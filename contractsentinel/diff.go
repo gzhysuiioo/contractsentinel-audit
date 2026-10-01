@@ -1,13 +1,17 @@
 // Package contractsentinel diff: deterministic comparison of two stored reports.
 package contractsentinel
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Per-rule comparison outcomes.
 const (
 	ChangeNewDefect      = "新发现缺陷"
 	ChangeResolvedDefect = "已消除缺陷"
 	ChangeStatusChanged  = "检查状态变化"
+	ChangeNoteChanged    = "检查说明变化"
 	ChangeNoChange       = "无变化"
 	ChangeRuleAdded      = "新增规则"
 	ChangeRuleRemoved    = "移除规则"
@@ -45,6 +49,7 @@ type DiffSummary struct {
 	NewDefects      int `json:"newDefects"`
 	ResolvedDefects int `json:"resolvedDefects"`
 	StatusChanges   int `json:"statusChanges"`
+	NoteChanges     int `json:"noteChanges"`
 	NoChange        int `json:"noChange"`
 	AddedRules      int `json:"addedRules"`
 	RemovedRules    int `json:"removedRules"`
@@ -79,8 +84,8 @@ func validReportID(id string) bool {
 }
 
 // validateDiffReport rejects reports whose content id matches but whose rules
-// are not comparable: duplicate or empty rule ids, empty rule versions, or
-// unknown check statuses.
+// are not comparable: duplicate or empty rule ids, empty rule versions,
+// unknown check statuses, or a tool-missing/timeout check without a note.
 func validateDiffReport(r Report) error {
 	seen := make(map[string]bool, len(r.Rules))
 	for _, rule := range r.Rules {
@@ -96,6 +101,10 @@ func validateDiffReport(r Report) error {
 		}
 		switch rule.Status {
 		case StatusUnchecked, StatusPass, StatusDefect:
+		case StatusToolMissing, StatusTimeout:
+			if strings.TrimSpace(rule.Note) == "" {
+				return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
+			}
 		default:
 			return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " has unknown status " + rule.Status)
 		}
@@ -228,9 +237,12 @@ func DiffReports(before, after Report) DiffResult {
 			entry.Before = diffSide(b, beforeFindings)
 			entry.After = diffSide(a, afterFindings)
 			switch {
-			case b.Status == a.Status:
+			case b.Status == a.Status && b.Note == a.Note:
 				entry.Change = ChangeNoChange
 				result.Summary.NoChange++
+			case b.Status == a.Status:
+				entry.Change = ChangeNoteChanged
+				result.Summary.NoteChanges++
 			case b.Status == StatusPass && a.Status == StatusDefect:
 				entry.Change = ChangeNewDefect
 				result.Summary.NewDefects++

@@ -10,13 +10,16 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 )
 
 // Check statuses recorded per rule in a report.
 const (
-	StatusUnchecked = "未检查"
-	StatusPass      = "通过"
-	StatusDefect    = "发现缺陷"
+	StatusUnchecked   = "未检查"
+	StatusPass        = "通过"
+	StatusDefect      = "发现缺陷"
+	StatusToolMissing = "工具缺失"
+	StatusTimeout     = "超时"
 )
 
 // ReportArtifact identifies the audited artifact by name and content hash.
@@ -25,7 +28,11 @@ type ReportArtifact struct {
 	Hash string `json:"hash"`
 }
 
-// ReportRule is one rule together with the invariant check result.
+// ReportRule is one rule together with the invariant check result. The note
+// carries the original checker description: counterexample evidence for a
+// defect, a tool availability remark for 工具缺失, a deadline remark for 超时,
+// or an optional remark for a passing check. It is empty for reports built
+// only from invariant booleans.
 type ReportRule struct {
 	ID          string `json:"id"`
 	Kind        string `json:"kind"`
@@ -34,6 +41,7 @@ type ReportRule struct {
 	RequiresABI bool   `json:"requiresABI"`
 	Version     string `json:"version"`
 	Status      string `json:"status"`
+	Note        string `json:"note,omitempty"`
 }
 
 // ReportFinding binds a defect to its artifact, rule, version and evidence.
@@ -72,25 +80,46 @@ type wireRule struct {
 	Version     string `json:"version"`
 }
 
+// CheckRecord is one imported per-rule check result: the artifact hash and
+// rule version it was produced against, the conclusion status, and the
+// original checker note (counterexample, tool or deadline remark).
+type CheckRecord struct {
+	ArtifactHash string
+	RuleID       string
+	Version      string
+	Status       string
+	Note         string
+}
+
+// wireCheck is the JSON shape of one entry in the checks array.
+type wireCheck struct {
+	ArtifactHash string `json:"artifactHash"`
+	RuleID       string `json:"ruleId"`
+	Version      string `json:"version"`
+	Status       string `json:"status"`
+	Note         string `json:"note"`
+}
+
 // wireInput is the JSON object accepted by the audit command.
 type wireInput struct {
 	Artifact   wireArtifact               `json:"artifact"`
 	Rules      []wireRule                 `json:"rules"`
 	Invariants map[string]json.RawMessage `json:"invariants"`
+	Checks     []wireCheck                `json:"checks"`
 }
 
 // ParseAuditInput decodes an audit submission JSON object into domain values.
 // Invariant values must be JSON booleans; any other type is an error.
-func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, error) {
+func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	var in wireInput
 	if err := json.Unmarshal(data, &in); err != nil {
-		return Artifact{}, nil, nil, errInvalid("invalid JSON: " + err.Error())
+		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	invariants := make(map[string]bool, len(in.Invariants))
 	for key, raw := range in.Invariants {
 		var holds bool
 		if err := json.Unmarshal(raw, &holds); err != nil {
-			return Artifact{}, nil, nil, errInvalid("invariant " + key + " must be a boolean")
+			return Artifact{}, nil, nil, nil, errInvalid("invariant " + key + " must be a boolean")
 		}
 		invariants[key] = holds
 	}
@@ -111,7 +140,17 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, error) {
 			Version:     wr.Version,
 		})
 	}
-	return artifact, rules, invariants, nil
+	checks := make([]CheckRecord, 0, len(in.Checks))
+	for _, wc := range in.Checks {
+		checks = append(checks, CheckRecord{
+			ArtifactHash: wc.ArtifactHash,
+			RuleID:       wc.RuleID,
+			Version:      wc.Version,
+			Status:       wc.Status,
+			Note:         wc.Note,
+		})
+	}
+	return artifact, rules, invariants, checks, nil
 }
 
 // ArtifactHash computes the content hash of an artifact. Only the raw ABI,
@@ -130,15 +169,31 @@ func ArtifactHash(a Artifact) string {
 	return hex.EncodeToString(sum)
 }
 
+// validCheckStatus reports whether status is one of the four recorded check
+// conclusions.
+func validCheckStatus(status string) bool {
+	switch status {
+	case StatusPass, StatusDefect, StatusToolMissing, StatusTimeout:
+		return true
+	}
+	return false
+}
+
 // BuildReport evaluates rules against the artifact and invariant values and
-// produces the report to persist. Insufficient inputs (missing ABI for a rule
-// that requires it, missing bytecode for a symbolic rule) fail the whole
-// submission and are never recorded as defects.
-func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (Report, error) {
+// imported check records and produces the report to persist. Insufficient
+// inputs (missing ABI for a rule that requires it, missing bytecode for a
+// symbolic rule) fail the whole submission and are never recorded as defects.
+// Imported checks are validated as a whole: unknown rules, duplicate records,
+// unknown statuses, missing notes, hash or version mismatches, and a rule
+// receiving both a check record and an invariant boolean all reject the
+// submission without producing a report.
+func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, checks []CheckRecord) (Report, error) {
 	if artifact.Name == "" {
 		return Report{}, errInvalid("artifact name is required")
 	}
+	hash := ArtifactHash(artifact)
 	seen := make(map[string]bool, len(rules))
+	ruleByID := make(map[string]Rule, len(rules))
 	for _, rule := range rules {
 		if rule.ID == "" {
 			return Report{}, errInvalid("rule id is required")
@@ -150,6 +205,7 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (R
 			return Report{}, errInvalid("duplicate rule id " + rule.ID)
 		}
 		seen[rule.ID] = true
+		ruleByID[rule.ID] = rule
 		if rule.RequiresABI && artifact.ABI == "" {
 			return Report{}, errInvalid("rule " + rule.ID + " requires an ABI")
 		}
@@ -157,7 +213,35 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (R
 			return Report{}, errInvalid("symbolic rule " + rule.ID + " requires bytecode")
 		}
 	}
-	hash := ArtifactHash(artifact)
+	checkByRule := make(map[string]CheckRecord, len(checks))
+	for _, check := range checks {
+		if check.RuleID == "" {
+			return Report{}, errInvalid("check rule id is required")
+		}
+		rule, ok := ruleByID[check.RuleID]
+		if !ok {
+			return Report{}, errInvalid("check for rule " + check.RuleID + ": unknown rule")
+		}
+		if _, dup := checkByRule[check.RuleID]; dup {
+			return Report{}, errInvalid("duplicate check for rule " + check.RuleID)
+		}
+		if check.ArtifactHash != hash {
+			return Report{}, errInvalid("check for rule " + check.RuleID + ": artifact hash mismatch")
+		}
+		if check.Version != rule.Version {
+			return Report{}, errInvalid("check for rule " + check.RuleID + ": version mismatch")
+		}
+		if !validCheckStatus(check.Status) {
+			return Report{}, errInvalid("check for rule " + check.RuleID + ": unknown status " + check.Status)
+		}
+		if check.Status != StatusPass && strings.TrimSpace(check.Note) == "" {
+			return Report{}, errInvalid("check for rule " + check.RuleID + ": note is required for status " + check.Status)
+		}
+		if _, hasInvariant := invariants[rule.Invariant]; hasInvariant {
+			return Report{}, errInvalid("rule " + check.RuleID + ": both a check record and an invariant value are provided")
+		}
+		checkByRule[check.RuleID] = check
+	}
 	report := Report{
 		Artifact: ReportArtifact{Name: artifact.Name, Hash: hash},
 		Rules:    []ReportRule{},
@@ -165,7 +249,11 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (R
 	}
 	for _, rule := range rules {
 		status := StatusUnchecked
-		if holds, checked := invariants[rule.Invariant]; checked {
+		note := ""
+		if check, ok := checkByRule[rule.ID]; ok {
+			status = check.Status
+			note = check.Note
+		} else if holds, checked := invariants[rule.Invariant]; checked {
 			if holds {
 				status = StatusPass
 			} else {
@@ -180,15 +268,20 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (R
 			RequiresABI: rule.RequiresABI,
 			Version:     rule.Version,
 			Status:      status,
+			Note:        note,
 		})
 		if status == StatusDefect {
+			evidence := note
+			if evidence == "" {
+				evidence = "invariant " + rule.Invariant + " does not hold"
+			}
 			report.Findings = append(report.Findings, ReportFinding{
 				ArtifactHash: hash,
 				RuleID:       rule.ID,
 				Version:      rule.Version,
 				Severity:     rule.Severity,
 				Invariant:    rule.Invariant,
-				Evidence:     "invariant " + rule.Invariant + " does not hold",
+				Evidence:     evidence,
 			})
 		}
 	}
@@ -196,7 +289,9 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool) (R
 	return report, nil
 }
 
-// canonicalRule is the order-independent view of a rule used for the id.
+// canonicalRule is the order-independent view of a rule used for the id. The
+// note is omitted when empty so reports built only from invariant booleans
+// keep their original ids.
 type canonicalRule struct {
 	ID          string `json:"id"`
 	Kind        string `json:"kind"`
@@ -205,6 +300,7 @@ type canonicalRule struct {
 	RequiresABI bool   `json:"requiresABI"`
 	Version     string `json:"version"`
 	Status      string `json:"status"`
+	Note        string `json:"note,omitempty"`
 }
 
 // canonicalFinding is the order-independent view of a finding used for the id.
@@ -235,7 +331,7 @@ func canonicalize(report Report) canonicalReport {
 		cr.Rules = append(cr.Rules, canonicalRule{
 			ID: rule.ID, Kind: rule.Kind, Severity: rule.Severity,
 			Invariant: rule.Invariant, RequiresABI: rule.RequiresABI,
-			Version: rule.Version, Status: rule.Status,
+			Version: rule.Version, Status: rule.Status, Note: rule.Note,
 		})
 	}
 	sort.Slice(cr.Rules, func(i, j int) bool { return cr.Rules[i].ID < cr.Rules[j].ID })
@@ -264,18 +360,25 @@ func ReportID(r Report) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// expectedFindings rebuilds the findings that match a report's rules.
+// expectedFindings rebuilds the findings that match a report's rules. A
+// defect imported from a check record carries the checker's note as evidence;
+// a defect derived from an invariant boolean carries the standard invariant
+// message.
 func expectedFindings(r Report) []ReportFinding {
 	var out []ReportFinding
 	for _, rule := range r.Rules {
 		if rule.Status == StatusDefect {
+			evidence := rule.Note
+			if evidence == "" {
+				evidence = "invariant " + rule.Invariant + " does not hold"
+			}
 			out = append(out, ReportFinding{
 				ArtifactHash: r.Artifact.Hash,
 				RuleID:       rule.ID,
 				Version:      rule.Version,
 				Severity:     rule.Severity,
 				Invariant:    rule.Invariant,
-				Evidence:     "invariant " + rule.Invariant + " does not hold",
+				Evidence:     evidence,
 			})
 		}
 	}

@@ -12,7 +12,7 @@ import (
 // saveDiffReport builds, saves and returns a report for diff tests.
 func saveDiffReport(t *testing.T, dir string, artifact Artifact, rules []Rule, invariants map[string]bool) Report {
 	t.Helper()
-	report, err := BuildReport(artifact, rules, invariants)
+	report, err := BuildReport(artifact, rules, invariants, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,5 +541,160 @@ func TestDiffDoesNotModifyStore(t *testing.T) {
 		if string(data) != contentsBefore[name] {
 			t.Errorf("diff modified %s", name)
 		}
+	}
+}
+
+// saveCheckReport builds a report from check records, saves it and returns it.
+func saveCheckReport(t *testing.T, dir string, artifact Artifact, rules []Rule, checks []CheckRecord) Report {
+	t.Helper()
+	report, err := BuildReport(artifact, rules, nil, checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveReport(dir, report); err != nil {
+		t.Fatal(err)
+	}
+	return report
+}
+
+func TestDiffNoteChange(t *testing.T) {
+	dir := t.TempDir()
+	artifact := sampleArtifact()
+	hash := ArtifactHash(artifact)
+	rules := []Rule{{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1"}}
+	before := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusPass, Note: "note one"}})
+	after := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusPass, Note: "note two"}})
+
+	diff, err := DiffStore(dir, before.ReportID, after.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.Results) != 1 || diff.Results[0].Change != ChangeNoteChanged {
+		t.Fatalf("results = %+v", diff.Results)
+	}
+	if diff.Summary.NoteChanges != 1 || diff.Summary.NoChange != 0 || diff.Summary.StatusChanges != 0 {
+		t.Errorf("summary = %+v", diff.Summary)
+	}
+	if diff.Results[0].Before == nil || diff.Results[0].After == nil {
+		t.Fatal("both sides must be present")
+	}
+	if diff.Results[0].Before.Rule.Status != StatusPass || diff.Results[0].After.Rule.Status != StatusPass {
+		t.Errorf("statuses = %q / %q", diff.Results[0].Before.Rule.Status, diff.Results[0].After.Rule.Status)
+	}
+	if diff.Results[0].Before.Rule.Note != "note one" || diff.Results[0].After.Rule.Note != "note two" {
+		t.Errorf("notes = %q / %q", diff.Results[0].Before.Rule.Note, diff.Results[0].After.Rule.Note)
+	}
+}
+
+func TestDiffToolMissingVsTimeout(t *testing.T) {
+	dir := t.TempDir()
+	artifact := sampleArtifact()
+	hash := ArtifactHash(artifact)
+	rules := []Rule{{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1"}}
+	before := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusToolMissing, Note: "tool unavailable"}})
+	after := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusTimeout, Note: "timed out"}})
+
+	diff, err := DiffStore(dir, before.ReportID, after.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Results[0].Change != ChangeStatusChanged {
+		t.Fatalf("change = %q, want %q", diff.Results[0].Change, ChangeStatusChanged)
+	}
+	if diff.Summary.StatusChanges != 1 || diff.Summary.NoteChanges != 0 {
+		t.Errorf("summary = %+v", diff.Summary)
+	}
+}
+
+func TestDiffToolMissingNotDefect(t *testing.T) {
+	dir := t.TempDir()
+	artifact := sampleArtifact()
+	hash := ArtifactHash(artifact)
+	rules := []Rule{{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1"}}
+	before := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusToolMissing, Note: "tool unavailable"}})
+	after := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusPass, Note: ""}})
+
+	diff, err := DiffStore(dir, before.ReportID, after.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Results[0].Change != ChangeStatusChanged {
+		t.Fatalf("change = %q, want %q", diff.Results[0].Change, ChangeStatusChanged)
+	}
+	if diff.Summary.ResolvedDefects != 0 || diff.Summary.NewDefects != 0 {
+		t.Errorf("defect transitions must be zero: %+v", diff.Summary)
+	}
+	if diff.Summary.BeforeDefects != 0 || diff.Summary.AfterDefects != 0 {
+		t.Errorf("defect totals must be zero: %+v", diff.Summary)
+	}
+}
+
+func TestDiffCheckDefectToPassIsResolved(t *testing.T) {
+	dir := t.TempDir()
+	artifact := sampleArtifact()
+	hash := ArtifactHash(artifact)
+	rules := []Rule{{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1"}}
+	before := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusDefect, Note: "counterexample"}})
+	after := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusPass, Note: ""}})
+
+	diff, err := DiffStore(dir, before.ReportID, after.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Results[0].Change != ChangeResolvedDefect {
+		t.Fatalf("change = %q, want %q", diff.Results[0].Change, ChangeResolvedDefect)
+	}
+	if diff.Summary.ResolvedDefects != 1 {
+		t.Errorf("summary = %+v", diff.Summary)
+	}
+}
+
+func TestDiffTimeoutToDefectIsStatusChange(t *testing.T) {
+	dir := t.TempDir()
+	artifact := sampleArtifact()
+	hash := ArtifactHash(artifact)
+	rules := []Rule{{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1"}}
+	before := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusTimeout, Note: "timed out"}})
+	after := saveCheckReport(t, dir, artifact, rules,
+		[]CheckRecord{{ArtifactHash: hash, RuleID: "r1", Version: "1", Status: StatusDefect, Note: "counterexample"}})
+
+	diff, err := DiffStore(dir, before.ReportID, after.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff.Results[0].Change != ChangeStatusChanged {
+		t.Fatalf("change = %q, want %q", diff.Results[0].Change, ChangeStatusChanged)
+	}
+	if diff.Summary.NewDefects != 0 {
+		t.Errorf("timeout->defect must not be a new defect: %+v", diff.Summary)
+	}
+	if diff.Summary.BeforeDefects != 0 || diff.Summary.AfterDefects != 1 {
+		t.Errorf("defect totals = %d/%d", diff.Summary.BeforeDefects, diff.Summary.AfterDefects)
+	}
+}
+
+func TestDiffRejectsToolMissingWithoutNote(t *testing.T) {
+	dir := t.TempDir()
+	good := saveDiffReport(t, dir, sampleArtifact(), sampleRules(), sampleInvariants())
+	bad := saveRawReport(t, dir, Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusToolMissing, Note: ""},
+		},
+		Findings: []ReportFinding{},
+	})
+	if _, err := DiffStore(dir, good.ReportID, bad.ReportID); err == nil {
+		t.Fatal("expected error for tool-missing without note")
+	} else if !strings.Contains(err.Error(), "no note") {
+		t.Fatalf("error must mention the missing note: %v", err)
 	}
 }

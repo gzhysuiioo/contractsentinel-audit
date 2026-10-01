@@ -56,11 +56,11 @@ func runAudit(args []string) {
 	if err != nil {
 		fail("audit", err)
 	}
-	artifact, rules, invariants, err := contractsentinel.ParseAuditInput(data)
+	artifact, rules, invariants, checks, err := contractsentinel.ParseAuditInput(data)
 	if err != nil {
 		fail("audit", err)
 	}
-	report, err := contractsentinel.BuildReport(artifact, rules, invariants)
+	report, err := contractsentinel.BuildReport(artifact, rules, invariants, checks)
 	if err != nil {
 		fail("audit", err)
 	}
