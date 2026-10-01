@@ -419,9 +419,21 @@ func TestSaveReportByteIdentical(t *testing.T) {
 
 func TestLoadReportNotFound(t *testing.T) {
 	dir := t.TempDir()
-	_, err := LoadReport(dir, "deadbeef")
+	missing := strings.Repeat("0", 64)
+	_, err := LoadReport(dir, missing)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected not found error, got %v", err)
+	}
+}
+
+func TestLoadReportInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{"", "deadbeef", "abc", strings.Repeat("A", 64), strings.Repeat("g", 64), strings.Repeat("0", 63)} {
+		_, err := LoadReport(dir, bad)
+		var ei errInvalid
+		if !errors.As(err, &ei) {
+			t.Errorf("id %q: expected errInvalid, got %T: %v", bad, err, err)
+		}
 	}
 }
 
@@ -945,5 +957,249 @@ func TestSaveReportCheckResubmissionByteIdentical(t *testing.T) {
 	second, _ := os.ReadFile(path)
 	if string(first) != string(second) {
 		t.Fatal("resubmission changed the report bytes")
+	}
+}
+
+// --- Strengthened submission / archive validation ---
+
+func TestSaveReportRejectsInvalidSubmissionWithoutStore(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "store")
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusPass},
+			{ID: "r1", Kind: "static", Severity: "low", Invariant: "inv", Version: "1", Status: StatusPass},
+		},
+		Findings: []ReportFinding{},
+	}
+	report.ReportID = ReportID(report)
+	err := SaveReport(dir, report)
+	if err == nil {
+		t.Fatal("expected error for invalid submission")
+	}
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid submission must not create the store: %v", statErr)
+	}
+}
+
+func TestSaveReportRejectsInvalidReportID(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		ReportID: "abc",
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules:    []ReportRule{},
+		Findings: []ReportFinding{},
+	}
+	err := SaveReport(dir, report)
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "*.json")); len(matches) != 0 {
+		t.Fatalf("invalid submission must not add files: %v", matches)
+	}
+}
+
+func TestSaveReportRejectsInvalidArtifactHash(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: "deadbeef"},
+		Rules:    []ReportRule{},
+		Findings: []ReportFinding{},
+	}
+	report.ReportID = ReportID(report)
+	err := SaveReport(dir, report)
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+}
+
+func TestSaveReportRejectsFindingMismatch(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusDefect, Note: "counterexample"},
+		},
+		Findings: []ReportFinding{
+			{ArtifactHash: ArtifactHash(sampleArtifact()), RuleID: "r1", Version: "1", Severity: "high", Invariant: "inv", Evidence: "wrong"},
+		},
+	}
+	report.ReportID = ReportID(report)
+	err := SaveReport(dir, report)
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "r1") {
+		t.Fatalf("error must name the rule: %v", err)
+	}
+}
+
+func TestSaveReportRejectsDefectWithoutFinding(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusDefect, Note: "counterexample"},
+		},
+		Findings: []ReportFinding{},
+	}
+	report.ReportID = ReportID(report)
+	err := SaveReport(dir, report)
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+}
+
+func TestSaveReportRejectsFindingVersionMismatch(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusDefect, Note: "counterexample"},
+		},
+		Findings: []ReportFinding{
+			{ArtifactHash: ArtifactHash(sampleArtifact()), RuleID: "r1", Version: "9.9.9", Severity: "high", Invariant: "inv", Evidence: "counterexample"},
+		},
+	}
+	report.ReportID = ReportID(report)
+	err := SaveReport(dir, report)
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid, got %T: %v", err, err)
+	}
+}
+
+func TestLoadReportRejectsInvalidStoredReport(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusPass},
+			{ID: "r1", Kind: "static", Severity: "low", Invariant: "inv", Version: "1", Status: StatusPass},
+		},
+		Findings: []ReportFinding{},
+	}
+	report.ReportID = ReportID(report)
+	data, _ := json.Marshal(report)
+	if err := os.WriteFile(filepath.Join(dir, report.ReportID+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadReport(dir, report.ReportID)
+	var ec errCorrupt
+	if !errors.As(err, &ec) {
+		t.Fatalf("expected errCorrupt, got %T: %v", err, err)
+	}
+}
+
+func TestLoadReportRejectsFindingMismatch(t *testing.T) {
+	dir := t.TempDir()
+	report := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusDefect, Note: "counterexample"},
+		},
+		Findings: []ReportFinding{
+			{ArtifactHash: ArtifactHash(sampleArtifact()), RuleID: "r1", Version: "9.9.9", Severity: "high", Invariant: "inv", Evidence: "counterexample"},
+		},
+	}
+	report.ReportID = ReportID(report)
+	data, _ := json.Marshal(report)
+	if err := os.WriteFile(filepath.Join(dir, report.ReportID+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadReport(dir, report.ReportID)
+	var ec errCorrupt
+	if !errors.As(err, &ec) {
+		t.Fatalf("expected errCorrupt, got %T: %v", err, err)
+	}
+}
+
+func TestSaveReportPermutationKeepsFirstBytes(t *testing.T) {
+	dir := t.TempDir()
+	rules := sampleRules()
+	r1, err := BuildReport(sampleArtifact(), rules, sampleInvariants(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveReport(dir, r1); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, r1.ReportID+".json")
+	first, _ := os.ReadFile(path)
+	r2, err := BuildReport(sampleArtifact(), []Rule{rules[2], rules[0], rules[1]}, sampleInvariants(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.ReportID != r1.ReportID {
+		t.Fatal("permutation must keep the same id")
+	}
+	if err := SaveReport(dir, r2); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := os.ReadFile(path)
+	if string(first) != string(second) {
+		t.Fatal("duplicate submission must not replace the first archive bytes")
+	}
+}
+
+func TestSaveReportRaceCorruptFileKept(t *testing.T) {
+	dir := t.TempDir()
+	report, _ := BuildReport(sampleArtifact(), sampleRules(), sampleInvariants(), nil)
+	finalPath := filepath.Join(dir, report.ReportID+".json")
+	saveReportHook = func(string) {
+		os.WriteFile(finalPath, []byte(`{broken`), 0o644)
+	}
+	defer func() { saveReportHook = nil }()
+	err := SaveReport(dir, report)
+	var ec errCorrupt
+	if !errors.As(err, &ec) {
+		t.Fatalf("expected errCorrupt, got %T: %v", err, err)
+	}
+	kept, _ := os.ReadFile(finalPath)
+	if string(kept) != `{broken` {
+		t.Fatalf("corrupt file must be kept, got %q", kept)
+	}
+}
+
+func TestSaveReportConcurrentPermutations(t *testing.T) {
+	dir := t.TempDir()
+	rules := sampleRules()
+	report0, _ := BuildReport(sampleArtifact(), rules, sampleInvariants(), nil)
+	var wg sync.WaitGroup
+	errs := make(chan error, 24)
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			perm := []Rule{rules[i%3], rules[(i+1)%3], rules[(i+2)%3]}
+			report, err := BuildReport(sampleArtifact(), perm, sampleInvariants(), nil)
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- SaveReport(dir, report)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent permutation save failed: %v", err)
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(matches))
+	}
+	if _, err := LoadReport(dir, report0.ReportID); err != nil {
+		t.Fatalf("final archive must be loadable: %v", err)
 	}
 }

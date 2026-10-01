@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 )
@@ -360,79 +359,144 @@ func ReportID(r Report) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// expectedFindings rebuilds the findings that match a report's rules. A
-// defect imported from a check record carries the checker's note as evidence;
-// a defect derived from an invariant boolean carries the standard invariant
-// message.
-func expectedFindings(r Report) []ReportFinding {
-	var out []ReportFinding
+// validateReport checks every archive legality condition against r. It is the
+// single definition of a legal report: the id and artifact hash are 64
+// lowercase hex characters, the id matches the content, the artifact name is
+// present, rule ids are present and unique with non-empty versions, statuses
+// use the five recorded values, tool-missing and timeout notes are
+// non-blank, and 发现缺陷 rules correspond one-to-one with findings whose
+// artifact hash, version, severity, invariant and evidence match the rule.
+// The same conditions apply to submissions and to stored archives: a
+// recomputed id never makes an invalid report legal. fail is errInvalid for
+// submissions and errCorrupt for stored archives.
+func validateReport(r Report, fail func(string) error) error {
+	if !validReportID(r.ReportID) {
+		return fail("report id " + r.ReportID + " is not a 64-character lowercase hex string")
+	}
+	if r.Artifact.Name == "" {
+		return fail("report " + r.ReportID + " artifact name is required")
+	}
+	if !validReportID(r.Artifact.Hash) {
+		return fail("report " + r.ReportID + " artifact hash is not a 64-character lowercase hex string")
+	}
+	if ReportID(r) != r.ReportID {
+		return fail("report content does not match id " + r.ReportID)
+	}
+	seenRule := make(map[string]bool, len(r.Rules))
+	defectByID := make(map[string]ReportRule)
 	for _, rule := range r.Rules {
+		if rule.ID == "" {
+			return fail("report " + r.ReportID + " has a rule with an empty id")
+		}
+		if seenRule[rule.ID] {
+			return fail("report " + r.ReportID + " has duplicate rule id " + rule.ID)
+		}
+		seenRule[rule.ID] = true
+		if rule.Version == "" {
+			return fail("report " + r.ReportID + " rule " + rule.ID + " has an empty version")
+		}
+		switch rule.Status {
+		case StatusUnchecked, StatusPass, StatusDefect, StatusToolMissing, StatusTimeout:
+		default:
+			return fail("report " + r.ReportID + " rule " + rule.ID + " has unknown status " + rule.Status)
+		}
+		if (rule.Status == StatusToolMissing || rule.Status == StatusTimeout) && strings.TrimSpace(rule.Note) == "" {
+			return fail("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
+		}
 		if rule.Status == StatusDefect {
-			evidence := rule.Note
-			if evidence == "" {
-				evidence = "invariant " + rule.Invariant + " does not hold"
-			}
-			out = append(out, ReportFinding{
-				ArtifactHash: r.Artifact.Hash,
-				RuleID:       rule.ID,
-				Version:      rule.Version,
-				Severity:     rule.Severity,
-				Invariant:    rule.Invariant,
-				Evidence:     evidence,
-			})
+			defectByID[rule.ID] = rule
 		}
 	}
-	return out
-}
-
-// sameFindings compares two finding sets independently of order; nil and empty
-// slices are treated as equal.
-func sameFindings(a, b []ReportFinding) bool {
-	if len(a) == 0 && len(b) == 0 {
-		return true
+	seenFinding := make(map[string]bool, len(r.Findings))
+	for _, f := range r.Findings {
+		if f.RuleID == "" {
+			return fail("report " + r.ReportID + " has a finding with an empty rule id")
+		}
+		rule, ok := defectByID[f.RuleID]
+		if !ok {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " does not match a 发现缺陷 rule")
+		}
+		if seenFinding[f.RuleID] {
+			return fail("report " + r.ReportID + " has a duplicate finding for rule " + f.RuleID)
+		}
+		seenFinding[f.RuleID] = true
+		if f.ArtifactHash != r.Artifact.Hash {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has artifact hash " + f.ArtifactHash + ", want " + r.Artifact.Hash)
+		}
+		if f.Version != rule.Version {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has version " + f.Version + ", want " + rule.Version)
+		}
+		if f.Severity != rule.Severity {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has severity " + f.Severity + ", want " + rule.Severity)
+		}
+		if f.Invariant != rule.Invariant {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has invariant " + f.Invariant + ", want " + rule.Invariant)
+		}
+		wantEvidence := rule.Note
+		if wantEvidence == "" {
+			wantEvidence = "invariant " + rule.Invariant + " does not hold"
+		}
+		if f.Evidence != wantEvidence {
+			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has evidence " + f.Evidence + ", want " + wantEvidence)
+		}
 	}
-	ac := append([]ReportFinding(nil), a...)
-	bc := append([]ReportFinding(nil), b...)
-	sort.Slice(ac, func(i, j int) bool { return ac[i].RuleID < ac[j].RuleID })
-	sort.Slice(bc, func(i, j int) bool { return bc[i].RuleID < bc[j].RuleID })
-	return reflect.DeepEqual(ac, bc)
-}
-
-// verifyReportBytes parses stored bytes and checks they match the id and that
-// the findings are consistent with the rules.
-func verifyReportBytes(data []byte, id string) error {
-	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
-		return errCorrupt("invalid JSON in report " + id + ": " + err.Error())
-	}
-	if r.ReportID != id {
-		return errCorrupt("report id " + r.ReportID + " does not match stored id " + id)
-	}
-	if ReportID(r) != id {
-		return errCorrupt("report content does not match id " + id)
-	}
-	if !sameFindings(expectedFindings(r), r.Findings) {
-		return errCorrupt("report findings do not match rules for id " + id)
+	for id := range defectByID {
+		if !seenFinding[id] {
+			return fail("report " + r.ReportID + " defect rule " + id + " has no finding")
+		}
 	}
 	return nil
 }
 
+// validStoredReport validates archive contents.
+func validStoredReport(r Report) error {
+	return validateReport(r, func(msg string) error { return errCorrupt(msg) })
+}
+
+// validSubmittedReport validates a submission before any store operation.
+func validSubmittedReport(r Report) error {
+	return validateReport(r, func(msg string) error { return errInvalid(msg) })
+}
+
+// loadStoredReport parses archive bytes for id and fully validates them.
+func loadStoredReport(data []byte, id string) (Report, error) {
+	var r Report
+	if err := json.Unmarshal(data, &r); err != nil {
+		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	if r.ReportID != id {
+		return Report{}, errCorrupt("report id " + r.ReportID + " does not match requested id " + id)
+	}
+	if err := validStoredReport(r); err != nil {
+		return Report{}, err
+	}
+	return r, nil
+}
+
+// saveReportHook, when set, is invoked after the archive existence check and
+// before the atomic publish. It lets tests simulate another process racing to
+// claim the same report id.
+var saveReportHook func(finalPath string)
+
 // SaveReport persists a report under the store directory. The store is safe
 // for concurrent writers: identical reports share one file and all
 // submissions succeed, different reports never overwrite each other, and
-// readers only ever observe complete files. A pre-existing file with the same
-// id must carry the same report; a corrupted archive makes the submission
-// fail while keeping the original file.
+// readers only ever observe complete files. A submission is fully validated
+// before any store operation, so an invalid report creates no store and no
+// files. A pre-existing file with the same id must be a valid archive of the
+// same report; a corrupted archive makes the submission fail while keeping the
+// original file, even when the corruption appears only during the save. The
+// first successfully archived bytes are never replaced by later submissions.
 func SaveReport(dir string, r Report) error {
-	if r.ReportID == "" {
-		return errInvalid("report id is required")
+	if err := validSubmittedReport(r); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	finalPath := filepath.Join(dir, r.ReportID+".json")
 	if existing, err := os.ReadFile(finalPath); err == nil {
-		if err := verifyReportBytes(existing, r.ReportID); err != nil {
+		if _, err := loadStoredReport(existing, r.ReportID); err != nil {
 			return err
 		}
 		return nil
@@ -463,22 +527,34 @@ func SaveReport(dir string, r Report) error {
 		cleanup()
 		return err
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if saveReportHook != nil {
+		saveReportHook(finalPath)
+	}
+	if err := os.Link(tmpPath, finalPath); err != nil {
 		cleanup()
-		if existing, readErr := os.ReadFile(finalPath); readErr == nil {
-			if verifyErr := verifyReportBytes(existing, r.ReportID); verifyErr != nil {
-				return verifyErr
+		if os.IsExist(err) {
+			existing, readErr := os.ReadFile(finalPath)
+			if readErr != nil {
+				return readErr
+			}
+			if _, err := loadStoredReport(existing, r.ReportID); err != nil {
+				return err
 			}
 			return nil
 		}
 		return err
 	}
+	cleanup()
 	return nil
 }
 
-// LoadReport reads and verifies a report by id. Missing, corrupted or tampered
-// archives produce a clear error.
+// LoadReport reads and verifies a report by id. The id must be 64 lowercase
+// hex characters; missing, corrupted or tampered archives produce a clear
+// error. The store is only read, never created or modified.
 func LoadReport(dir, id string) (Report, error) {
+	if !validReportID(id) {
+		return Report{}, errInvalid("invalid report id " + id + ": want 64 lowercase hex characters")
+	}
 	data, err := os.ReadFile(filepath.Join(dir, id+".json"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -486,20 +562,7 @@ func LoadReport(dir, id string) (Report, error) {
 		}
 		return Report{}, err
 	}
-	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
-		return Report{}, errCorrupt("invalid JSON in report " + id)
-	}
-	if r.ReportID != id {
-		return Report{}, errCorrupt("report id " + r.ReportID + " does not match requested id " + id)
-	}
-	if ReportID(r) != id {
-		return Report{}, errCorrupt("report content does not match id " + id)
-	}
-	if !sameFindings(expectedFindings(r), r.Findings) {
-		return Report{}, errCorrupt("report findings do not match rules for id " + id)
-	}
-	return r, nil
+	return loadStoredReport(data, id)
 }
 
 type errNotFound string

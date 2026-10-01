@@ -3,7 +3,6 @@ package contractsentinel
 
 import (
 	"sort"
-	"strings"
 )
 
 // Per-rule comparison outcomes.
@@ -83,51 +82,14 @@ func validReportID(id string) bool {
 	return true
 }
 
-// validateDiffReport rejects reports whose content id matches but whose rules
-// are not comparable: duplicate or empty rule ids, empty rule versions,
-// unknown check statuses, or a tool-missing/timeout check without a note.
-func validateDiffReport(r Report) error {
-	seen := make(map[string]bool, len(r.Rules))
-	for _, rule := range r.Rules {
-		if rule.ID == "" {
-			return errCorrupt("report " + r.ReportID + " has a rule with an empty id")
-		}
-		if seen[rule.ID] {
-			return errCorrupt("report " + r.ReportID + " has duplicate rule id " + rule.ID)
-		}
-		seen[rule.ID] = true
-		if rule.Version == "" {
-			return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " has an empty version")
-		}
-		switch rule.Status {
-		case StatusUnchecked, StatusPass, StatusDefect:
-		case StatusToolMissing, StatusTimeout:
-			if strings.TrimSpace(rule.Note) == "" {
-				return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
-			}
-		default:
-			return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " has unknown status " + rule.Status)
-		}
-	}
-	return nil
-}
-
 // LoadReportForDiff loads a stored report for comparison. The id must be 64
-// lowercase hex characters; the archive is verified against its id and the
-// rule semantics are validated. The store is only read, never created or
-// modified.
+// lowercase hex characters; the archive is fully verified. The store is only
+// read, never created or modified.
 func LoadReportForDiff(dir, id string) (Report, error) {
 	if !validReportID(id) {
 		return Report{}, errInvalid("invalid report id " + id + ": want 64 lowercase hex characters")
 	}
-	r, err := LoadReport(dir, id)
-	if err != nil {
-		return Report{}, err
-	}
-	if err := validateDiffReport(r); err != nil {
-		return Report{}, err
-	}
-	return r, nil
+	return LoadReport(dir, id)
 }
 
 // DiffStore loads both reports from the store and compares them. Both reports

@@ -513,6 +513,29 @@ func TestDiffRejectsCorruptedArchive(t *testing.T) {
 	}
 }
 
+func TestDiffRejectsRecomputedInvalidReport(t *testing.T) {
+	// An invalid report with a self-consistent (recomputed) id must still be
+	// rejected: the id binds content, not legality.
+	dir := t.TempDir()
+	good := saveDiffReport(t, dir, sampleArtifact(), sampleRules(), sampleInvariants())
+	bad := Report{
+		Artifact: ReportArtifact{Name: "Vault", Hash: ArtifactHash(sampleArtifact())},
+		Rules: []ReportRule{
+			{ID: "r1", Kind: "static", Severity: "high", Invariant: "inv", Version: "1", Status: StatusPass},
+			{ID: "r1", Kind: "static", Severity: "low", Invariant: "inv", Version: "1", Status: StatusPass},
+		},
+		Findings: []ReportFinding{},
+	}
+	bad.ReportID = ReportID(bad)
+	data, _ := json.Marshal(bad)
+	if err := os.WriteFile(filepath.Join(dir, bad.ReportID+".json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DiffStore(dir, good.ReportID, bad.ReportID); err == nil {
+		t.Fatal("expected error for recomputed invalid report")
+	}
+}
+
 func TestDiffDoesNotModifyStore(t *testing.T) {
 	dir := t.TempDir()
 	before := saveDiffReport(t, dir, sampleArtifact(), sampleRules(), sampleInvariants())
