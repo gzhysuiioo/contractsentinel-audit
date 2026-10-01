@@ -24,6 +24,8 @@ func main() {
 		runAudit(os.Args[2:])
 	case "report":
 		runReport(os.Args[2:])
+	case "diff":
+		runDiff(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -34,7 +36,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: contractsentinel [demo|version|audit|report|help]")
+	fmt.Println("usage: contractsentinel [demo|version|audit|report|diff|help]")
 }
 
 // runAudit parses an audit submission, builds the report and saves it.
@@ -86,6 +88,31 @@ func runReport(args []string) {
 		fail("report", err)
 	}
 	printReport("report", report)
+}
+
+// runDiff compares two stored reports and prints the diff JSON.
+func runDiff(args []string) {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	store := fs.String("store", "", "report store directory")
+	before := fs.String("before", "", "baseline report id")
+	after := fs.String("after", "", "new report id")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if *store == "" || *before == "" || *after == "" {
+		fmt.Fprintln(os.Stderr, "usage: contractsentinel diff --store <dir> --before <id> --after <id>")
+		os.Exit(2)
+	}
+	diff, err := contractsentinel.DiffStore(*store, *before, *after)
+	if err != nil {
+		fail("diff", err)
+	}
+	out, err := json.MarshalIndent(diff, "", "  ")
+	if err != nil {
+		fail("diff", err)
+	}
+	fmt.Println(string(out))
 }
 
 // fail prints an error to stderr and exits with a non-zero status.
