@@ -2,6 +2,8 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 
@@ -18,6 +20,10 @@ func main() {
 		runDemo()
 	case "version":
 		fmt.Println("contractsentinel 0.1.0")
+	case "audit":
+		runAudit(os.Args[2:])
+	case "report":
+		runReport(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -28,7 +34,73 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: contractsentinel [demo|version|help]")
+	fmt.Println("usage: contractsentinel [demo|version|audit|report|help]")
+}
+
+// runAudit parses an audit submission, builds the report and saves it.
+func runAudit(args []string) {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	inputPath := fs.String("input", "", "path to the audit input JSON file")
+	store := fs.String("store", "", "report store directory")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if *inputPath == "" || *store == "" {
+		fmt.Fprintln(os.Stderr, "usage: contractsentinel audit --input <file> --store <dir>")
+		os.Exit(2)
+	}
+	data, err := os.ReadFile(*inputPath)
+	if err != nil {
+		fail("audit", err)
+	}
+	artifact, rules, invariants, err := contractsentinel.ParseAuditInput(data)
+	if err != nil {
+		fail("audit", err)
+	}
+	report, err := contractsentinel.BuildReport(artifact, rules, invariants)
+	if err != nil {
+		fail("audit", err)
+	}
+	if err := contractsentinel.SaveReport(*store, report); err != nil {
+		fail("audit", err)
+	}
+	printReport("audit", report)
+}
+
+// runReport reads a saved report by id and prints it.
+func runReport(args []string) {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	store := fs.String("store", "", "report store directory")
+	id := fs.String("id", "", "report id")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if *store == "" || *id == "" {
+		fmt.Fprintln(os.Stderr, "usage: contractsentinel report --store <dir> --id <id>")
+		os.Exit(2)
+	}
+	report, err := contractsentinel.LoadReport(*store, *id)
+	if err != nil {
+		fail("report", err)
+	}
+	printReport("report", report)
+}
+
+// fail prints an error to stderr and exits with a non-zero status.
+func fail(command string, err error) {
+	fmt.Fprintf(os.Stderr, "%s failed: %s\n", command, err)
+	os.Exit(1)
+}
+
+// printReport writes the full report JSON to stdout.
+func printReport(command string, report contractsentinel.Report) {
+	out, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fail(command, err)
+	}
+	fmt.Println(string(out))
 }
 
 func runDemo() {

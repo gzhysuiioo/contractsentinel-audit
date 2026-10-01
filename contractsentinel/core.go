@@ -26,6 +26,7 @@ type Rule struct {
 	Severity    string
 	Invariant   string
 	RequiresABI bool
+	Version     string
 }
 
 // Run executes the deterministic subset of rules and refuses inputs they need.
