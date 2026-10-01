@@ -419,9 +419,25 @@ func TestSaveReportByteIdentical(t *testing.T) {
 
 func TestLoadReportNotFound(t *testing.T) {
 	dir := t.TempDir()
-	_, err := LoadReport(dir, "deadbeef")
+	id := strings.Repeat("0", 64)
+	_, err := LoadReport(dir, id)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected not found error, got %v", err)
+	}
+}
+
+func TestLoadReportInvalidID(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	for _, bad := range []string{"", "deadbeef", "ABC", strings.Repeat("g", 64)} {
+		_, err := LoadReport(dir, bad)
+		var ei errInvalid
+		if !errors.As(err, &ei) {
+			t.Errorf("id %q: expected errInvalid, got %T %v", bad, err, err)
+		}
+	}
+	// A failed query must not create the store.
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("query created the store directory: %v", err)
 	}
 }
 

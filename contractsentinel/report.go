@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 )
@@ -169,16 +168,6 @@ func ArtifactHash(a Artifact) string {
 	return hex.EncodeToString(sum)
 }
 
-// validCheckStatus reports whether status is one of the four recorded check
-// conclusions.
-func validCheckStatus(status string) bool {
-	switch status {
-	case StatusPass, StatusDefect, StatusToolMissing, StatusTimeout:
-		return true
-	}
-	return false
-}
-
 // BuildReport evaluates rules against the artifact and invariant values and
 // imported check records and produces the report to persist. Insufficient
 // inputs (missing ABI for a rule that requires it, missing bytecode for a
@@ -231,7 +220,7 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 		if check.Version != rule.Version {
 			return Report{}, errInvalid("check for rule " + check.RuleID + ": version mismatch")
 		}
-		if !validCheckStatus(check.Status) {
+		if !validCheckStatus(check.Status) || check.Status == StatusUnchecked {
 			return Report{}, errInvalid("check for rule " + check.RuleID + ": unknown status " + check.Status)
 		}
 		if check.Status != StatusPass && strings.TrimSpace(check.Note) == "" {
@@ -360,87 +349,194 @@ func ReportID(r Report) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// expectedFindings rebuilds the findings that match a report's rules. A
-// defect imported from a check record carries the checker's note as evidence;
-// a defect derived from an invariant boolean carries the standard invariant
-// message.
-func expectedFindings(r Report) []ReportFinding {
-	var out []ReportFinding
-	for _, rule := range r.Rules {
-		if rule.Status == StatusDefect {
-			evidence := rule.Note
-			if evidence == "" {
-				evidence = "invariant " + rule.Invariant + " does not hold"
-			}
-			out = append(out, ReportFinding{
-				ArtifactHash: r.Artifact.Hash,
-				RuleID:       rule.ID,
-				Version:      rule.Version,
-				Severity:     rule.Severity,
-				Invariant:    rule.Invariant,
-				Evidence:     evidence,
-			})
+// validHash64 reports whether s is exactly 64 lowercase hex characters: the
+// shape of a report id and an artifact content hash.
+func validHash64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
 		}
 	}
-	return out
+	return true
 }
 
-// sameFindings compares two finding sets independently of order; nil and empty
-// slices are treated as equal.
-func sameFindings(a, b []ReportFinding) bool {
-	if len(a) == 0 && len(b) == 0 {
+// validCheckStatus reports whether status is one of the five recorded check
+// conclusions.
+func validCheckStatus(status string) bool {
+	switch status {
+	case StatusUnchecked, StatusPass, StatusDefect, StatusToolMissing, StatusTimeout:
 		return true
 	}
-	ac := append([]ReportFinding(nil), a...)
-	bc := append([]ReportFinding(nil), b...)
-	sort.Slice(ac, func(i, j int) bool { return ac[i].RuleID < ac[j].RuleID })
-	sort.Slice(bc, func(i, j int) bool { return bc[i].RuleID < bc[j].RuleID })
-	return reflect.DeepEqual(ac, bc)
+	return false
 }
 
-// verifyReportBytes parses stored bytes and checks they match the id and that
-// the findings are consistent with the rules.
-func verifyReportBytes(data []byte, id string) error {
-	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
-		return errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+// validateReportStructure enforces the single set of admission conditions every
+// report must satisfy when it is saved, loaded or compared:
+//
+//   - the report id and the artifact hash are 64 lowercase hex characters;
+//   - the artifact name, every rule id and rule version are non-empty and rule
+//     ids are unique;
+//   - every rule status is one of the five known statuses, and 工具缺失/超时
+//     carry a non-blank note;
+//   - defect rules and findings correspond one-to-one, and every finding's
+//     artifact hash, rule version, severity and invariant match the report and
+//     the rule it belongs to;
+//   - a defect with a note uses the note verbatim as evidence; a note-less
+//     old-style boolean-invariant defect uses the standard invariant message.
+//
+// asInvalid chooses the error class: a caller's current submission failing the
+// conditions is an input-validity error; a report read from the archive failing
+// them is an archive-corruption error. Rule problems always name the rule id.
+func validateReportStructure(r Report, asInvalid bool) error {
+	errf := func(msg string) error {
+		if asInvalid {
+			return errInvalid(msg)
+		}
+		return errCorrupt(msg)
 	}
-	if r.ReportID != id {
-		return errCorrupt("report id " + r.ReportID + " does not match stored id " + id)
+	if !validHash64(r.ReportID) {
+		return errf("invalid report id " + r.ReportID + ": want 64 lowercase hex characters")
 	}
-	if ReportID(r) != id {
-		return errCorrupt("report content does not match id " + id)
+	if r.Artifact.Name == "" {
+		return errf("report " + r.ReportID + " has an empty artifact name")
 	}
-	if !sameFindings(expectedFindings(r), r.Findings) {
-		return errCorrupt("report findings do not match rules for id " + id)
+	if !validHash64(r.Artifact.Hash) {
+		return errf("report " + r.ReportID + " artifact hash is not 64 lowercase hex characters")
+	}
+	if asInvalid && ReportID(r) != r.ReportID {
+		return errf("report content does not match id " + r.ReportID)
+	}
+	rules := make(map[string]ReportRule, len(r.Rules))
+	for _, rule := range r.Rules {
+		if rule.ID == "" {
+			return errf("report " + r.ReportID + " has a rule with an empty id")
+		}
+		if _, dup := rules[rule.ID]; dup {
+			return errf("report " + r.ReportID + " has duplicate rule id " + rule.ID)
+		}
+		if rule.Version == "" {
+			return errf("report " + r.ReportID + " rule " + rule.ID + " has an empty version")
+		}
+		if !validCheckStatus(rule.Status) {
+			return errf("report " + r.ReportID + " rule " + rule.ID + " has unknown status " + rule.Status)
+		}
+		if (rule.Status == StatusToolMissing || rule.Status == StatusTimeout) && strings.TrimSpace(rule.Note) == "" {
+			return errf("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
+		}
+		rules[rule.ID] = rule
+	}
+	findings := make(map[string]ReportFinding, len(r.Findings))
+	for _, f := range r.Findings {
+		if f.RuleID == "" {
+			return errf("report " + r.ReportID + " has a finding with an empty rule id")
+		}
+		if _, dup := findings[f.RuleID]; dup {
+			return errf("report " + r.ReportID + " has a duplicate finding for rule " + f.RuleID)
+		}
+		findings[f.RuleID] = f
+		rule, ok := rules[f.RuleID]
+		if !ok {
+			return errf("report " + r.ReportID + " finding for rule " + f.RuleID + " has no defect rule")
+		}
+		if rule.Status != StatusDefect {
+			return errf("report " + r.ReportID + " finding for rule " + f.RuleID + " has rule status " + rule.Status)
+		}
+		if f.ArtifactHash != r.Artifact.Hash {
+			return errf("report " + r.ReportID + " rule " + f.RuleID + " finding artifact hash does not match report")
+		}
+		if f.Version != rule.Version {
+			return errf("report " + r.ReportID + " rule " + f.RuleID + " finding version does not match rule version")
+		}
+		if f.Severity != rule.Severity {
+			return errf("report " + r.ReportID + " rule " + f.RuleID + " finding severity does not match rule severity")
+		}
+		if f.Invariant != rule.Invariant {
+			return errf("report " + r.ReportID + " rule " + f.RuleID + " finding invariant does not match rule invariant")
+		}
+		evidence := rule.Note
+		if evidence == "" {
+			evidence = "invariant " + rule.Invariant + " does not hold"
+		}
+		if f.Evidence != evidence {
+			return errf("report " + r.ReportID + " rule " + f.RuleID + " finding evidence does not match the check note")
+		}
+	}
+	for id, rule := range rules {
+		if rule.Status == StatusDefect {
+			if _, ok := findings[id]; !ok {
+				return errf("report " + r.ReportID + " defect rule " + id + " has no finding")
+			}
+		}
 	}
 	return nil
 }
 
-// SaveReport persists a report under the store directory. The store is safe
-// for concurrent writers: identical reports share one file and all
-// submissions succeed, different reports never overwrite each other, and
-// readers only ever observe complete files. A pre-existing file with the same
-// id must carry the same report; a corrupted archive makes the submission
-// fail while keeping the original file.
+// parseArchivedReport parses stored bytes and applies every archive admission
+// condition. Every failure is reported as archive corruption.
+func parseArchivedReport(data []byte, id string) (Report, error) {
+	var r Report
+	if err := json.Unmarshal(data, &r); err != nil {
+		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	if r.ReportID != id {
+		return Report{}, errCorrupt("report id " + r.ReportID + " does not match stored id " + id)
+	}
+	if err := validateReportStructure(r, false); err != nil {
+		return Report{}, err
+	}
+	if ReportID(r) != id {
+		return Report{}, errCorrupt("report content does not match id " + id)
+	}
+	return r, nil
+}
+
+// verifyReportBytes parses stored bytes and checks they satisfy every archive
+// admission condition.
+func verifyReportBytes(data []byte, id string) error {
+	_, err := parseArchivedReport(data, id)
+	return err
+}
+
+// SaveReport persists a report under the store directory.
+//
+// The submission is validated in full before anything is written: its id and
+// artifact hash must be 64 lowercase hex characters, the id must equal the id
+// computed from the submitted content, and the rules and findings must satisfy
+// every admission condition. An invalid submission is an input error and
+// neither creates the store nor adds a file.
+//
+// Once an id has been archived its bytes can never be replaced: the archive is
+// published with an atomic hard link that fails when the slot is already
+// occupied, so the first successful archiver wins and later submissions keep
+// the original bytes. A resubmission of the same logical report (for instance
+// one differing only in rule or finding order) is a duplicate and succeeds
+// once the stored file is verified; concurrent duplicate writers all succeed
+// and leave exactly one complete file. A corrupt file already occupying the
+// slot, including one created by another process during this save, is reported
+// as archive corruption and left untouched; this submission can neither repair
+// nor overwrite it. Readers therefore only ever observe a missing slot or a
+// complete, verifiable report.
 func SaveReport(dir string, r Report) error {
-	if r.ReportID == "" {
-		return errInvalid("report id is required")
+	if err := validateReportStructure(r, true); err != nil {
+		return err
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	finalPath := filepath.Join(dir, r.ReportID+".json")
-	if existing, err := os.ReadFile(finalPath); err == nil {
-		if err := verifyReportBytes(existing, r.ReportID); err != nil {
-			return err
-		}
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	data, err := json.Marshal(r)
-	if err != nil {
+	// Duplicate fast path: a verifiable file at the slot ends the submission
+	// without creating any temporary file.
+	switch existing, err := os.ReadFile(finalPath); {
+	case err == nil:
+		return verifyReportBytes(existing, r.ReportID)
+	case !os.IsNotExist(err):
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".report-*.tmp")
@@ -448,37 +544,52 @@ func SaveReport(dir string, r Report) error {
 		return err
 	}
 	tmpPath := tmp.Name()
-	cleanup := func() { os.Remove(tmpPath) }
+	defer os.Remove(tmpPath)
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		cleanup()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		cleanup()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		cleanup()
 		return err
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		cleanup()
-		if existing, readErr := os.ReadFile(finalPath); readErr == nil {
-			if verifyErr := verifyReportBytes(existing, r.ReportID); verifyErr != nil {
-				return verifyErr
-			}
+	// Hard link is atomic and never overwrites: exactly one writer occupies
+	// the slot, and it appears complete the moment it is visible.
+	const attempts = 16
+	for i := 0; i < attempts; i++ {
+		err := os.Link(tmpPath, finalPath)
+		if err == nil {
 			return nil
 		}
-		return err
+		existing, readErr := os.ReadFile(finalPath)
+		switch {
+		case readErr == nil:
+			// Another writer won the slot (duplicate), or a corrupt file now
+			// occupies it. Either way the slot must not be replaced.
+			return verifyReportBytes(existing, r.ReportID)
+		case !os.IsNotExist(readErr):
+			return readErr
+		case !os.IsExist(err):
+			// Slot is free but linking failed for another reason; retrying
+			// cannot help.
+			return err
+		}
+		// EEXIST raced with an external removal: retry the atomic publish.
 	}
-	return nil
+	return err
 }
 
-// LoadReport reads and verifies a report by id. Missing, corrupted or tampered
-// archives produce a clear error.
+// LoadReport reads and verifies a report by id. A malformed id is an input
+// error, a valid id without a file is a not-found error, and a file that fails
+// any admission condition (bad JSON, id mismatch, invalid rules or findings)
+// is an archive-corruption error. The store is never modified.
 func LoadReport(dir, id string) (Report, error) {
+	if !validHash64(id) {
+		return Report{}, errInvalid("invalid report id " + id + ": want 64 lowercase hex characters")
+	}
 	data, err := os.ReadFile(filepath.Join(dir, id+".json"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -486,20 +597,7 @@ func LoadReport(dir, id string) (Report, error) {
 		}
 		return Report{}, err
 	}
-	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
-		return Report{}, errCorrupt("invalid JSON in report " + id)
-	}
-	if r.ReportID != id {
-		return Report{}, errCorrupt("report id " + r.ReportID + " does not match requested id " + id)
-	}
-	if ReportID(r) != id {
-		return Report{}, errCorrupt("report content does not match id " + id)
-	}
-	if !sameFindings(expectedFindings(r), r.Findings) {
-		return Report{}, errCorrupt("report findings do not match rules for id " + id)
-	}
-	return r, nil
+	return parseArchivedReport(data, id)
 }
 
 type errNotFound string
