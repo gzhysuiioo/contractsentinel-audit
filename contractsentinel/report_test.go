@@ -207,7 +207,7 @@ func TestParseAuditInputValid(t *testing.T) {
 		"rules": [{"id":"r1","kind":"static","severity":"high","invariant":"inv","requiresABI":true,"version":"1.0.0"}],
 		"invariants": {"inv": false}
 	}`
-	artifact, rules, invariants, err := ParseAuditInput([]byte(input))
+	artifact, rules, invariants, _, err := ParseAuditInput([]byte(input))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,14 +223,14 @@ func TestParseAuditInputValid(t *testing.T) {
 }
 
 func TestParseAuditInputInvalidJSON(t *testing.T) {
-	if _, _, _, err := ParseAuditInput([]byte(`{not json`)); err == nil {
+	if _, _, _, _, err := ParseAuditInput([]byte(`{not json`)); err == nil {
 		t.Fatal("expected invalid JSON error")
 	}
 }
 
 func TestParseAuditInputBooleanTypeError(t *testing.T) {
 	input := `{"artifact":{"name":"A"},"rules":[],"invariants":{"inv":"true"}}`
-	_, _, _, err := ParseAuditInput([]byte(input))
+	_, _, _, _, err := ParseAuditInput([]byte(input))
 	if err == nil || !strings.Contains(err.Error(), "boolean") {
 		t.Fatalf("expected boolean type error, got %v", err)
 	}
@@ -238,7 +238,7 @@ func TestParseAuditInputBooleanTypeError(t *testing.T) {
 
 func TestParseAuditInputInvariantsNotObject(t *testing.T) {
 	input := `{"artifact":{"name":"A"},"rules":[],"invariants":[1,2]}`
-	if _, _, _, err := ParseAuditInput([]byte(input)); err == nil {
+	if _, _, _, _, err := ParseAuditInput([]byte(input)); err == nil {
 		t.Fatal("expected error when invariants is not an object")
 	}
 }

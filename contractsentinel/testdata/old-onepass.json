@@ -1,0 +1,19 @@
+{
+  "reportId": "00af33dc11fae0978423148b06d13675df1d540d5f183c4b0f0fb9649da02a78",
+  "artifact": {
+    "name": "Vault",
+    "hash": "e1e82c7b935a680b3334dd37eb0d7d4cdfeb3efff1a822a8aa57ffa228e0ed59"
+  },
+  "rules": [
+    {
+      "id": "r1",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "inv",
+      "requiresABI": false,
+      "version": "1.0.0",
+      "status": "通过"
+    }
+  ],
+  "findings": []
+}

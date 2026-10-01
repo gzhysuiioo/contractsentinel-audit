@@ -8,6 +8,7 @@ const (
 	ChangeNewDefect      = "新发现缺陷"
 	ChangeResolvedDefect = "已消除缺陷"
 	ChangeStatusChanged  = "检查状态变化"
+	ChangeNoteChanged    = "检查说明变化"
 	ChangeNoChange       = "无变化"
 	ChangeRuleAdded      = "新增规则"
 	ChangeRuleRemoved    = "移除规则"
@@ -45,6 +46,7 @@ type DiffSummary struct {
 	NewDefects      int `json:"newDefects"`
 	ResolvedDefects int `json:"resolvedDefects"`
 	StatusChanges   int `json:"statusChanges"`
+	NoteChanges     int `json:"noteChanges"`
 	NoChange        int `json:"noChange"`
 	AddedRules      int `json:"addedRules"`
 	RemovedRules    int `json:"removedRules"`
@@ -95,7 +97,7 @@ func validateDiffReport(r Report) error {
 			return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " has an empty version")
 		}
 		switch rule.Status {
-		case StatusUnchecked, StatusPass, StatusDefect:
+		case StatusUnchecked, StatusPass, StatusDefect, StatusToolMissing, StatusTimeout:
 		default:
 			return errCorrupt("report " + r.ReportID + " rule " + rule.ID + " has unknown status " + rule.Status)
 		}
@@ -228,18 +230,27 @@ func DiffReports(before, after Report) DiffResult {
 			entry.Before = diffSide(b, beforeFindings)
 			entry.After = diffSide(a, afterFindings)
 			switch {
-			case b.Status == a.Status:
+			case b.Status != a.Status:
+				switch {
+				case b.Status == StatusPass && a.Status == StatusDefect:
+					entry.Change = ChangeNewDefect
+					result.Summary.NewDefects++
+				case b.Status == StatusDefect && a.Status == StatusPass:
+					entry.Change = ChangeResolvedDefect
+					result.Summary.ResolvedDefects++
+				default:
+					// Transitions involving 工具缺失/超时/未检查, and any
+					// transition other than 通过<->发现缺陷, are status
+					// changes, never defects.
+					entry.Change = ChangeStatusChanged
+					result.Summary.StatusChanges++
+				}
+			case b.Note != a.Note:
+				entry.Change = ChangeNoteChanged
+				result.Summary.NoteChanges++
+			default:
 				entry.Change = ChangeNoChange
 				result.Summary.NoChange++
-			case b.Status == StatusPass && a.Status == StatusDefect:
-				entry.Change = ChangeNewDefect
-				result.Summary.NewDefects++
-			case b.Status == StatusDefect && a.Status == StatusPass:
-				entry.Change = ChangeResolvedDefect
-				result.Summary.ResolvedDefects++
-			default:
-				entry.Change = ChangeStatusChanged
-				result.Summary.StatusChanges++
 			}
 		}
 		result.Results = append(result.Results, entry)

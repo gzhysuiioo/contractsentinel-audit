@@ -1,0 +1,54 @@
+{
+  "reportId": "8f6b21baff121b19a8d0391a81f6515fa106d1574a384b4cd7d8afc198a03882",
+  "artifact": {
+    "name": "Vault",
+    "hash": "e1e82c7b935a680b3334dd37eb0d7d4cdfeb3efff1a822a8aa57ffa228e0ed59"
+  },
+  "rules": [
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.0.0",
+      "status": "发现缺陷"
+    },
+    {
+      "id": "access-control",
+      "kind": "static",
+      "severity": "medium",
+      "invariant": "owner-only-withdraw",
+      "requiresABI": true,
+      "version": "2.1.0",
+      "status": "通过"
+    },
+    {
+      "id": "invariant-preserved",
+      "kind": "symbolic",
+      "severity": "critical",
+      "invariant": "balance-monotonic",
+      "requiresABI": false,
+      "version": "0.9.0",
+      "status": "发现缺陷"
+    }
+  ],
+  "findings": [
+    {
+      "artifactHash": "e1e82c7b935a680b3334dd37eb0d7d4cdfeb3efff1a822a8aa57ffa228e0ed59",
+      "ruleId": "reentrancy-guard",
+      "version": "1.0.0",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "evidence": "invariant no-reentrant-withdraw does not hold"
+    },
+    {
+      "artifactHash": "e1e82c7b935a680b3334dd37eb0d7d4cdfeb3efff1a822a8aa57ffa228e0ed59",
+      "ruleId": "invariant-preserved",
+      "version": "0.9.0",
+      "severity": "critical",
+      "invariant": "balance-monotonic",
+      "evidence": "invariant balance-monotonic does not hold"
+    }
+  ]
+}
