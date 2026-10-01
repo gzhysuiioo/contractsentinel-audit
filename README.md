@@ -12,6 +12,17 @@ go run ./cmd/contractsentinel version
 go test ./...
 ```
 
+## 审计报告存档
+
+`audit` 提交一次审计并保存报告，`report` 按标识读取已保存报告：
+
+```bash
+go run ./cmd/contractsentinel audit --input submission.json --store ./reports
+go run ./cmd/contractsentinel report --store ./reports --id <报告标识>
+```
+
+提交文件是一个 JSON 对象：`artifact`（name/abi/bytecode/source）、`rules`（在现有规则字段上另带非空 `version`）、`invariants`（名称到布尔值的映射）。报告记录产物内容哈希（SHA-256，仅覆盖 ABI、字节码、源码的原始内容并区分字段边界）、每条规则的检查状态（未检查/通过/发现缺陷）以及绑定了产物哈希、规则标识、版本与证据的发现。报告标识由产物哈希、名称、完整规则定义和各规则实际使用的不变式值共同决定：同一输入重复提交得到同一标识和逐字节相同的报告，规则顺序与无关不变式键不影响结果。相同报告只保留一份；写入经临时文件原子提交，并发提交与中断重试均安全；内容被篡改（包括发现证据）的存档在读取和再次提交时都会报错且不被覆盖。
+
 ## 技术方向
 
 smart-contract-audit, formal-verification, symbolic-execution, fuzzing, security, exploit-analysis, reentrancy

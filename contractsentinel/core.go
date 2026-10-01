@@ -5,10 +5,10 @@ import "sort"
 
 // Artifact is one compiled contract target under audit.
 type Artifact struct {
-	Name     string
-	ABI      string
-	Bytecode string
-	Source   string
+	Name     string `json:"name"`
+	ABI      string `json:"abi"`
+	Bytecode string `json:"bytecode"`
+	Source   string `json:"source"`
 }
 
 // Finding is one rule violation with the invariant it breaks.
@@ -21,11 +21,12 @@ type Finding struct {
 
 // Rule is a static or symbolic check the pipeline can run.
 type Rule struct {
-	ID          string
-	Kind        string
-	Severity    string
-	Invariant   string
-	RequiresABI bool
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Severity    string `json:"severity"`
+	Invariant   string `json:"invariant"`
+	RequiresABI bool   `json:"requiresABI"`
+	Version     string `json:"version"`
 }
 
 // Run executes the deterministic subset of rules and refuses inputs they need.
