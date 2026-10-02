@@ -65,6 +65,8 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 			present, items = applyRemove(items, present, tr.Name)
 		case "set":
 			present, items = applySet(items, present, tr.Name, tr.Value)
+		case "rename":
+			items = applyRename(items, tr.Name, tr.To)
 		}
 	}
 
@@ -128,6 +130,34 @@ func applySet(items []queryItem, present bool, name, value string) (bool, []quer
 		}
 	}
 	return true, kept
+}
+
+// applyRename renames in place every parameter whose decoded name equals
+// name: its name is re-encoded as to while the '=' (if any) and the raw
+// value bytes after it are kept verbatim. Parameters already named to,
+// empty fragments and non-matching parameters are untouched; when nothing
+// matches (or name and to are identical) every fragment keeps its bytes.
+func applyRename(items []queryItem, name, to string) []queryItem {
+	if name == to {
+		// Renaming to the same name must not re-encode existing names.
+		return items
+	}
+	encodedTo := encodeQueryComponent(to)
+	for k := range items {
+		if items[k].empty || items[k].name != name {
+			continue
+		}
+		frag := items[k].raw
+		if j := strings.IndexByte(frag, '='); j >= 0 {
+			// Keep the '=' and everything after it byte for byte.
+			frag = encodedTo + frag[j:]
+		} else {
+			frag = encodedTo
+		}
+		items[k].raw = frag
+		items[k].name = to
+	}
+	return items
 }
 
 // decodeQueryName percent-decodes a raw parameter name with '+' treated as a

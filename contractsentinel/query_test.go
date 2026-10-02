@@ -182,6 +182,149 @@ func TestQueryTransformRemove(t *testing.T) {
 	}
 }
 
+func TestQueryTransformRenameSpecExample(t *testing.T) {
+	// old=1&new=9&%6Fld=%2f+&old&x= renamed old -> new
+	rules := `[{"op":"rename","name":"old","to":"new"}]`
+	got := transformResult(t, rules, "/p?old=1&new=9&%6Fld=%2f+&old&x=")
+	want := "http://h.internal/base/p?new=1&new=9&new=%2f+&new&x="
+	if got != want {
+		t.Fatalf("upstreamURL = %q, want %q", got, want)
+	}
+}
+
+func TestQueryTransformRename(t *testing.T) {
+	cases := []struct {
+		name      string
+		rules     string
+		target    string
+		wantQuery string // expected suffix after http://h.internal/base/p
+	}{
+		{
+			name:      "rename every hit in place keeping values count and order",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=1&b=2&old=3",
+			wantQuery: "?new=1&b=2&new=3",
+		},
+		{
+			name:      "rename keeps an existing target parameter without merging",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=1&new=9&old=2",
+			wantQuery: "?new=1&new=9&new=2",
+		},
+		{
+			name:      "rename matches percent-decoded source names",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?%6Fld=1",
+			wantQuery: "?new=1",
+		},
+		{
+			name:      "rename matches plus-as-space source names",
+			rules:     `[{"op":"rename","name":"a b","to":"c d"}]`,
+			target:    "/p?a+b=1",
+			wantQuery: "?c%20d=1",
+		},
+		{
+			name:      "rename is case sensitive",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?OLD=1&old=2",
+			wantQuery: "?OLD=1&new=2",
+		},
+		{
+			name:      "rename keeps a valueless parameter valueless",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old&x=1",
+			wantQuery: "?new&x=1",
+		},
+		{
+			name:      "rename keeps an empty value's equals sign",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=&x=1",
+			wantQuery: "?new=&x=1",
+		},
+		{
+			name:      "rename preserves value bytes verbatim",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=%2f+%2F+a=b&x",
+			wantQuery: "?new=%2f+%2F+a=b&x",
+		},
+		{
+			name:      "rename encodes the new name like set",
+			rules:     `[{"op":"rename","name":"old","to":"n ew/x"}]`,
+			target:    "/p?old=1",
+			wantQuery: "?n%20ew%2Fx=1",
+		},
+		{
+			name:      "rename leaves non-hit fragments and empty fragments as is",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?a=1&&old=2&&",
+			wantQuery: "?a=1&&new=2&&",
+		},
+		{
+			name:      "rename with no hit changes nothing byte for byte",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?a=1&%62=2",
+			wantQuery: "?a=1&%62=2",
+		},
+		{
+			name:      "rename with no query string does not create a mark",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p",
+			wantQuery: "",
+		},
+		{
+			name:      "rename with no hit keeps an empty question mark",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?",
+			wantQuery: "?",
+		},
+		{
+			name:      "rename after a hit keeps an empty question mark with empties",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=1&",
+			wantQuery: "?new=1&",
+		},
+		{
+			name:      "rename to the same name does not re-encode the name",
+			rules:     `[{"op":"rename","name":"a b","to":"a b"}]`,
+			target:    "/p?a+b=1&a%20b=2",
+			wantQuery: "?a+b=1&a%20b=2",
+		},
+		{
+			name:      "rename chains: later set merges originals and renamed",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"set","name":"new","value":"z"}]`,
+			target:    "/p?new=1&old=2&x=3",
+			wantQuery: "?new=z&x=3",
+		},
+		{
+			name:      "rename chains: later remove drops originals and renamed",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"remove","name":"new"}]`,
+			target:    "/p?new=1&old=2&x=3",
+			wantQuery: "?x=3",
+		},
+		{
+			name:      "rename chains: remove source after rename hits nothing",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"remove","name":"old"}]`,
+			target:    "/p?old=1&x=3",
+			wantQuery: "?new=1&x=3",
+		},
+		{
+			name:      "set then rename moves the merged pair",
+			rules:     `[{"op":"set","name":"old","value":"z"},{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=1&old=2&x=3",
+			wantQuery: "?new=z&x=3",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformResult(t, tc.rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // encodeJSONString renders s as a JSON string literal for embedding in config JSON.
 func encodeJSONString(s string) string {
 	b, _ := json.Marshal(s)
@@ -268,6 +411,14 @@ func TestQueryTransformInvalidConfig(t *testing.T) {
 		{"set numeric value", `[{"op":"set","name":"a","value":1}]`, "value must be a string", true},
 		{"remove with value", `[{"op":"remove","name":"a","value":"x"}]`, "remove must not include a value", true},
 		{"remove with empty value still rejected", `[{"op":"remove","name":"a","value":""}]`, "remove must not include a value", true},
+		{"rename missing to", `[{"op":"rename","name":"a"}]`, "rename requires a non-empty string to", true},
+		{"rename null to", `[{"op":"rename","name":"a","to":null}]`, "to must be a non-empty string", true},
+		{"rename numeric to", `[{"op":"rename","name":"a","to":1}]`, "to must be a non-empty string", true},
+		{"rename empty to", `[{"op":"rename","name":"a","to":""}]`, "to must be a non-empty string", true},
+		{"rename with value", `[{"op":"rename","name":"a","to":"b","value":"x"}]`, "rename must not include a value", true},
+		{"rename with empty value still rejected", `[{"op":"rename","name":"a","to":"b","value":""}]`, "rename must not include a value", true},
+		{"rename missing name", `[{"op":"rename","to":"b"}]`, "name is required", true},
+		{"rename empty name", `[{"op":"rename","name":"","to":"b"}]`, "name must be a non-empty string", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
