@@ -10,13 +10,28 @@ import (
 	"strings"
 )
 
-// Route is one configured route: an id, accepted methods, a path prefix and
-// the upstream URL requests on that route are forwarded to.
+// Route is one configured route: an id, accepted methods, a path prefix, the
+// upstream URL requests on that route are forwarded to, and optional rules
+// that rewrite the query string after matching.
 type Route struct {
-	ID         string   `json:"id"`
-	Methods    []string `json:"methods"`
-	PathPrefix string   `json:"pathPrefix"`
-	Upstream   string   `json:"upstream"`
+	ID              string          `json:"id"`
+	Methods         []string        `json:"methods"`
+	PathPrefix      string          `json:"pathPrefix"`
+	Upstream        string          `json:"upstream"`
+	QueryTransforms json.RawMessage `json:"queryTransforms"`
+
+	// queryRules is the validated, parsed form of QueryTransforms; it is
+	// populated by ParseConfig and never read from JSON directly.
+	queryRules []QueryTransform
+}
+
+// QueryTransform is one rule that rewrites the query string of the matched
+// route's upstream URL. Rules run in array order against the result of the
+// previous rule.
+type QueryTransform struct {
+	Op    string  `json:"op"`
+	Name  string  `json:"name"`
+	Value *string `json:"value"`
 }
 
 // Config is the resolve configuration: a flat array of routes.
@@ -95,6 +110,11 @@ func (cfg *Config) validate() *Failure {
 		if f := validateUpstream(route.Upstream, loc, route.ID); f != nil {
 			return f
 		}
+		rules, f := validateQueryTransforms(route.QueryTransforms, loc, route.ID)
+		if f != nil {
+			return f
+		}
+		route.queryRules = rules
 	}
 	return nil
 }
@@ -128,6 +148,52 @@ func validateUpstream(raw, loc, id string) *Failure {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
 	return nil
+}
+
+// validateQueryTransforms parses and fully validates the optional
+// queryTransforms array. A missing field yields no rules; an explicit null,
+// a non-array value, a null rule, a rule with a wrong-typed or unknown op,
+// an empty name, a set missing a string value, or a remove carrying a value
+// all invalidate the whole configuration. Rule errors carry the 1-based
+// index of the rule within the array.
+func validateQueryTransforms(raw json.RawMessage, loc, id string) ([]QueryTransform, *Failure) {
+	if raw == nil {
+		return nil, nil
+	}
+	if string(raw) == "null" {
+		return nil, failuref("invalid_config", "%s (id %q): queryTransforms must not be null", loc, id)
+	}
+	var rules []json.RawMessage
+	if err := json.Unmarshal(raw, &rules); err != nil {
+		return nil, failuref("invalid_config", "%s (id %q): queryTransforms must be an array of rules: %v", loc, id, err)
+	}
+	out := make([]QueryTransform, 0, len(rules))
+	for i, rraw := range rules {
+		rloc := fmt.Sprintf("%s (id %q): queryTransforms rule %d", loc, id, i+1)
+		if len(rraw) == 0 || string(rraw) == "null" {
+			return nil, failuref("invalid_config", "%s: rule must not be null", rloc)
+		}
+		var rule QueryTransform
+		if err := json.Unmarshal(rraw, &rule); err != nil {
+			return nil, failuref("invalid_config", "%s: rule has invalid fields: %v", rloc, err)
+		}
+		switch rule.Op {
+		case "set", "remove":
+		default:
+			return nil, failuref("invalid_config", "%s: op must be \"set\" or \"remove\", got %q", rloc, rule.Op)
+		}
+		if rule.Name == "" {
+			return nil, failuref("invalid_config", "%s: name must be a non-empty string", rloc)
+		}
+		if rule.Op == "set" && rule.Value == nil {
+			return nil, failuref("invalid_config", "%s: set requires a string value", rloc)
+		}
+		if rule.Op == "remove" && rule.Value != nil {
+			return nil, failuref("invalid_config", "%s: remove must not have a value", rloc)
+		}
+		out = append(out, rule)
+	}
+	return out, nil
 }
 
 // ParseRequest parses and validates one JSON request.
@@ -287,10 +353,192 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	}
 
 	result := route.Upstream[:schemeEnd+3] + hostPart + joined
-	if i := strings.IndexByte(target, '?'); i >= 0 {
-		result += "?" + target[i+1:] // raw query: duplicates, empty values and order preserved
+
+	qidx := strings.IndexByte(target, '?')
+	hadQuery := qidx >= 0
+	rawQuery := ""
+	if hadQuery {
+		rawQuery = target[qidx+1:]
+	}
+	transformed, nfrags, f := applyQueryTransforms(route.queryRules, rawQuery)
+	if f != nil {
+		return "", f
+	}
+	switch {
+	case nfrags > 0:
+		// At least one fragment (empty ones included) survives: re-emit the
+		// question mark with whatever text remains.
+		result += "?" + transformed
+	case hadQuery && rawQuery == "":
+		// An originally empty query string keeps its bare question mark even
+		// when no rule changed anything.
+		result += "?"
+		// Otherwise every fragment (and there was at least one) was removed:
+		// the question mark disappears along with them.
 	}
 	return result, nil
+}
+
+// queryFragment is one piece of a query string split on "&". Empty fragments
+// (from "&&" or a trailing "&") are preserved verbatim and never treated as
+// parameters. A non-empty fragment is a parameter: its name is the part
+// before the first "=" (or the whole fragment when there is no "="), decoded
+// for name matching.
+type queryFragment struct {
+	text    string // current output text; replaced when a rule rewrites it
+	isParam bool
+	name    string // decoded name, valid only when isParam
+}
+
+// applyQueryTransforms runs the route's rules in array order over the raw
+// query string. With no rules the raw string is returned byte for byte.
+// Splitting is on "&" only; the first "=" separates the name from the value.
+// Names are compared case-sensitively after decoding percent escapes and
+// treating "+" as a space, with no other normalization. The second return
+// value is the number of surviving fragments (empty fragments included),
+// which the caller needs to decide whether the question mark survives.
+func applyQueryTransforms(rules []QueryTransform, rawQuery string) (string, int, *Failure) {
+	var frags []queryFragment
+	if rawQuery != "" {
+		for _, part := range strings.Split(rawQuery, "&") {
+			if part == "" {
+				frags = append(frags, queryFragment{text: part})
+				continue
+			}
+			name := part
+			if eq := strings.IndexByte(part, '='); eq >= 0 {
+				name = part[:eq]
+			}
+			decoded, f := decodeQueryName(name)
+			if f != nil {
+				return "", 0, f
+			}
+			frags = append(frags, queryFragment{text: part, isParam: true, name: decoded})
+		}
+	}
+
+	for _, rule := range rules {
+		switch rule.Op {
+		case "set":
+			frags = applySet(frags, rule)
+		case "remove":
+			frags = applyRemove(frags, rule)
+		}
+	}
+
+	texts := make([]string, len(frags))
+	for i := range frags {
+		texts[i] = frags[i].text
+	}
+	return strings.Join(texts, "&"), len(frags), nil
+}
+
+// applySet merges every parameter with the rule's name into a single
+// fragment placed at the first match; when none matches, the new fragment is
+// appended at the end. The rule's name and value are used literally and
+// percent-encoded only on output.
+func applySet(frags []queryFragment, rule QueryTransform) []queryFragment {
+	encoded := encodeQueryComponent(rule.Name) + "=" + encodeQueryComponent(*rule.Value)
+	first := -1
+	for i := range frags {
+		if frags[i].isParam && frags[i].name == rule.Name {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return append(frags, queryFragment{text: encoded, isParam: true, name: rule.Name})
+	}
+	frags[first].text = encoded
+	kept := frags[:0]
+	for i := range frags {
+		if i != first && frags[i].isParam && frags[i].name == rule.Name {
+			continue // merge away the other matches into the first position
+		}
+		kept = append(kept, frags[i])
+	}
+	return kept
+}
+
+// applyRemove deletes every parameter whose decoded name matches the rule's
+// name. Empty fragments are not parameters and are always kept.
+func applyRemove(frags []queryFragment, rule QueryTransform) []queryFragment {
+	kept := frags[:0]
+	for i := range frags {
+		if frags[i].isParam && frags[i].name == rule.Name {
+			continue
+		}
+		kept = append(kept, frags[i])
+	}
+	return kept
+}
+
+// encodeQueryComponent renders a literal name or value for the query string.
+// ASCII letters, digits and "-._~" appear unchanged; every other byte (spaces
+// included) is emitted as an uppercase percent escape, with a space written
+// as "%20" rather than "+".
+func encodeQueryComponent(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case isUnreserved(c):
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
+}
+
+func isUnreserved(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	case '-', '.', '_', '~':
+		return true
+	}
+	return false
+}
+
+// decodeQueryName reverses percent escapes in a parameter name for matching:
+// "%XX" yields the byte XX, "+" yields a space, and everything else is taken
+// literally. Malformed escapes are rejected (request validation normally
+// catches these up front).
+func decodeQueryName(s string) (string, *Failure) {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '+':
+			b.WriteByte(' ')
+		case c == '%':
+			if i+2 >= len(s) || !isHex(s[i+1]) || !isHex(s[i+2]) {
+				return "", failuref("invalid_request", "target contains an invalid percent escape")
+			}
+			b.WriteByte(hexVal(s[i+1])<<4 | hexVal(s[i+2]))
+			i += 2
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), nil
+}
+
+func hexVal(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
 }
 
 // isToken reports whether s is an RFC 7230 token, i.e. a legal HTTP method.

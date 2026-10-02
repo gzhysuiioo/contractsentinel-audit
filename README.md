@@ -41,6 +41,26 @@ go test ./...
 {"routeId":"api","upstreamURL":"http://api.internal/v1/orders/7?a=1&a="}
 ```
 
+带查询串改写的配置（命中后 `set` 名称 `a` 值空字符串、`remove` 名称 `flag`）：
+
+```json
+{
+  "routes": [
+    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1",
+     "queryTransforms": [
+       {"op": "set",    "name": "a",    "value": ""},
+       {"op": "remove", "name": "flag"}
+     ]}
+  ]
+}
+```
+
+请求 `/api/orders?x=%2f&a=1&%61=2&flag` 的输出为：
+
+```json
+{"routeId":"api","upstreamURL":"http://api.internal/v1/orders?x=%2f&a="}
+```
+
 匹配规则：
 
 - `methods` 为非空数组，元素是区分大小写的具体 HTTP 方法名或 `*`（匹配任意合法方法）。
@@ -53,6 +73,32 @@ go test ./...
 - 命中后去掉请求路径前缀，剩余路径接到 upstream 基础路径之后，连接处恰好
   保留一个 `/`（剩余路径为空也保留）；根前缀 `/` 保留其后全部路径。连接处
   以外的路径、百分号编码与原始查询串（含重复参数、空值与顺序）逐字节保留。
+
+查询串改写（`queryTransforms`）：
+
+- 每条路由可新增 `queryTransforms` 数组，规则按数组顺序执行，作用于路由
+  选定后的查询串，不改变匹配、冲突判定与路径拼接。
+- 每条规则含 `op`（仅支持 `set`、`remove`）与 `name`（非空字符串，按字面
+  值使用）；`set` 必须提供字符串 `value`（允许空字符串），`remove` 不接受
+  `value`。
+- 省略或为空数组时逐字节保留原查询串；`null`、规则为 `null`、字段类型错误、
+  未知操作、空名称、缺少必要字段或 `remove` 带 `value` 均使整个配置返回
+  `invalid_config`（即使出错路由未被命中），reason 定位到路由，规则错误给出
+  从 1 开始的序号。
+- 查询串只以 `&` 分隔参数，第一个 `=` 分开名称与值，没有 `=` 的参数也可按
+  名称命中；空查询串视为没有片段，其余空片段保留且不作为参数。比较参数名
+  称时解码百分号转义、把 `+` 视为空格、区分大小写，不做其他归一化。
+- `remove` 删除该名称的全部参数；`set` 将该名称的全部参数合并成一个，放在
+  首次命中的位置，原来没有时追加到末尾。新增或替换的参数写成编码后的
+  `name=value`：仅 ASCII 字母、数字及 `-._~` 原样出现，其他 UTF-8 字节使用
+  大写百分号转义，空格写为 `%20`。未被修改的参数与空片段保持原始内容及相对
+  顺序，后续规则基于前一步结果执行。
+- 没有查询串时 `remove` 不产生问号、`set` 创建查询串；原先空查询串的问号在
+  没有实际修改时保留；删除命中参数后若参数与空片段均已清空则去掉问号。
+  非法百分号转义返回 `invalid_request`。
+
+示例：查询串 `x=%2f&a=1&%61=2&flag`，依次 `set` 名称 `a` 值空字符串、
+`remove` 名称 `flag`，结果为 `x=%2f&a=`。
 
 失败时标准错误输出含 `code`、`reason` 的 JSON（`route_conflict` 另含
 `candidates`），退出状态非零，标准输出不留下结果：
