@@ -9,8 +9,18 @@
 ```bash
 go run ./cmd/contractsentinel demo
 go run ./cmd/contractsentinel version
+go run ./cmd/contractsentinel help
+go run ./cmd/contractsentinel resolve <config.json> < request.json
 go test ./...
 ```
+
+`resolve` 从标准输入读取一个 JSON 请求（`method`、`target`），在离线状态下依据配置文件中的 `routes`（每条含 `id`、`methods`、`pathPrefix`、`upstream`）进行前缀匹配，并向标准输出输出命中的路由与上游地址：
+
+```json
+{"routeId":"orders","upstreamURL":"https://upstream.example.com/base/orders?x=1"}
+```
+
+失败时标准输出为空，标准错误输出含 `code`、`reason` 的 JSON 并以非零状态退出：`invalid_config`、`invalid_request`、`route_not_found`、`route_conflict`（冲突时另含按 id 排序的 `candidates`）。
 
 ## 技术方向
 
