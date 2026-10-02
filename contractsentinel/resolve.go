@@ -24,12 +24,14 @@ type Route struct {
 }
 
 // QueryTransform is one rule in a route's queryTransforms array: op is
-// "set" or "remove", name is matched against decoded parameter names, and
-// value (set only) is used literally.
+// "set", "remove" or "rename"; name is matched against decoded parameter
+// names; value (set only) is used literally; to (rename only) is the
+// literal new parameter name.
 type QueryTransform struct {
 	Op    string `json:"op"`
 	Name  string `json:"name"`
 	Value string `json:"value"`
+	To    string `json:"to"`
 }
 
 // routeJSON mirrors Route, keeping queryTransforms as raw JSON so null,
@@ -100,8 +102,8 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
 		case !jsonString(opRaw, &qt.Op):
 			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
-		case qt.Op != "set" && qt.Op != "remove":
-			return nil, failuref("invalid_config", "%s: unknown op %q (only set and remove are supported)", ruleLoc, qt.Op)
+		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename":
+			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove and rename are supported)", ruleLoc, qt.Op)
 		}
 
 		nameRaw, ok := fields["name"]
@@ -126,6 +128,19 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 		case "remove":
 			if hasValue {
 				return nil, failuref("invalid_config", "%s: remove must not include a value", ruleLoc)
+			}
+		case "rename":
+			toRaw, hasTo := fields["to"]
+			switch {
+			case !hasTo:
+				return nil, failuref("invalid_config", "%s: rename requires a string to", ruleLoc)
+			case !jsonString(toRaw, &qt.To):
+				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
+			case qt.To == "":
+				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
+			}
+			if hasValue {
+				return nil, failuref("invalid_config", "%s: rename must not include a value", ruleLoc)
 			}
 		}
 		transforms = append(transforms, qt)

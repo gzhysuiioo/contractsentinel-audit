@@ -182,6 +182,151 @@ func TestQueryTransformRemove(t *testing.T) {
 	}
 }
 
+func TestQueryTransformRename(t *testing.T) {
+	cases := []struct {
+		name      string
+		rules     string
+		target    string
+		wantQuery string // expected suffix after http://h.internal/base/p
+	}{
+		{
+			name:      "spec example renames every hit in place keeping values",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=1&new=9&%6Fld=%2f+&old&x=",
+			wantQuery: "?new=1&new=9&new=%2f+&new&x=",
+		},
+		{
+			name:      "renames a parameter without an equals sign",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old&x=1",
+			wantQuery: "?new&x=1",
+		},
+		{
+			name:      "renames an empty value keeping the equals sign",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=",
+			wantQuery: "?new=",
+		},
+		{
+			name:      "keeps plus escapes extra equals and case in values",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?old=%2f+&old=x=y&old=AbC%3d",
+			wantQuery: "?new=%2f+&new=x=y&new=AbC%3d",
+		},
+		{
+			name:      "renames all duplicates in their original relative order",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?z=9&old=1&a=2&old=3&b=4",
+			wantQuery: "?z=9&new=1&a=2&new=3&b=4",
+		},
+		{
+			name:      "leaves parameters already named to untouched",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?new=9&old=1",
+			wantQuery: "?new=9&new=1",
+		},
+		{
+			name:      "preserves empty fragments around renamed parameters",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?a=1&&old=2&",
+			wantQuery: "?a=1&&new=2&",
+		},
+		{
+			name:      "matches percent-decoded source names",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?%6Fld=1",
+			wantQuery: "?new=1",
+		},
+		{
+			name:      "matches plus-as-space source names",
+			rules:     `[{"op":"rename","name":"old name","to":"new"}]`,
+			target:    "/p?old+name=1",
+			wantQuery: "?new=1",
+		},
+		{
+			name:      "rename is case sensitive",
+			rules:     `[{"op":"rename","name":"Old","to":"new"}]`,
+			target:    "/p?old=1",
+			wantQuery: "?old=1",
+		},
+		{
+			name:      "encodes the target name like set",
+			rules:     `[{"op":"rename","name":"old","to":"new name"}]`,
+			target:    "/p?old=1",
+			wantQuery: "?new%20name=1",
+		},
+		{
+			name:      "encodes reserved bytes in the target name",
+			rules:     `[{"op":"rename","name":"old","to":"a/b=c"}]`,
+			target:    "/p?old=1",
+			wantQuery: "?a%2Fb%3Dc=1",
+		},
+		{
+			name:      "no hit leaves the query completely unchanged",
+			rules:     `[{"op":"rename","name":"zzz","to":"new"}]`,
+			target:    "/p?old=1&b=2",
+			wantQuery: "?old=1&b=2",
+		},
+		{
+			name:      "no hit on a valueless parameter leaves it unchanged",
+			rules:     `[{"op":"rename","name":"zzz","to":"new"}]`,
+			target:    "/p?old",
+			wantQuery: "?old",
+		},
+		{
+			name:      "name equal to to rewrites nothing",
+			rules:     `[{"op":"rename","name":"old","to":"old"}]`,
+			target:    "/p?%6Fld=1&old=2",
+			wantQuery: "?%6Fld=1&old=2",
+		},
+		{
+			name:      "rename with no query string does not create a question mark",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p",
+			wantQuery: "",
+		},
+		{
+			name:      "rename on an empty question mark keeps the mark",
+			rules:     `[{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?",
+			wantQuery: "?",
+		},
+		{
+			name:      "rename then set merges all parameters now named to",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"set","name":"new","value":"v"}]`,
+			target:    "/p?old=1&new=9",
+			wantQuery: "?new=v",
+		},
+		{
+			name:      "rename then remove deletes all parameters now named to",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"remove","name":"new"}]`,
+			target:    "/p?old=1&new=9&x=2",
+			wantQuery: "?x=2",
+		},
+		{
+			name:      "set then rename renames the appended parameter",
+			rules:     `[{"op":"set","name":"old","value":"1"},{"op":"rename","name":"old","to":"new"}]`,
+			target:    "/p?a=1",
+			wantQuery: "?a=1&new=1",
+		},
+		{
+			name:      "chained renames apply in array order",
+			rules:     `[{"op":"rename","name":"old","to":"new"},{"op":"rename","name":"new","to":"final"}]`,
+			target:    "/p?old=1",
+			wantQuery: "?final=1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformResult(t, tc.rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // encodeJSONString renders s as a JSON string literal for embedding in config JSON.
 func encodeJSONString(s string) string {
 	b, _ := json.Marshal(s)
@@ -321,6 +466,80 @@ func TestQueryTransformInvalidConfig(t *testing.T) {
 		_, f := ParseConfig([]byte(src))
 		if f == nil || !strings.Contains(f.Reason, "rule 2") {
 			t.Fatalf("got %+v, want reason naming rule 2", f)
+		}
+	})
+}
+
+func TestQueryTransformRenameInvalidConfig(t *testing.T) {
+	good := `"id":"r1","methods":["*"],"pathPrefix":"/","upstream":"http://h"`
+	cases := []struct {
+		name    string
+		partial string // raw JSON of the rule object
+		want    string // reason substring
+	}{
+		{"rename missing to", `{"op":"rename","name":"old"}`, "rename requires a string to"},
+		{"rename to null", `{"op":"rename","name":"old","to":null}`, "to must be a non-empty string"},
+		{"rename to empty string", `{"op":"rename","name":"old","to":""}`, "to must be a non-empty string"},
+		{"rename to numeric", `{"op":"rename","name":"old","to":1}`, "to must be a non-empty string"},
+		{"rename to object", `{"op":"rename","name":"old","to":{}}`, "to must be a non-empty string"},
+		{"rename to array", `{"op":"rename","name":"old","to":[]}`, "to must be a non-empty string"},
+		{"rename with value", `{"op":"rename","name":"old","to":"new","value":"x"}`, "rename must not include a value"},
+		{"rename with empty value still rejected", `{"op":"rename","name":"old","to":"new","value":""}`, "rename must not include a value"},
+		{"rename empty name", `{"op":"rename","name":"","to":"new"}`, "name must be a non-empty string"},
+		{"rename missing name", `{"op":"rename","to":"new"}`, "name is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{` + good + `,"queryTransforms":[` + tc.partial + `]}]}`
+			_, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config")
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 1", `"r1"`, "rule 1", tc.want} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+		})
+	}
+
+	// A bad rename on a later rule is reported with its 1-based rule index.
+	t.Run("rule index of a later rename", func(t *testing.T) {
+		src := `{"routes":[{` + good + `,"queryTransforms":[
+		  {"op":"set","name":"a","value":"1"},
+		  {"op":"rename","name":"old","to":null}
+		]}]}`
+		_, f := ParseConfig([]byte(src))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config", f)
+		}
+		for _, want := range []string{"route 1", `"r1"`, "rule 2", "to must be a non-empty string"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
+		}
+	})
+
+	// A bad rename invalidates the whole config even on a route no request
+	// will ever hit.
+	t.Run("bad rename on an unhit route", func(t *testing.T) {
+		src := `{"routes":[
+		  {"id":"hit","methods":["*"],"pathPrefix":"/","upstream":"http://h"},
+		  {"id":"miss","methods":["GET"],"pathPrefix":"/x","upstream":"http://h2","queryTransforms":[
+		    {"op":"rename","name":"old","to":""}
+		  ]}
+		]}`
+		_, f := ParseConfig([]byte(src))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config", f)
+		}
+		for _, want := range []string{"route 2", `"miss"`, "rule 1", "to must be a non-empty string"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
 		}
 	})
 }

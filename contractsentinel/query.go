@@ -3,7 +3,8 @@
 // rewriter works on raw fragments so unmodified parameters (including
 // duplicates, empty values and empty fragments) keep their original bytes
 // and relative order; only a rule's target parameter is decoded for name
-// comparison and re-encoded when set.
+// comparison and re-encoded when set, and renamed parameters keep their
+// value bytes verbatim.
 package contractsentinel
 
 import "strings"
@@ -65,6 +66,8 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 			present, items = applyRemove(items, present, tr.Name)
 		case "set":
 			present, items = applySet(items, present, tr.Name, tr.Value)
+		case "rename":
+			present, items = applyRename(items, present, tr.Name, tr.To)
 		}
 	}
 
@@ -128,6 +131,39 @@ func applySet(items []queryItem, present bool, name, value string) (bool, []quer
 		}
 	}
 	return true, kept
+}
+
+// applyRename renames every parameter whose decoded name equals old, each at
+// its original position: only the name is re-encoded (with the same encoding
+// as set), while the '=' and everything after it is copied byte for byte so
+// values keep their '+', percent escapes, extra '=' and case. Parameters
+// already named to are kept untouched and are never merged or overwritten,
+// and empty fragments never match a name. With no hit the query is unchanged
+// (rename never creates a query string); a no-op rename (old == to) leaves
+// every existing name encoding as-is.
+func applyRename(items []queryItem, present bool, old, to string) (bool, []queryItem) {
+	if old == to {
+		return present, items
+	}
+	newName := encodeQueryComponent(to)
+	hit := false
+	for k := range items {
+		if items[k].empty || items[k].name != old {
+			continue
+		}
+		hit = true
+		frag := items[k].raw
+		rest := ""
+		if j := strings.IndexByte(frag, '='); j >= 0 {
+			rest = frag[j:] // keep the '=' and the value byte for byte
+		}
+		items[k].raw = newName + rest
+		items[k].name = to // later rules match the renamed parameter
+	}
+	if !hit {
+		return present, items
+	}
+	return present, items
 }
 
 // decodeQueryName percent-decodes a raw parameter name with '+' treated as a
