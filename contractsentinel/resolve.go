@@ -3,6 +3,7 @@
 package contractsentinel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -11,13 +12,149 @@ import (
 )
 
 // Route is one configured route: an id, accepted methods, a path prefix and
-// the upstream URL requests on that route are forwarded to.
+// the upstream URL requests on that route are forwarded to. An optional
+// queryTransforms list rewrites the request query string after the route has
+// been selected.
 type Route struct {
-	ID         string   `json:"id"`
-	Methods    []string `json:"methods"`
-	PathPrefix string   `json:"pathPrefix"`
-	Upstream   string   `json:"upstream"`
+	ID              string            `json:"id"`
+	Methods         []string          `json:"methods"`
+	PathPrefix      string            `json:"pathPrefix"`
+	Upstream        string            `json:"upstream"`
+	QueryTransforms []*QueryTransform `json:"-"`
 }
+
+// QueryTransform is one rule in a route's queryTransforms array: op is
+// "set" or "remove", name is matched against decoded parameter names, and
+// value (set only) is used literally.
+type QueryTransform struct {
+	Op    string `json:"op"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// routeJSON mirrors Route, keeping queryTransforms as raw JSON so null,
+// wrong types and malformed rules can be reported with the route's location
+// instead of as a generic decode error.
+type routeJSON struct {
+	ID              string          `json:"id"`
+	Methods         []string        `json:"methods"`
+	PathPrefix      string          `json:"pathPrefix"`
+	Upstream        string          `json:"upstream"`
+	QueryTransforms json.RawMessage `json:"queryTransforms"`
+}
+
+// UnmarshalJSON decodes a route object and eagerly validates its
+// queryTransforms (if present); the location matches ParseConfig's
+// "route N" numbering so the reason can identify the route and rule.
+func (route *Route) UnmarshalJSON(data []byte) error {
+	var rj routeJSON
+	if err := json.Unmarshal(data, &rj); err != nil {
+		return err
+	}
+	idx := routeUnmarshalIndex
+	routeUnmarshalIndex++
+	route.ID = rj.ID
+	route.Methods = rj.Methods
+	route.PathPrefix = rj.PathPrefix
+	route.Upstream = rj.Upstream
+
+	if len(rj.QueryTransforms) == 0 {
+		return nil // field absent
+	}
+	loc := fmt.Sprintf("route %d", idx+1)
+	transforms, f := parseQueryTransforms(rj.QueryTransforms, loc, rj.ID)
+	if f != nil {
+		return f
+	}
+	route.QueryTransforms = transforms
+	return nil
+}
+
+// parseQueryTransforms decodes and validates the raw queryTransforms array
+// of one route. loc identifies the route; rule errors additionally carry a
+// 1-based rule index.
+func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransform, *Failure) {
+	body := strings.TrimSpace(string(raw))
+	if body == "null" {
+		return nil, failuref("invalid_config", "%s: queryTransforms must not be null", routeLabel(loc, id))
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(body), &elems); err != nil {
+		return nil, failuref("invalid_config", "%s: queryTransforms must be an array", routeLabel(loc, id))
+	}
+	transforms := make([]*QueryTransform, 0, len(elems))
+	for i, elem := range elems {
+		ruleLoc := fmt.Sprintf("%s, queryTransforms rule %d", routeLabel(loc, id), i+1)
+		if string(bytes.TrimSpace(elem)) == "null" {
+			return nil, failuref("invalid_config", "%s: rule must not be null", ruleLoc)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(elem, &fields); err != nil {
+			return nil, failuref("invalid_config", "%s: rule must be a JSON object", ruleLoc)
+		}
+
+		qt := &QueryTransform{}
+		opRaw, ok := fields["op"]
+		switch {
+		case !ok:
+			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
+		case !jsonString(opRaw, &qt.Op):
+			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
+		case qt.Op != "set" && qt.Op != "remove":
+			return nil, failuref("invalid_config", "%s: unknown op %q (only set and remove are supported)", ruleLoc, qt.Op)
+		}
+
+		nameRaw, ok := fields["name"]
+		switch {
+		case !ok:
+			return nil, failuref("invalid_config", "%s: name is required", ruleLoc)
+		case !jsonString(nameRaw, &qt.Name):
+			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
+		case qt.Name == "":
+			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
+		}
+
+		valueRaw, hasValue := fields["value"]
+		switch qt.Op {
+		case "set":
+			if !hasValue {
+				return nil, failuref("invalid_config", "%s: set requires a string value", ruleLoc)
+			}
+			if !jsonString(valueRaw, &qt.Value) {
+				return nil, failuref("invalid_config", "%s: value must be a string", ruleLoc)
+			}
+		case "remove":
+			if hasValue {
+				return nil, failuref("invalid_config", "%s: remove must not include a value", ruleLoc)
+			}
+		}
+		transforms = append(transforms, qt)
+	}
+	return transforms, nil
+}
+
+// jsonString decodes raw into s and reports whether raw is a JSON string
+// (null, numbers, objects and arrays fail).
+func jsonString(raw json.RawMessage, s *string) bool {
+	if len(raw) == 0 || raw[0] != '"' {
+		return false
+	}
+	return json.Unmarshal(raw, s) == nil
+}
+
+// routeLabel renders the human-readable route location, adding the id when
+// the configuration supplied one.
+func routeLabel(loc, id string) string {
+	if id != "" {
+		return fmt.Sprintf("%s (id %q)", loc, id)
+	}
+	return loc
+}
+
+// routeUnmarshalIndex is advanced while a config is decoded so nested route
+// unmarshalling can report its 1-based position. Route objects only occur in
+// the routes array; ParseConfig resets it before each decode.
+var routeUnmarshalIndex int
 
 // Config is the resolve configuration: a flat array of routes.
 type Config struct {
@@ -53,7 +190,11 @@ func failuref(code, format string, args ...any) *Failure {
 // ParseConfig parses and fully validates the route configuration.
 func ParseConfig(data []byte) (*Config, *Failure) {
 	var cfg Config
+	routeUnmarshalIndex = 0
 	if err := json.Unmarshal(data, &cfg); err != nil {
+		if f, ok := err.(*Failure); ok {
+			return nil, f
+		}
 		return nil, failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
 	if f := cfg.validate(); f != nil {
@@ -252,8 +393,10 @@ func prefixMatch(prefix, path string) bool {
 
 // joinUpstream strips the route prefix from the request path and joins the
 // remainder onto the upstream base path with exactly one slash at the
-// junction. The base path and raw query string are carried over byte for
-// byte: joining never re-encodes, reorders or drops anything.
+// junction. The base path is carried over byte for byte: joining never
+// re-encodes, reorders or drops anything outside that junction. The raw
+// query is preserved verbatim unless the route defines queryTransforms, in
+// which case they rewrite it after route selection.
 func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if _, err := url.Parse(route.Upstream); err != nil {
 		// Config validation already rejected this.
@@ -287,10 +430,11 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	}
 
 	result := route.Upstream[:schemeEnd+3] + hostPart + joined
-	if i := strings.IndexByte(target, '?'); i >= 0 {
-		result += "?" + target[i+1:] // raw query: duplicates, empty values and order preserved
+	query, f := applyQueryTransforms(route.QueryTransforms, target)
+	if f != nil {
+		return "", f
 	}
-	return result, nil
+	return result + query, nil
 }
 
 // isToken reports whether s is an RFC 7230 token, i.e. a legal HTTP method.
