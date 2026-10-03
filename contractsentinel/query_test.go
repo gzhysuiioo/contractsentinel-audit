@@ -2,7 +2,9 @@ package contractsentinel
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -474,6 +476,61 @@ func TestQueryTransformInvalidConfig(t *testing.T) {
 			t.Fatalf("got %+v, want reason naming rule 2", f)
 		}
 	})
+}
+
+func TestParseConfigConcurrentAttribution(t *testing.T) {
+	// A config whose second route fails on its second queryTransforms rule.
+	bad := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://h1"},
+	  {"id":"orders","methods":["GET"],"pathPrefix":"/orders","upstream":"http://h2","queryTransforms":[
+	    {"op":"set","name":"a","value":"1"},
+	    {"op":"frob","name":"a"}
+	  ]}
+	]}`
+	// A config that is fully valid but has many routes with transforms.
+	var sb strings.Builder
+	sb.WriteString(`{"routes":[`)
+	for i := 0; i < 50; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"id":"ok%d","methods":["*"],"pathPrefix":"/p%d",`+
+			`"upstream":"http://h","queryTransforms":[{"op":"remove","name":"q"}]}`, i, i)
+	}
+	sb.WriteString(`]}`)
+	good := sb.String()
+
+	check := func() {
+		_, f := ParseConfig([]byte(bad))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config", f)
+		}
+		for _, want := range []string{"route 2", `"orders"`, "rule 2", "unknown op"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
+		}
+		if strings.Contains(f.Reason, "route 1,") || strings.Contains(f.Reason, "route 3") {
+			t.Fatalf("reason = %q attributes the error to the wrong route", f.Reason)
+		}
+		if _, f := ParseConfig([]byte(good)); f != nil {
+			t.Fatalf("valid config rejected while parsing concurrently: %+v", f)
+		}
+	}
+
+	// Interleaved with another config being decoded at the same time, the
+	// error attribution must be identical to parsing alone.
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				check()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestQueryTransformOnlyAppliedAfterMatching(t *testing.T) {

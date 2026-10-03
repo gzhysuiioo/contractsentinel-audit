@@ -45,16 +45,17 @@ type routeJSON struct {
 	QueryTransforms json.RawMessage `json:"queryTransforms"`
 }
 
-// UnmarshalJSON decodes a route object and eagerly validates its
-// queryTransforms (if present); the location matches ParseConfig's
-// "route N" numbering so the reason can identify the route and rule.
-func (route *Route) UnmarshalJSON(data []byte) error {
+// decodeRoute decodes one route object and eagerly validates its
+// queryTransforms (if present). idx is the route's 1-based position in the
+// routes array of the config being parsed, so the reason can identify the
+// route and rule. The position is passed explicitly rather than kept in
+// shared state: configs parsed concurrently in the same process must not
+// influence each other's error locations.
+func decodeRoute(data []byte, idx int, route *Route) *Failure {
 	var rj routeJSON
 	if err := json.Unmarshal(data, &rj); err != nil {
-		return err
+		return failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
-	idx := routeUnmarshalIndex
-	routeUnmarshalIndex++
 	route.ID = rj.ID
 	route.Methods = rj.Methods
 	route.PathPrefix = rj.PathPrefix
@@ -63,7 +64,7 @@ func (route *Route) UnmarshalJSON(data []byte) error {
 	if len(rj.QueryTransforms) == 0 {
 		return nil // field absent
 	}
-	loc := fmt.Sprintf("route %d", idx+1)
+	loc := fmt.Sprintf("route %d", idx)
 	transforms, f := parseQueryTransforms(rj.QueryTransforms, loc, rj.ID)
 	if f != nil {
 		return f
@@ -166,10 +167,11 @@ func routeLabel(loc, id string) string {
 	return loc
 }
 
-// routeUnmarshalIndex is advanced while a config is decoded so nested route
-// unmarshalling can report its 1-based position. Route objects only occur in
-// the routes array; ParseConfig resets it before each decode.
-var routeUnmarshalIndex int
+// configJSON mirrors Config, keeping each route as raw JSON so routes are
+// decoded one at a time with their 1-based position in the routes array.
+type configJSON struct {
+	Routes []json.RawMessage `json:"routes"`
+}
 
 // Config is the resolve configuration: a flat array of routes.
 type Config struct {
@@ -202,20 +204,24 @@ func failuref(code, format string, args ...any) *Failure {
 	return &Failure{Code: code, Reason: fmt.Sprintf(format, args...)}
 }
 
-// ParseConfig parses and fully validates the route configuration.
+// ParseConfig parses and fully validates the route configuration. It keeps
+// no state between calls, so any number of configs can be parsed
+// concurrently; every error is attributed to the config passed in.
 func ParseConfig(data []byte) (*Config, *Failure) {
-	var cfg Config
-	routeUnmarshalIndex = 0
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		if f, ok := err.(*Failure); ok {
+	var raw configJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, failuref("invalid_config", "config is not valid JSON: %v", err)
+	}
+	cfg := &Config{Routes: make([]Route, len(raw.Routes))}
+	for i := range raw.Routes {
+		if f := decodeRoute(raw.Routes[i], i+1, &cfg.Routes[i]); f != nil {
 			return nil, f
 		}
-		return nil, failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
 	if f := cfg.validate(); f != nil {
 		return nil, f
 	}
-	return &cfg, nil
+	return cfg, nil
 }
 
 func (cfg *Config) validate() *Failure {
