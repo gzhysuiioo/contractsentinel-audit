@@ -387,12 +387,50 @@ func validateUpstream(raw, loc, id string) *Failure {
 	return nil
 }
 
-// ParseRequest parses and validates one JSON request.
+// requestJSON mirrors Request but keeps method and target raw, so a valid
+// JSON document whose fields merely have the wrong JSON type is reported on
+// the offending field instead of as a generic JSON decode error.
+type requestJSON struct {
+	Method json.RawMessage `json:"method"`
+	Target json.RawMessage `json:"target"`
+}
+
+// ParseRequest parses and validates one JSON request. Three failure shapes are
+// kept apart: a document whose JSON syntax is broken fails as a parse failure
+// without guessing a field; a syntactically valid non-object document (array,
+// number, string, boolean or null) must be a JSON object; a valid object whose
+// method or target is not a string fails on that field, naming the JSON type
+// actually received (null counts as a type error, never as a missing field).
+// method is always checked before target, regardless of the key order in the
+// object. Only after both fields are present strings are their contents
+// (required method, legal token, absolute target without a fragment or a bad
+// percent escape) validated, so an empty string stays a content error.
 func ParseRequest(data []byte) (*Request, *Failure) {
-	var req Request
-	if err := json.Unmarshal(data, &req); err != nil {
+	var doc json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, failuref("invalid_request", "request is not valid JSON: %v", err)
 	}
+	body := bytes.TrimSpace(doc)
+	if len(body) == 0 || body[0] != '{' {
+		return nil, failuref("invalid_request", "request must be a JSON object")
+	}
+
+	var rj requestJSON
+	if err := json.Unmarshal(body, &rj); err != nil {
+		// The document already parsed as one JSON value and starts with '{';
+		// keep this as a parse failure rather than a field error if the object
+		// itself cannot be read.
+		return nil, failuref("invalid_request", "request is not valid JSON: %v", err)
+	}
+
+	var req Request
+	if f := decodeRequestStringField(rj.Method, "method", &req.Method); f != nil {
+		return nil, f
+	}
+	if f := decodeRequestStringField(rj.Target, "target", &req.Target); f != nil {
+		return nil, f
+	}
+
 	switch {
 	case req.Method == "":
 		return nil, failuref("invalid_request", "method is required")
@@ -408,6 +446,41 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 		return nil, failuref("invalid_request", "target contains an invalid percent escape")
 	}
 	return &req, nil
+}
+
+// decodeRequestStringField type-checks one request field that must hold a
+// string. An absent field (no such key) is left as the zero value so the
+// later content checks keep their "field is required" behavior; null or any
+// non-string JSON value is a type error that names the field and the JSON
+// type that was actually supplied.
+func decodeRequestStringField(raw json.RawMessage, field string, dst *string) *Failure {
+	if len(raw) == 0 {
+		return nil
+	}
+	if jsonString(raw, dst) {
+		return nil
+	}
+	return failuref("invalid_request", "%s must be a string, got %s", field, jsonTypeName(raw))
+}
+
+// jsonTypeName names the JSON type of a syntactically valid raw value, in the
+// terms the request error reasons use: "null", "a boolean", "a number",
+// "a string", "an array" or "an object".
+func jsonTypeName(raw json.RawMessage) string {
+	switch bytes.TrimSpace(raw)[0] {
+	case 'n':
+		return "null"
+	case 't', 'f':
+		return "a boolean"
+	case '"':
+		return "a string"
+	case '[':
+		return "an array"
+	case '{':
+		return "an object"
+	default:
+		return "a number"
+	}
 }
 
 // Resolve matches a validated request against a validated configuration and

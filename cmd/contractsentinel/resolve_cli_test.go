@@ -491,6 +491,113 @@ func TestResolveCLIRenameInvalidToRejectsConfig(t *testing.T) {
 	}
 }
 
+// TestResolveCLIRequestErrorReasons exercises how malformed requests are
+// explained at the command boundary: broken JSON is a parse failure, a legal
+// non-object document says the request must be an object, and a legal object
+// with a wrong-typed field names the field and the received type. Every
+// failure still exits non-zero, leaves stdout empty and emits one JSON error.
+func TestResolveCLIRequestErrorReasons(t *testing.T) {
+	cases := []struct {
+		name      string
+		request   string
+		want      []string
+		forbidden []string
+	}{
+		{
+			name:      "syntactically broken JSON",
+			request:   `{"method":"GET",`,
+			want:      []string{"not valid JSON"},
+			forbidden: []string{"method", "target"},
+		},
+		{
+			name:      "top level array is legal JSON but the wrong shape",
+			request:   `["GET","/api"]`,
+			want:      []string{"must be a JSON object"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "top level null is legal JSON but the wrong shape",
+			request:   `null`,
+			want:      []string{"must be a JSON object"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "numeric method is a field type error",
+			request:   `{"method":42,"target":"/api"}`,
+			want:      []string{"method must be a string", "got a number"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "array target is a field type error",
+			request:   `{"method":"GET","target":[]}`,
+			want:      []string{"target must be a string", "got an array"},
+			forbidden: []string{"not valid JSON", "start with /"},
+		},
+		{
+			name:      "null method is a type error, not a missing method",
+			request:   `{"method":null,"target":"/api"}`,
+			want:      []string{"method must be a string", "got null"},
+			forbidden: []string{"method is required"},
+		},
+		{
+			name:      "both fields wrong report method regardless of key order",
+			request:   `{"target":[],"method":42}`,
+			want:      []string{"method must be a string"},
+			forbidden: []string{"target must be a string"},
+		},
+		{
+			name:      "empty string is content validated, not type checked",
+			request:   `{"method":"GET","target":"/api%2"}`,
+			want:      []string{"invalid percent escape"},
+			forbidden: []string{"must be a string"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runResolveCLI(t, cliSuccessConfig, tc.request)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", fail.Code)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, bad := range tc.forbidden {
+				if strings.Contains(fail.Reason, bad) {
+					t.Errorf("reason = %q must not contain %q", fail.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// A bad config is reported before the request is even examined, so a
+	// broken config paired with a broken request still yields invalid_config.
+	badConfig := `{"routes":[{"id":"x","methods":"GET","pathPrefix":"/a","upstream":"http://h"}]}`
+	res := runResolveCLI(t, badConfig, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

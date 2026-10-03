@@ -741,6 +741,7 @@ func TestInvalidRequest(t *testing.T) {
 	}{
 		{"not json", `{bad`, "not valid JSON"},
 		{"missing method", `{"target":"/a"}`, "method is required"},
+		{"missing target", `{"method":"GET"}`, "start with /"},
 		{"illegal method", `{"method":"GE T","target":"/a"}`, "legal HTTP method"},
 		{"target not absolute", `{"method":"GET","target":"a"}`, "start with /"},
 		{"empty target", `{"method":"GET","target":""}`, "start with /"},
@@ -759,6 +760,170 @@ func TestInvalidRequest(t *testing.T) {
 			}
 			if !strings.Contains(f.Reason, tc.want) {
 				t.Fatalf("reason = %q, want substring %q", f.Reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestInvalidRequestFieldTypes(t *testing.T) {
+	// Valid JSON with a field whose JSON type is wrong is a field type error,
+	// not a broken-document error: the reason names the field, says it must be
+	// a string and names the JSON type actually received. null is a type error
+	// and must never masquerade as a missing field.
+	cases := []struct {
+		name      string
+		src       string
+		want      []string // all must appear in the reason
+		forbidden []string // none may appear in the reason
+	}{
+		{
+			name:      "method is a number",
+			src:       `{"method":42,"target":"/api"}`,
+			want:      []string{"method must be a string", "got a number"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "method is a boolean",
+			src:       `{"method":true,"target":"/api"}`,
+			want:      []string{"method must be a string", "got a boolean"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "method is an object",
+			src:       `{"method":{"GET":true},"target":"/api"}`,
+			want:      []string{"method must be a string", "got an object"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "method is an array",
+			src:       `{"method":["GET"],"target":"/api"}`,
+			want:      []string{"method must be a string", "got an array"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "method is null, not a missing method",
+			src:       `{"method":null,"target":"/api"}`,
+			want:      []string{"method must be a string", "got null"},
+			forbidden: []string{"not valid JSON", "method is required"},
+		},
+		{
+			name:      "target is an array",
+			src:       `{"method":"GET","target":[]}`,
+			want:      []string{"target must be a string", "got an array"},
+			forbidden: []string{"not valid JSON", "start with /"},
+		},
+		{
+			name:      "target is a number",
+			src:       `{"method":"GET","target":7}`,
+			want:      []string{"target must be a string", "got a number"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "target is a boolean",
+			src:       `{"method":"GET","target":false}`,
+			want:      []string{"target must be a string", "got a boolean"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "target is an object",
+			src:       `{"method":"GET","target":{"path":"/api"}}`,
+			want:      []string{"target must be a string", "got an object"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "target is null, not a missing target",
+			src:       `{"method":"GET","target":null}`,
+			want:      []string{"target must be a string", "got null"},
+			forbidden: []string{"not valid JSON", "start with /"},
+		},
+		{
+			name:      "both fields wrong with method written first reports method",
+			src:       `{"method":42,"target":[]}`,
+			want:      []string{"method must be a string"},
+			forbidden: []string{"target must be a string", "not valid JSON"},
+		},
+		{
+			name:      "both fields wrong with target written first still reports method",
+			src:       `{"target":[],"method":42}`,
+			want:      []string{"method must be a string"},
+			forbidden: []string{"target must be a string", "not valid JSON"},
+		},
+		{
+			name:      "empty method string stays a content error",
+			src:       `{"method":"","target":"/api"}`,
+			want:      []string{"method is required"},
+			forbidden: []string{"must be a string"},
+		},
+		{
+			name:      "empty target string stays a content error",
+			src:       `{"method":"GET","target":""}`,
+			want:      []string{"target must start with /"},
+			forbidden: []string{"must be a string"},
+		},
+		{
+			name:      "string fields still run content checks (percent escape)",
+			src:       `{"method":"GET","target":"/api%2"}`,
+			want:      []string{"invalid percent escape"},
+			forbidden: []string{"must be a string"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, f := ParseRequest([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_request")
+			}
+			if f.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", f.Code)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			for _, bad := range tc.forbidden {
+				if strings.Contains(f.Reason, bad) {
+					t.Fatalf("reason = %q must not contain %q", f.Reason, bad)
+				}
+			}
+		})
+	}
+}
+
+func TestInvalidRequestTopLevelShape(t *testing.T) {
+	// A syntactically legal JSON document that is not an object is a shape
+	// error, never a syntax failure: the reason says the request must be a
+	// JSON object.
+	for _, src := range []string{`[]`, `42`, `"GET /api"`, `true`, `false`, `null`} {
+		t.Run(src, func(t *testing.T) {
+			_, f := ParseRequest([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_request for %q", src)
+			}
+			if f.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", f.Code)
+			}
+			if !strings.Contains(f.Reason, "must be a JSON object") {
+				t.Fatalf("reason = %q, want the request-must-be-an-object reason", f.Reason)
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("legal JSON must not be called a syntax failure: %q", f.Reason)
+			}
+		})
+	}
+
+	// Genuinely broken syntax stays a parse failure with no field guessed.
+	for _, src := range []string{`{bad`, `{"method":`, `{"method":"GET","target":"/api"`} {
+		t.Run(src, func(t *testing.T) {
+			_, f := ParseRequest([]byte(src))
+			if f == nil || f.Code != "invalid_request" {
+				t.Fatalf("got %+v, want invalid_request for %q", f, src)
+			}
+			if !strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("reason = %q, want a JSON parse failure", f.Reason)
+			}
+			if strings.Contains(f.Reason, "method") || strings.Contains(f.Reason, "target") {
+				t.Fatalf("parse failure must not guess a field: %q", f.Reason)
 			}
 		})
 	}
