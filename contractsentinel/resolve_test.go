@@ -331,6 +331,206 @@ func TestResolveConflict(t *testing.T) {
 	}
 }
 
+// configFromRoutes builds a config document from raw route objects, so the
+// same routes can be parsed in different orders.
+func configFromRoutes(routes ...string) string {
+	return `{"routes":[` + strings.Join(routes, ",") + `]}`
+}
+
+func reversed(routes []string) []string {
+	out := make([]string, len(routes))
+	for i, r := range routes {
+		out[len(routes)-1-i] = r
+	}
+	return out
+}
+
+func TestResolveLongestPrefixBeatsShorterConcreteMethods(t *testing.T) {
+	// Selection order: longest prefix first, concrete-vs-wildcard only among
+	// the longest-prefix winners. A concrete GET on a shorter prefix must
+	// never override a wildcard on a longer prefix, and several GET routes
+	// tied on the shorter prefix must not conflict once the longer prefix
+	// wins.
+	routes := []string{
+		`{"id":"short-one","methods":["GET"],"pathPrefix":"/a","upstream":"http://one.internal/s1"}`,
+		`{"id":"short-two","methods":["GET"],"pathPrefix":"/a","upstream":"http://two.internal/s2"}`,
+		`{"id":"long-wild","methods":["*"],"pathPrefix":"/a/b","upstream":"http://wild.internal/base"}`,
+	}
+
+	cases := []struct {
+		name     string
+		request  string
+		upstream string
+	}{
+		{
+			name:     "longer wildcard beats shorter concrete GETs",
+			request:  `{"method":"GET","target":"/a/b/c/items"}`,
+			upstream: "http://wild.internal/base/c/items",
+		},
+		{
+			name:     "query string survives route selection verbatim",
+			request:  `{"method":"GET","target":"/a/b/c?keep=1&keep=2&empty=&x=%2f"}`,
+			upstream: "http://wild.internal/base/c?keep=1&keep=2&empty=&x=%2f",
+		},
+		{
+			name:     "target equal to the longer prefix keeps one junction slash",
+			request:  `{"method":"GET","target":"/a/b"}`,
+			upstream: "http://wild.internal/base/",
+		},
+		{
+			name:     "wildcard on the longer prefix also serves other methods",
+			request:  `{"method":"POST","target":"/a/b/c"}`,
+			upstream: "http://wild.internal/base/c",
+		},
+	}
+	for _, order := range [][]string{routes, reversed(routes)} {
+		cfg := mustConfig(t, configFromRoutes(order...))
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				res := resolveJSON(t, cfg, tc.request)
+				if res.RouteID != "long-wild" {
+					t.Errorf("routeId = %q, want long-wild", res.RouteID)
+				}
+				if res.UpstreamURL != tc.upstream {
+					t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.upstream)
+				}
+			})
+		}
+	}
+
+	// The shorter-prefix GET routes really are tied with each other: a
+	// request that only reaches their prefix does conflict, proving the
+	// longer prefix (not an absence of rivalry) is what decided the cases
+	// above.
+	cfg := mustConfig(t, configFromRoutes(routes...))
+	_, rf := Resolve(cfg, mustReq(t, "GET", "/a/c"))
+	if rf == nil || rf.Code != "route_conflict" {
+		t.Fatalf("got %+v, want route_conflict between the shorter-prefix GET routes", rf)
+	}
+	if want := []string{"short-one", "short-two"}; !equalStrings(rf.Candidates, want) {
+		t.Fatalf("candidates = %v, want %v", rf.Candidates, want)
+	}
+}
+
+func TestResolveConcreteBeatsWildcardAtSameLongestPrefix(t *testing.T) {
+	// Within the longest matching prefix a concrete GET beats the wildcard;
+	// the shorter-prefix GET route is out of the running either way.
+	routes := []string{
+		`{"id":"short-get","methods":["GET"],"pathPrefix":"/a","upstream":"http://short.internal"}`,
+		`{"id":"long-wild","methods":["*"],"pathPrefix":"/a/b","upstream":"http://wild.internal/w"}`,
+		`{"id":"long-get","methods":["GET"],"pathPrefix":"/a/b","upstream":"http://exact.internal/e"}`,
+	}
+	for _, order := range [][]string{routes, reversed(routes)} {
+		cfg := mustConfig(t, configFromRoutes(order...))
+
+		res := resolveJSON(t, cfg, `{"method":"GET","target":"/a/b/1"}`)
+		if res.RouteID != "long-get" || res.UpstreamURL != "http://exact.internal/e/1" {
+			t.Fatalf("GET: got %+v, want long-get / http://exact.internal/e/1", res)
+		}
+
+		// Methods without a concrete entry at the longest prefix still fall
+		// to the wildcard route there, never to the shorter-prefix GET.
+		for _, method := range []string{"POST", "PROPFIND"} {
+			res := resolveJSON(t, cfg, `{"method":"`+method+`","target":"/a/b/1"}`)
+			if res.RouteID != "long-wild" || res.UpstreamURL != "http://wild.internal/w/1" {
+				t.Fatalf("%s: got %+v, want long-wild / http://wild.internal/w/1", method, res)
+			}
+		}
+	}
+}
+
+func TestResolveRouteWithConcreteAndWildcardCountsOnce(t *testing.T) {
+	// A route whose methods list holds both GET and * is a concrete match
+	// for GET, and it is one candidate: matching two method entries of its
+	// own must not turn into a self-conflict.
+	single := mustConfig(t, `{"routes":[
+	  {"id":"dual","methods":["GET","*"],"pathPrefix":"/d","upstream":"http://dual.internal/base"}
+	]}`)
+	for _, method := range []string{"GET", "POST"} {
+		res := resolveJSON(t, single, `{"method":"`+method+`","target":"/d/x"}`)
+		if res.RouteID != "dual" || res.UpstreamURL != "http://dual.internal/base/x" {
+			t.Fatalf("%s: got %+v, want dual / http://dual.internal/base/x", method, res)
+		}
+	}
+
+	// Next to a plain wildcard route on the same prefix, the dual route is
+	// the concrete winner for GET; for other methods both are wildcard
+	// candidates and conflict as exactly two routes.
+	routes := []string{
+		`{"id":"dual","methods":["GET","*"],"pathPrefix":"/d","upstream":"http://dual.internal/base"}`,
+		`{"id":"wild","methods":["*"],"pathPrefix":"/d","upstream":"http://wild.internal"}`,
+	}
+	for _, order := range [][]string{routes, reversed(routes)} {
+		cfg := mustConfig(t, configFromRoutes(order...))
+
+		res := resolveJSON(t, cfg, `{"method":"GET","target":"/d/x"}`)
+		if res.RouteID != "dual" {
+			t.Fatalf("GET: routeId = %q, want dual (concrete entry wins)", res.RouteID)
+		}
+
+		_, rf := Resolve(cfg, mustReq(t, "POST", "/d/x"))
+		if rf == nil || rf.Code != "route_conflict" {
+			t.Fatalf("POST: got %+v, want route_conflict", rf)
+		}
+		if want := []string{"dual", "wild"}; !equalStrings(rf.Candidates, want) {
+			t.Fatalf("POST: candidates = %v, want %v (one entry per route)", rf.Candidates, want)
+		}
+	}
+}
+
+func TestResolveConflictOnlyAmongFinalCandidates(t *testing.T) {
+	// A conflict is reported only when the final candidates cannot be
+	// narrowed to one: shorter-prefix routes and same-prefix wildcard routes
+	// are already eliminated and must not appear in the candidate list, and
+	// no route may be returned as a success.
+	routes := []string{
+		`{"id":"z-short","methods":["GET"],"pathPrefix":"/a","upstream":"http://short.internal"}`,
+		`{"id":"wild-long","methods":["*"],"pathPrefix":"/a/b","upstream":"http://wild.internal"}`,
+		`{"id":"zeta","methods":["GET"],"pathPrefix":"/a/b","upstream":"http://z.internal"}`,
+		`{"id":"alpha","methods":["GET"],"pathPrefix":"/a/b","upstream":"http://a.internal"}`,
+	}
+	for _, order := range [][]string{routes, reversed(routes)} {
+		cfg := mustConfig(t, configFromRoutes(order...))
+
+		res, rf := Resolve(cfg, mustReq(t, "GET", "/a/b/x"))
+		if res != nil {
+			t.Fatalf("got success %+v, want route_conflict", res)
+		}
+		if rf == nil || rf.Code != "route_conflict" {
+			t.Fatalf("got %+v, want route_conflict", rf)
+		}
+		if want := []string{"alpha", "zeta"}; !equalStrings(rf.Candidates, want) {
+			t.Fatalf("candidates = %v, want %v (lexicographic, no shorter-prefix or wildcard routes)", rf.Candidates, want)
+		}
+
+		// The wildcard route at the conflicted prefix still serves methods
+		// that have no concrete rival there.
+		res = resolveJSON(t, cfg, `{"method":"POST","target":"/a/b/x"}`)
+		if res.RouteID != "wild-long" {
+			t.Fatalf("POST: routeId = %q, want wild-long", res.RouteID)
+		}
+
+		// The shorter-prefix route still serves requests that never reach
+		// the conflicted prefix.
+		res = resolveJSON(t, cfg, `{"method":"GET","target":"/a/other"}`)
+		if res.RouteID != "z-short" {
+			t.Fatalf("GET /a/other: routeId = %q, want z-short", res.RouteID)
+		}
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func mustReq(t *testing.T, method, target string) *Request {
 	t.Helper()
 	req, f := ParseRequest([]byte(`{"method":"` + method + `","target":"` + target + `"}`))
