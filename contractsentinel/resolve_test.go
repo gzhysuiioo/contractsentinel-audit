@@ -309,6 +309,258 @@ func TestInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigRouteFieldTypes(t *testing.T) {
+	// The first route is legal and would match GET /api; the second route's
+	// methods field uses the wrong type. The whole configuration must be
+	// rejected regardless of which route a request would hit, and the reason
+	// must point at the route (position and id), the field and the expected
+	// type — not describe the document as invalid JSON.
+	wrongMethods := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"orders","methods":"GET","pathPrefix":"/api/orders","upstream":"http://orders.internal"}
+	]}`
+	_, f := ParseConfig([]byte(wrongMethods))
+	if f == nil {
+		t.Fatal("expected invalid_config for string methods")
+	}
+	if f.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config", f.Code)
+	}
+	for _, want := range []string{"route 2", `"orders"`, "methods", "array"} {
+		if !strings.Contains(f.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+	if strings.Contains(f.Reason, "not valid JSON") {
+		t.Errorf("a wrong field type must not be reported as a JSON parse failure: %q", f.Reason)
+	}
+
+	// With methods corrected to an array, the same request hits route 1 and
+	// resolves normally.
+	fixed := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"orders","methods":["GET","POST"],"pathPrefix":"/api/orders","upstream":"http://orders.internal"}
+	]}`
+	cfg := mustConfig(t, fixed)
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/orders/7"}`)
+	if res.RouteID != "orders" || res.UpstreamURL != "http://orders.internal/7" {
+		t.Fatalf("got %+v, want orders route and upstream after fixing methods", res)
+	}
+
+	cases := []struct {
+		name  string
+		src   string
+		loc   string // "route N" substring
+		id    string // id substring ("" = must not render an id label)
+		field string
+		why   string // explanation substring (expected kind)
+	}{
+		{
+			name:  "id is a number",
+			src:   `{"routes":[{"id":7,"methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			field: "id",
+			why:   "string",
+		},
+		{
+			name:  "id is an object",
+			src:   `{"routes":[{"id":{"v":1},"methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			field: "id",
+			why:   "string",
+		},
+		{
+			name:  "methods is a string, id written after the bad field still identifies the route",
+			src:   `{"routes":[{"methods":"GET","id":"late","pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"late"`,
+			field: "methods",
+			why:   "array",
+		},
+		{
+			name:  "methods is an object",
+			src:   `{"routes":[{"id":"r","methods":{"GET":true},"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "methods",
+			why:   "array",
+		},
+		{
+			name:  "methods entry is a number",
+			src:   `{"routes":[{"id":"r","methods":["GET",7],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "methods",
+			why:   "entry 2",
+		},
+		{
+			name:  "methods entry is an object",
+			src:   `{"routes":[{"id":"r","methods":["GET",{"x":1}],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "methods",
+			why:   "entry 2",
+		},
+		{
+			name:  "methods entry is null",
+			src:   `{"routes":[{"id":"r","methods":[null],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "methods",
+			why:   "entry 1",
+		},
+		{
+			name: "pathPrefix is a number on the second route",
+			src: `{"routes":[
+			  {"id":"ok","methods":["GET"],"pathPrefix":"/ok","upstream":"http://h1"},
+			  {"id":"bad","methods":["GET"],"pathPrefix":42,"upstream":"http://h2"}]}`,
+			loc:   "route 2",
+			id:    `"bad"`,
+			field: "pathPrefix",
+			why:   "string",
+		},
+		{
+			name:  "pathPrefix is an array",
+			src:   `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":["/a"],"upstream":"http://h"}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "pathPrefix",
+			why:   "string",
+		},
+		{
+			name:  "upstream is a number",
+			src:   `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/a","upstream":8080}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "upstream",
+			why:   "string",
+		},
+		{
+			name:  "upstream is an object",
+			src:   `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/a","upstream":{"host":"h"}}]}`,
+			loc:   "route 1",
+			id:    `"r"`,
+			field: "upstream",
+			why:   "string",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_config containing field %q", tc.field)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			if !strings.Contains(f.Reason, tc.loc) {
+				t.Errorf("reason = %q, want route location %q", f.Reason, tc.loc)
+			}
+			if !strings.Contains(f.Reason, tc.field) {
+				t.Errorf("reason = %q, want field name %q", f.Reason, tc.field)
+			}
+			if !strings.Contains(f.Reason, tc.why) {
+				t.Errorf("reason = %q, want explanation %q", f.Reason, tc.why)
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Errorf("wrong field type must not be a JSON parse failure: %q", f.Reason)
+			}
+			if tc.id != "" {
+				if !strings.Contains(f.Reason, tc.id) {
+					t.Errorf("reason = %q, want id %q", f.Reason, tc.id)
+				}
+			} else if strings.Contains(f.Reason, "(id ") {
+				t.Errorf("reason = %q must not render a non-string value as an id", f.Reason)
+			}
+		})
+	}
+
+	// An empty-string id is a legal type but not a usable identifier: the
+	// wrong-typed methods field is still located by position without an id.
+	_, f = ParseConfig([]byte(`{"routes":[{"id":"","methods":3,"pathPrefix":"/a","upstream":"http://h"}]}`))
+	if f == nil || !strings.Contains(f.Reason, "route 1") || strings.Contains(f.Reason, "(id ") {
+		t.Fatalf("got %+v, want route 1 with no id label", f)
+	}
+}
+
+func TestSyntaxErrorsAreNotAttributedToRoutes(t *testing.T) {
+	// Broken JSON stays a parse failure and never gets a guessed route
+	// position, even when the error sits inside the routes array.
+	for _, src := range []string{
+		`{not json`,
+		`{"routes":[{"id":"x","methods":["GET"]}`,
+		`{"routes":[{"id":"x","methods":["GET"] "pathPrefix":"/a"}]}`,
+	} {
+		_, f := ParseConfig([]byte(src))
+		if f == nil {
+			t.Fatalf("expected failure for %q", src)
+		}
+		if f.Code != "invalid_config" || !strings.Contains(f.Reason, "not valid JSON") {
+			t.Fatalf("got %+v, want an invalid_config JSON parse failure", f)
+		}
+		if strings.Contains(f.Reason, "route ") {
+			t.Fatalf("syntax error must not name a route: %q", f.Reason)
+		}
+	}
+
+	// Legal JSON of the wrong shape is a type error, not a parse failure.
+	for _, tc := range []struct {
+		src  string
+		want string
+	}{
+		{`5`, "JSON object"},
+		{`["routes"]`, "JSON object"},
+		{`{"routes":{}}`, "routes must be an array"},
+		{`{"routes":"x"}`, "routes must be an array"},
+		{`{"routes":[5]}`, "route 1"},
+		{`{"routes":[true]}`, "route 1"},
+		{`{"routes":[[{"id":"x"}]]}`, "route 1"},
+	} {
+		_, f := ParseConfig([]byte(tc.src))
+		if f == nil {
+			t.Fatalf("expected failure for %q", tc.src)
+		}
+		if !strings.Contains(f.Reason, tc.want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, tc.want)
+		}
+		if strings.Contains(f.Reason, "not valid JSON") {
+			t.Fatalf("a type mismatch on legal JSON must not be a parse failure: %q", f.Reason)
+		}
+	}
+
+	// A later non-object element is located at its own position, and null
+	// stays an empty config rather than an error.
+	_, f := ParseConfig([]byte(`{"routes":[
+	  {"id":"a","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"},
+	  "x"]}`))
+	if f == nil || !strings.Contains(f.Reason, "route 2") {
+		t.Fatalf("got %+v, want the failure located at route 2", f)
+	}
+	if cfg, f := ParseConfig([]byte(`null`)); f != nil || len(cfg.Routes) != 0 {
+		t.Fatalf("top-level null should decode to an empty config, got %+v %+v", cfg, f)
+	}
+}
+
+func TestNullFieldsKeepExistingValidation(t *testing.T) {
+	// Explicit null used to decode to the zero value; the required-field
+	// checks in validate() (with route locations) must keep doing so.
+	for _, tc := range []struct {
+		src  string
+		want string
+	}{
+		{`{"routes":[{"id":null,"methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}]}`, "id must be non-empty"},
+		{`{"routes":[{"id":"x","methods":null,"pathPrefix":"/a","upstream":"http://h"}]}`, "non-empty array"},
+		{`{"routes":[{"id":"x","methods":["GET"],"pathPrefix":null,"upstream":"http://h"}]}`, "start with /"},
+		{`{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":null}]}`, "absolute http or https"},
+		{`{"routes":[null]}`, "id must be non-empty"},
+	} {
+		_, f := ParseConfig([]byte(tc.src))
+		if f == nil || f.Code != "invalid_config" || !strings.Contains(f.Reason, tc.want) {
+			t.Fatalf("got %+v, want invalid_config containing %q", f, tc.want)
+		}
+	}
+}
+
 func TestInvalidRequest(t *testing.T) {
 	cases := []struct {
 		name string

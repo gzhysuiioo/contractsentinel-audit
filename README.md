@@ -99,11 +99,21 @@ go test ./...
 整个配置返回 `invalid_config`（即使出错路由不会被命中）；reason 定位到
 路由，规则错误另给出从 1 开始的规则序号。
 
+路由基本字段 `id`、`methods`、`pathPrefix`、`upstream` 类型不符时同样
+返回 `invalid_config`，reason 直接指出按排列从 1 开始的路由序号与字段
+名，并说明实际读到的 JSON 类型为何不能接受（如 `methods` 应为字符串
+数组；数组合法但某项是数字时归属到该路由的 `methods` 并指明是第几项、
+应为字符串）。路由提供了合法非空字符串 `id` 时还会附上该 id，即使 id
+写在出错字段之后；`id` 自身类型错误时只报告序号和字段，不把数字、对象
+等内容当作路由标识。这与 JSON 语法损坏相区分：语法错误只说明解析失败，
+不猜测路由位置。缺少字段、重复 id、非法路径或上游地址仍按原有方式校验。
+
 失败时标准错误输出含 `code`、`reason` 的 JSON（`route_conflict` 另含
 `candidates`），退出状态非零，标准输出不留下结果：
 
-- `invalid_config`：配置不可读、JSON 无效或任一路由不合法（含非法
-  queryTransforms；能定位时指出第几条路由及 id，规则错误指出规则序号）。
+- `invalid_config`：配置不可读、JSON 语法无效或任一路由不合法（基本字段
+  类型错误指出第几条路由、id 与字段名；非法 queryTransforms 指出路由及
+  规则序号；语法错误不猜测路由位置）。
 - `invalid_request`：请求 JSON 无效、方法缺失或不合法、`target` 不以 `/` 开头、含片段或非法百分号转义。
 - `route_conflict` / `route_not_found`：见上。
 

@@ -20,12 +20,7 @@ type Route struct {
 	Methods         []string          `json:"methods"`
 	PathPrefix      string            `json:"pathPrefix"`
 	Upstream        string            `json:"upstream"`
-	QueryTransforms []*QueryTransform `json:"-"`
-
-	// queryTransformsRaw holds the undecoded queryTransforms value between
-	// Route.UnmarshalJSON and Config.UnmarshalJSON, which validates it once
-	// the route's position in its own config is known.
-	queryTransformsRaw json.RawMessage
+	QueryTransforms []*QueryTransform `json:"queryTransforms,omitempty"`
 }
 
 // QueryTransform is one rule in a route's queryTransforms array: op is
@@ -37,34 +32,6 @@ type QueryTransform struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 	To    string `json:"to"`
-}
-
-// routeJSON mirrors Route, keeping queryTransforms as raw JSON so null,
-// wrong types and malformed rules can be reported with the route's location
-// instead of as a generic decode error.
-type routeJSON struct {
-	ID              string          `json:"id"`
-	Methods         []string        `json:"methods"`
-	PathPrefix      string          `json:"pathPrefix"`
-	Upstream        string          `json:"upstream"`
-	QueryTransforms json.RawMessage `json:"queryTransforms"`
-}
-
-// UnmarshalJSON decodes a route object and keeps queryTransforms raw; the
-// enclosing Config.UnmarshalJSON validates it with the route's 1-based
-// position in that config's routes array.
-func (route *Route) UnmarshalJSON(data []byte) error {
-	var rj routeJSON
-	if err := json.Unmarshal(data, &rj); err != nil {
-		return err
-	}
-	route.ID = rj.ID
-	route.Methods = rj.Methods
-	route.PathPrefix = rj.PathPrefix
-	route.Upstream = rj.Upstream
-	route.QueryTransforms = nil
-	route.queryTransformsRaw = rj.QueryTransforms
-	return nil
 }
 
 // parseQueryTransforms decodes and validates the raw queryTransforms array
@@ -166,32 +133,160 @@ type Config struct {
 	Routes []Route `json:"routes"`
 }
 
-// UnmarshalJSON decodes the routes array and validates each route's
-// queryTransforms against that route's position in this config. The position
-// comes from the array being decoded here, so configs parsed concurrently or
-// interleaved in the same process cannot shift each other's route numbering.
+// UnmarshalJSON decodes the routes array one element at a time so that a
+// route field carrying the wrong JSON type is reported against that route's
+// position and field, rather than as the whole document failing to parse.
+// The position comes from the array decoded here, so configs parsed
+// concurrently or interleaved in the same process cannot shift each other's
+// route numbering. A genuine syntax failure never reaches this function.
 func (cfg *Config) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Routes []Route `json:"routes"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		// The document parses (ParseConfig already saw valid JSON) but its
+		// top level is not an object: a structural type error, not a syntax
+		// failure (a top-level null decodes to a nil map, an empty config).
+		return failuref("invalid_config",
+			"config must be a JSON object, but the value is %s", jsonValueKind(data))
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	rawRoutes, ok := fields["routes"]
+	if !ok {
+		cfg.Routes = nil
+		return nil
 	}
-	cfg.Routes = raw.Routes
-	for i := range cfg.Routes {
-		route := &cfg.Routes[i]
-		if len(route.queryTransformsRaw) == 0 {
-			continue // field absent
-		}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(rawRoutes, &elems); err != nil {
+		// data is already known to be syntactically valid JSON here, so this
+		// can only be a type mismatch (null decodes to an empty array),
+		// never a parse failure.
+		return failuref("invalid_config",
+			"routes must be an array, but the value is %s", jsonValueKind(rawRoutes))
+	}
+
+	routes := make([]Route, 0, len(elems))
+	for i, elem := range elems {
 		loc := fmt.Sprintf("route %d", i+1)
-		transforms, f := parseQueryTransforms(route.queryTransformsRaw, loc, route.ID)
-		if f != nil {
-			return f
+		route, transformsRaw, err := decodeRoute(elem, loc)
+		if err != nil {
+			return err
 		}
-		route.QueryTransforms = transforms
-		route.queryTransformsRaw = nil
+		if len(transformsRaw) != 0 {
+			transforms, f := parseQueryTransforms(transformsRaw, loc, route.ID)
+			if f != nil {
+				return f
+			}
+			route.QueryTransforms = transforms
+		}
+		routes = append(routes, route)
 	}
+	cfg.Routes = routes
 	return nil
+}
+
+// decodeRoute decodes one routes element field by field. loc is the route's
+// 1-based location, e.g. "route 2". A wrong-typed basic field is returned
+// as an invalid_config Failure naming the route and the field; a legal
+// non-empty string id is read first, so it identifies the route even when
+// written after the offending field. When id itself has the wrong type no id
+// is attached, and non-string values are never rendered as identifiers.
+// JSON null fields fall through to validate(), whose required/empty checks
+// match encoding/json's treatment of null.
+func decodeRoute(data json.RawMessage, loc string) (Route, json.RawMessage, error) {
+	var route Route
+	if isJSONNull(data) {
+		// encoding/json decodes a null array element into the zero value;
+		// validate() then reports its missing id with the route location.
+		return route, nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		// The element is syntactically valid JSON but not an object.
+		return route, nil, failuref("invalid_config",
+			"%s: route must be a JSON object, but the value is %s", loc, jsonValueKind(data))
+	}
+
+	if raw, ok := fields["id"]; ok && !isJSONNull(raw) {
+		var id string
+		if !jsonString(raw, &id) {
+			return route, nil, failuref("invalid_config",
+				"%s: id must be a string, but the value is %s", loc, jsonValueKind(raw))
+		}
+		route.ID = id
+	}
+	// From here the label carries the id when the config supplied a legal
+	// non-empty one, however the fields are ordered in the document.
+	label := routeLabel(loc, route.ID)
+
+	if raw, ok := fields["methods"]; ok && !isJSONNull(raw) {
+		methods, f := decodeMethods(raw, label)
+		if f != nil {
+			return route, nil, f
+		}
+		route.Methods = methods
+	}
+	if raw, ok := fields["pathPrefix"]; ok && !isJSONNull(raw) {
+		var prefix string
+		if !jsonString(raw, &prefix) {
+			return route, nil, failuref("invalid_config",
+				"%s: pathPrefix must be a string, but the value is %s", label, jsonValueKind(raw))
+		}
+		route.PathPrefix = prefix
+	}
+	if raw, ok := fields["upstream"]; ok && !isJSONNull(raw) {
+		var upstream string
+		if !jsonString(raw, &upstream) {
+			return route, nil, failuref("invalid_config",
+				"%s: upstream must be a string, but the value is %s", label, jsonValueKind(raw))
+		}
+		route.Upstream = upstream
+	}
+	return route, fields["queryTransforms"], nil
+}
+
+// decodeMethods decodes a methods value that is known not to be null and
+// attributes any type problem to the named route's methods field: the value
+// itself must be an array and every entry a string method.
+func decodeMethods(raw json.RawMessage, label string) ([]string, *Failure) {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return nil, failuref("invalid_config",
+			"%s: methods must be an array of strings, but the value is %s", label, jsonValueKind(raw))
+	}
+	methods := make([]string, len(elems))
+	for i, elem := range elems {
+		var method string
+		if !jsonString(elem, &method) {
+			return nil, failuref("invalid_config",
+				"%s: methods must be an array of strings, but entry %d is %s instead of a string",
+				label, i+1, jsonValueKind(elem))
+		}
+		methods[i] = method
+	}
+	return methods, nil
+}
+
+// isJSONNull reports whether raw is the JSON null literal.
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// jsonValueKind describes the JSON type of a raw value for error messages,
+// so a wrong-typed field can say what was found instead of the expected
+// type. Raw values are already syntactically valid at this point.
+func jsonValueKind(raw json.RawMessage) string {
+	switch bytes.TrimSpace(raw)[0] {
+	case '"':
+		return "a string"
+	case '{':
+		return "an object"
+	case '[':
+		return "an array"
+	case 't', 'f':
+		return "a boolean"
+	case 'n':
+		return "null"
+	default:
+		return "a number"
+	}
 }
 
 // Request is one resolution request: an HTTP method and a request target
