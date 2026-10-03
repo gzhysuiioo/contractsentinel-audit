@@ -107,64 +107,28 @@ type wireInput struct {
 	Checks     []wireCheck                `json:"checks"`
 }
 
-// Fixed submission field spellings. A submission is decoded through these
-// exact names only, mirroring strictReportJSON on the read side:
-// encoding/json otherwise falls back to case-insensitive field matching, so
-// an extension member such as "StAtus" would silently decode into the status
-// field and could override — or launder — the conclusion carried by the
-// formal "status" member, depending on where the extension member appears.
-// Case variants, whitespace-padded names and unknown members are extension
-// data and never reach the decoder. The invariants object is not rewritten:
-// invariant names are user-defined rather than fixed fields, so "Inv" and
-// "inv" stay two independent invariants and a padded name is not trimmed.
-var (
-	submissionTopKeys   = []string{"artifact", "rules", "invariants", "checks"}
-	artifactWireKeys    = []string{"name", "abi", "bytecode", "source"}
-	submissionRuleKeys  = []string{"id", "kind", "severity", "invariant", "requiresABI", "version"}
-	submissionCheckKeys = []string{"artifactHash", "ruleId", "version", "status", "note"}
-)
+// submissionShape is the fixed-field shape of an audit submission: the agreed
+// spellings at the top level and inside the artifact, every rule and every
+// check record. The invariants object is a fixed top-level member but has no
+// nested shape, so it passes through untouched: invariant names are
+// user-defined rather than fixed fields, and "Inv" and "inv" stay two
+// independent invariants and a padded name is not trimmed.
+var submissionShape = fixedShape{
+	keys: []string{"artifact", "rules", "invariants", "checks"},
+	objects: map[string]fixedShape{
+		"artifact": {keys: []string{"name", "abi", "bytecode", "source"}},
+	},
+	arrays: map[string]fixedShape{
+		"rules":  {keys: []string{"id", "kind", "severity", "invariant", "requiresABI", "version"}},
+		"checks": {keys: []string{"artifactHash", "ruleId", "version", "status", "note"}},
+	},
+}
 
-// strictSubmissionJSON rewrites submission bytes to the fixed fields under
-// their agreed spelling, at the top level and inside the artifact, every rule
-// and every check record. Member order and extension members no longer
-// influence the decoded values: a case variant or whitespace-padded name can
-// neither override a formal value nor substitute for a missing or invalid
-// one. Names are compared after JSON string decoding, so a fixed name written
-// with escapes still denotes that field. The invariants object passes through
-// untouched because its member names are user-defined.
+// strictSubmissionJSON rewrites submission bytes to the fixed submission
+// fields under their agreed spelling; see fixedShape for the recognition
+// convention shared with the archive read side.
 func strictSubmissionJSON(data []byte) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, err
-	}
-	out := make(map[string]json.RawMessage, len(submissionTopKeys))
-	for _, k := range submissionTopKeys {
-		if v, ok := obj[k]; ok {
-			out[k] = v
-		}
-	}
-	if raw, ok := out["artifact"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsOnly(raw, artifactWireKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["artifact"] = f
-	}
-	if raw, ok := out["rules"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsInArray(raw, submissionRuleKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["rules"] = f
-	}
-	if raw, ok := out["checks"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsInArray(raw, submissionCheckKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["checks"] = f
-	}
-	return json.Marshal(out)
+	return strictFixedJSON(data, submissionShape)
 }
 
 // validateFormalCheckStatuses checks the formal "status" member of every
@@ -588,101 +552,27 @@ func duplicateArchiveError(id string, data []byte, dup *duplicateMemberError) er
 	return errCorrupt("report " + id + " archive is corrupt: " + duplicateMemberMessage(data, dup))
 }
 
-// Fixed report fields by their original spelling. A stored archive must be
-// decoded through these exact names only: encoding/json otherwise falls back
-// to case-insensitive field matching, so an extension member such as "StAtus"
-// would silently decode into the status field and could override — or launder
-// — the conclusion recorded by the original "status" member, depending on
-// where the extension member happens to appear. The trusted content of a
-// report is carried by the fixed fields alone; case variants, whitespace-
-// padded names and unknown members are extension data and never reach the
-// decoder.
-var (
-	reportTopKeys = []string{"reportId", "artifact", "rules", "findings"}
-	artifactKeys  = []string{"name", "hash"}
-	ruleKeys      = []string{"id", "kind", "severity", "invariant", "requiresABI", "version", "status", "note"}
-	findingKeys   = []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}
-)
-
-// fixedFieldsOnly rewrites one JSON object keeping only the named members.
-// Names are compared after JSON string decoding, so a member name written
-// with escapes still denotes its fixed field. Exact duplicates were already
-// rejected by findDuplicateJSONMember, so each kept name appears at most
-// once.
-func fixedFieldsOnly(raw json.RawMessage, keys []string) (json.RawMessage, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, err
-	}
-	out := make(map[string]json.RawMessage, len(keys))
-	for _, k := range keys {
-		if v, ok := obj[k]; ok {
-			out[k] = v
-		}
-	}
-	return json.Marshal(out)
-}
-
-// fixedFieldsInArray rewrites every element of a JSON array with
-// fixedFieldsOnly. A null array stays null so the decoded slice keeps the
-// same nil-ness as before.
-func fixedFieldsInArray(raw json.RawMessage, keys []string) (json.RawMessage, error) {
-	var elems []json.RawMessage
-	if err := json.Unmarshal(raw, &elems); err != nil {
-		return nil, err
-	}
-	if elems == nil {
-		return raw, nil
-	}
-	out := make([]json.RawMessage, 0, len(elems))
-	for _, e := range elems {
-		f, err := fixedFieldsOnly(e, keys)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, f)
-	}
-	return json.Marshal(out)
+// reportShape is the fixed-field shape of a stored report archive: the agreed
+// spellings at the top level and inside the artifact, every rule and every
+// finding. The trusted content of a report is carried by these fixed fields
+// alone; case variants, whitespace-padded names and unknown members are
+// extension data and never reach the decoder.
+var reportShape = fixedShape{
+	keys: []string{"reportId", "artifact", "rules", "findings"},
+	objects: map[string]fixedShape{
+		"artifact": {keys: []string{"name", "hash"}},
+	},
+	arrays: map[string]fixedShape{
+		"rules":    {keys: []string{"id", "kind", "severity", "invariant", "requiresABI", "version", "status", "note"}},
+		"findings": {keys: []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}},
+	},
 }
 
 // strictReportJSON rewrites archive bytes to the fixed report fields under
-// their original spelling, at the top level and inside the artifact, every
-// rule and every finding. Member order and extension members no longer
-// influence the decoded report.
+// their original spelling; see fixedShape for the recognition convention
+// shared with the submission side.
 func strictReportJSON(data []byte) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, err
-	}
-	out := make(map[string]json.RawMessage, len(reportTopKeys))
-	for _, k := range reportTopKeys {
-		if v, ok := obj[k]; ok {
-			out[k] = v
-		}
-	}
-	if raw, ok := out["artifact"]; ok {
-		f, err := fixedFieldsOnly(raw, artifactKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["artifact"] = f
-	}
-	for _, arrayKey := range []struct {
-		name string
-		keys []string
-	}{
-		{"rules", ruleKeys},
-		{"findings", findingKeys},
-	} {
-		if raw, ok := out[arrayKey.name]; ok {
-			f, err := fixedFieldsInArray(raw, arrayKey.keys)
-			if err != nil {
-				return nil, err
-			}
-			out[arrayKey.name] = f
-		}
-	}
-	return json.Marshal(out)
+	return strictFixedJSON(data, reportShape)
 }
 
 // loadStoredReport parses archive bytes for id and fully validates them.
