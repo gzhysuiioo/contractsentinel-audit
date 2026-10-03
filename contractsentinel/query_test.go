@@ -2,7 +2,9 @@ package contractsentinel
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -474,6 +476,103 @@ func TestQueryTransformInvalidConfig(t *testing.T) {
 			t.Fatalf("got %+v, want reason naming rule 2", f)
 		}
 	})
+}
+
+func TestParseConfigErrorAttributionIsPerConfig(t *testing.T) {
+	// Route 2 of this config has an unsupported op in its second rule; the
+	// reason must always locate route 2 / "orders" / rule 2 no matter what
+	// else is being parsed in the same process.
+	bad := `{"routes":[
+	  {"id":"ok","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"},
+	  {"id":"orders","methods":["GET"],"pathPrefix":"/b","upstream":"http://h","queryTransforms":[
+	    {"op":"set","name":"a","value":"1"},
+	    {"op":"frob","name":"a"}
+	  ]}
+	]}`
+	wantReason := func(f *Failure) {
+		t.Helper()
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config", f)
+		}
+		for _, want := range []string{"route 2", `"orders"`, "rule 2", "unknown op"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
+		}
+	}
+
+	// A second config with many valid routes (each carrying transforms) and
+	// a third that fails on a later route: parsing them alongside the bad
+	// config must not shift its reported positions or change its outcome.
+	var many strings.Builder
+	many.WriteString(`{"routes":[`)
+	for i := 0; i < 50; i++ {
+		if i > 0 {
+			many.WriteByte(',')
+		}
+		fmt.Fprintf(&many, `{"id":"g%d","methods":["*"],"pathPrefix":"/g%d","upstream":"http://h",`+
+			`"queryTransforms":[{"op":"set","name":"a","value":"1"}]}`, i, i)
+	}
+	many.WriteString(`]}`)
+	otherBad := `{"routes":[
+	  {"id":"x","methods":["*"],"pathPrefix":"/x","upstream":"http://h"},
+	  {"id":"y","methods":["*"],"pathPrefix":"/y","upstream":"http://h"},
+	  {"id":"z","methods":["*"],"pathPrefix":"/z","upstream":"http://h","queryTransforms":null}
+	]}`
+
+	checkOthers := func() {
+		t.Helper()
+		if _, f := ParseConfig([]byte(many.String())); f != nil {
+			t.Fatalf("valid config rejected: %+v", f)
+		}
+		_, f := ParseConfig([]byte(otherBad))
+		if f == nil || !strings.Contains(f.Reason, "route 3") || strings.Contains(f.Reason, "rule") {
+			t.Fatalf("other config reason = %+v, want route 3 with no rule index", f)
+		}
+	}
+
+	// Interleaved sequentially: same attribution as parsing alone.
+	checkOthers()
+	_, f := ParseConfig([]byte(bad))
+	wantReason(f)
+	checkOthers()
+
+	// Interleaved concurrently: goroutines parsing other configs must not
+	// race with or renumber this config's error.
+	const workers = 8
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if w%2 == 0 {
+					if _, f := ParseConfig([]byte(many.String())); f != nil {
+						t.Errorf("valid config rejected: %+v", f)
+						return
+					}
+				} else {
+					_, f := ParseConfig([]byte(otherBad))
+					if f == nil || !strings.Contains(f.Reason, "route 3") {
+						t.Errorf("other config reason = %+v, want route 3", f)
+						return
+					}
+				}
+			}
+		}(w)
+	}
+	for i := 0; i < 200; i++ {
+		_, f := ParseConfig([]byte(bad))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config", f)
+		}
+		for _, want := range []string{"route 2", `"orders"`, "rule 2", "unknown op"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
+		}
+	}
+	wg.Wait()
 }
 
 func TestQueryTransformOnlyAppliedAfterMatching(t *testing.T) {

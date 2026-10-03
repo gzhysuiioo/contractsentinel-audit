@@ -21,6 +21,11 @@ type Route struct {
 	PathPrefix      string            `json:"pathPrefix"`
 	Upstream        string            `json:"upstream"`
 	QueryTransforms []*QueryTransform `json:"-"`
+
+	// queryTransformsRaw holds the undecoded queryTransforms value between
+	// Route.UnmarshalJSON and Config.UnmarshalJSON, which validates it once
+	// the route's position in its own config is known.
+	queryTransformsRaw json.RawMessage
 }
 
 // QueryTransform is one rule in a route's queryTransforms array: op is
@@ -45,30 +50,20 @@ type routeJSON struct {
 	QueryTransforms json.RawMessage `json:"queryTransforms"`
 }
 
-// UnmarshalJSON decodes a route object and eagerly validates its
-// queryTransforms (if present); the location matches ParseConfig's
-// "route N" numbering so the reason can identify the route and rule.
+// UnmarshalJSON decodes a route object and keeps queryTransforms raw; the
+// enclosing Config.UnmarshalJSON validates it with the route's 1-based
+// position in that config's routes array.
 func (route *Route) UnmarshalJSON(data []byte) error {
 	var rj routeJSON
 	if err := json.Unmarshal(data, &rj); err != nil {
 		return err
 	}
-	idx := routeUnmarshalIndex
-	routeUnmarshalIndex++
 	route.ID = rj.ID
 	route.Methods = rj.Methods
 	route.PathPrefix = rj.PathPrefix
 	route.Upstream = rj.Upstream
-
-	if len(rj.QueryTransforms) == 0 {
-		return nil // field absent
-	}
-	loc := fmt.Sprintf("route %d", idx+1)
-	transforms, f := parseQueryTransforms(rj.QueryTransforms, loc, rj.ID)
-	if f != nil {
-		return f
-	}
-	route.QueryTransforms = transforms
+	route.QueryTransforms = nil
+	route.queryTransformsRaw = rj.QueryTransforms
 	return nil
 }
 
@@ -166,14 +161,37 @@ func routeLabel(loc, id string) string {
 	return loc
 }
 
-// routeUnmarshalIndex is advanced while a config is decoded so nested route
-// unmarshalling can report its 1-based position. Route objects only occur in
-// the routes array; ParseConfig resets it before each decode.
-var routeUnmarshalIndex int
-
 // Config is the resolve configuration: a flat array of routes.
 type Config struct {
 	Routes []Route `json:"routes"`
+}
+
+// UnmarshalJSON decodes the routes array and validates each route's
+// queryTransforms against that route's position in this config. The position
+// comes from the array being decoded here, so configs parsed concurrently or
+// interleaved in the same process cannot shift each other's route numbering.
+func (cfg *Config) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Routes []Route `json:"routes"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	cfg.Routes = raw.Routes
+	for i := range cfg.Routes {
+		route := &cfg.Routes[i]
+		if len(route.queryTransformsRaw) == 0 {
+			continue // field absent
+		}
+		loc := fmt.Sprintf("route %d", i+1)
+		transforms, f := parseQueryTransforms(route.queryTransformsRaw, loc, route.ID)
+		if f != nil {
+			return f
+		}
+		route.QueryTransforms = transforms
+		route.queryTransformsRaw = nil
+	}
+	return nil
 }
 
 // Request is one resolution request: an HTTP method and a request target
@@ -205,7 +223,6 @@ func failuref(code, format string, args ...any) *Failure {
 // ParseConfig parses and fully validates the route configuration.
 func ParseConfig(data []byte) (*Config, *Failure) {
 	var cfg Config
-	routeUnmarshalIndex = 0
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		if f, ok := err.(*Failure); ok {
 			return nil, f
