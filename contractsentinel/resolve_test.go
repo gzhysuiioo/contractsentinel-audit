@@ -127,6 +127,105 @@ func TestResolveBasicMatchAndJoin(t *testing.T) {
 	}
 }
 
+func TestResolveJunctionSlashCollapse(t *testing.T) {
+	// Only the run where the base path's trailing slashes meet the
+	// remainder's leading slashes is collapsed to a single slash; slashes,
+	// dot segments and percent escapes anywhere else stay byte for byte.
+	cfg := mustConfig(t, `{
+	  "routes": [
+	    {"id": "multi", "methods": ["GET"], "pathPrefix": "/api",  "upstream": "http://backend.internal/base///"},
+	    {"id": "plain", "methods": ["GET"], "pathPrefix": "/v",    "upstream": "http://plain.internal/base"},
+	    {"id": "nobase","methods": ["GET"], "pathPrefix": "/n",    "upstream": "http://nb.internal:8080"},
+	    {"id": "root",  "methods": ["*"],   "pathPrefix": "/",     "upstream": "https://fallback.internal/base//"}
+	  ]
+	}`)
+
+	cases := []struct {
+		name     string
+		request  string
+		routeID  string
+		upstream string
+	}{
+		{
+			name:     "multi-slash base and remainder collapse at the junction",
+			request:  `{"method":"GET","target":"/api//orders/7?a=1&a=&x=%2f+"}`,
+			routeID:  "multi",
+			upstream: "http://backend.internal/base/orders/7?a=1&a=&x=%2f+",
+		},
+		{
+			name:     "exact prefix with multi-slash base keeps one trailing slash",
+			request:  `{"method":"GET","target":"/api"}`,
+			routeID:  "multi",
+			upstream: "http://backend.internal/base/",
+		},
+		{
+			name:     "remainder made only of slashes ends in the one junction slash",
+			request:  `{"method":"GET","target":"/api///"}`,
+			routeID:  "multi",
+			upstream: "http://backend.internal/base/",
+		},
+		{
+			name:     "internal slashes and dot segments are left untouched",
+			request:  `{"method":"GET","target":"/api//a//b/../c/"}`,
+			routeID:  "multi",
+			upstream: "http://backend.internal/base/a//b/../c/",
+		},
+		{
+			name:     "encoded slash right at the junction is data, not a junction slash",
+			request:  `{"method":"GET","target":"/api/%2f/x"}`,
+			routeID:  "multi",
+			upstream: "http://backend.internal/base/%2f/x",
+		},
+		{
+			name:     "plain base with doubled leading remainder slashes collapses too",
+			request:  `{"method":"GET","target":"/v//orders"}`,
+			routeID:  "plain",
+			upstream: "http://plain.internal/base/orders",
+		},
+		{
+			name:     "upstream without a base path still joins with one slash",
+			request:  `{"method":"GET","target":"/n//orders"}`,
+			routeID:  "nobase",
+			upstream: "http://nb.internal:8080/orders",
+		},
+		{
+			name:     "upstream without a base path and exact prefix keeps the slash",
+			request:  `{"method":"GET","target":"/n"}`,
+			routeID:  "nobase",
+			upstream: "http://nb.internal:8080/",
+		},
+		{
+			name:     "root request keeps one junction slash over a multi-slash base",
+			request:  `{"method":"GET","target":"/"}`,
+			routeID:  "root",
+			upstream: "https://fallback.internal/base/",
+		},
+		{
+			name:     "root request leading multiple slashes follows the junction rule",
+			request:  `{"method":"GET","target":"///healthz//"}`,
+			routeID:  "root",
+			upstream: "https://fallback.internal/base/healthz//",
+		},
+		{
+			name:     "root internal slashes and dot segments are preserved",
+			request:  `{"method":"GET","target":"/a//b/./c?z=1&&w="}`,
+			routeID:  "root",
+			upstream: "https://fallback.internal/base/a//b/./c?z=1&&w=",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := resolveJSON(t, cfg, tc.request)
+			if res.RouteID != tc.routeID {
+				t.Errorf("routeId = %q, want %q", res.RouteID, tc.routeID)
+			}
+			if res.UpstreamURL != tc.upstream {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.upstream)
+			}
+		})
+	}
+}
+
 func TestResolveSegmentBoundary(t *testing.T) {
 	cfg := mustConfig(t, sampleConfig)
 

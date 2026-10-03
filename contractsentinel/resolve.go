@@ -509,10 +509,17 @@ func prefixMatch(prefix, path string) bool {
 
 // joinUpstream strips the route prefix from the request path and joins the
 // remainder onto the upstream base path with exactly one slash at the
-// junction. The base path is carried over byte for byte: joining never
-// re-encodes, reorders or drops anything outside that junction. The raw
-// query is preserved verbatim unless the route defines queryTransforms, in
-// which case they rewrite it after route selection.
+// junction. The junction is one run of literal slashes: every trailing
+// slash on the base path and every leading slash on the remainder are
+// merged into that single slash, even when either side contributes
+// several. Nothing else is normalized: slashes inside either part, the
+// remainder's trailing slashes (once non-slash content has appeared),
+// ".", ".." and percent escapes such as "%2F" are carried over byte for
+// byte, never decoded first. The base path is sliced out of the raw
+// upstream so joining never re-encodes, reorders or drops anything
+// outside the junction. The raw query is preserved verbatim unless the
+// route defines queryTransforms, in which case they rewrite it after
+// route selection.
 func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if _, err := url.Parse(route.Upstream); err != nil {
 		// Config validation already rejected this.
@@ -538,12 +545,15 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if i := strings.IndexByte(tail, '/'); i >= 0 {
 		hostPart, basePath = tail[:i], tail[i:]
 	}
-	joined := strings.TrimSuffix(basePath, "/")
-	if remainder == "" {
-		joined += "/" // the junction slash is kept even with no remaining path
-	} else {
-		joined += remainder
-	}
+
+	// Collapse only the junction run: all trailing slashes of the base
+	// path meet all leading slashes of the remainder, and the junction
+	// keeps exactly one slash whether or not anything follows them. A
+	// remainder made entirely of slashes has no content past the run, so
+	// it likewise ends in that single slash.
+	baseTrimmed := strings.TrimRight(basePath, "/")
+	rest := strings.TrimLeft(remainder, "/")
+	joined := baseTrimmed + "/" + rest
 
 	result := route.Upstream[:schemeEnd+3] + hostPart + joined
 	query, f := applyQueryTransforms(route.QueryTransforms, target)
