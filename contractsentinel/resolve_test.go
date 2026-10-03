@@ -331,6 +331,174 @@ func TestResolveConflict(t *testing.T) {
 	}
 }
 
+// reversedConfig returns the same configuration with its routes array in
+// reverse order. Selection must not depend on configuration order, so every
+// scenario in this file that pins a winner or a conflict is also run against
+// the reversed routes.
+func reversedConfig(t *testing.T, src string) string {
+	t.Helper()
+	var doc struct {
+		Routes []json.RawMessage `json:"routes"`
+	}
+	if err := json.Unmarshal([]byte(src), &doc); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	for i, j := 0, len(doc.Routes)-1; i < j; i, j = i+1, j-1 {
+		doc.Routes[i], doc.Routes[j] = doc.Routes[j], doc.Routes[i]
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	return string(out)
+}
+
+// resolveBothOrders resolves one request against src and against the same
+// routes in reverse order, requiring both to succeed identically.
+func resolveBothOrders(t *testing.T, src, request string) *Resolution {
+	t.Helper()
+	res := resolveJSON(t, mustConfig(t, src), request)
+	rev := resolveJSON(t, mustConfig(t, reversedConfig(t, src)), request)
+	if *rev != *res {
+		t.Fatalf("reversed route order changed the result: %+v vs %+v", res, rev)
+	}
+	return res
+}
+
+func TestResolveLongestWildcardBeatsShorterConcrete(t *testing.T) {
+	// Selection runs longest-prefix first and only then compares concrete
+	// against wildcard methods. The two GET routes on the shorter /api
+	// prefix would conflict with each other if they ever reached the method
+	// comparison, but the longer wildcard prefix must discard them before
+	// that — no conflict, and the result belongs entirely to the longer
+	// route: its id, its prefix stripped, its upstream base path.
+	const src = `{
+	  "routes": [
+	    {"id": "short-get-1", "methods": ["GET"], "pathPrefix": "/api",    "upstream": "http://one.internal/v1"},
+	    {"id": "short-get-2", "methods": ["GET"], "pathPrefix": "/api",    "upstream": "http://two.internal/v1"},
+	    {"id": "long-wild",   "methods": ["*"],   "pathPrefix": "/api/v2", "upstream": "http://v2.internal/base"}
+	  ]
+	}`
+
+	res := resolveBothOrders(t, src, `{"method":"GET","target":"/api/v2/items/9?keep=1&x=%2f+a&flag"}`)
+	if res.RouteID != "long-wild" {
+		t.Errorf("routeId = %q, want long-wild (longest prefix wins over shorter concrete routes)", res.RouteID)
+	}
+	// /api/v2 is stripped, the remainder joins onto long-wild's own base
+	// path, and with no queryTransforms the raw query survives verbatim.
+	if want := "http://v2.internal/base/items/9?keep=1&x=%2f+a&flag"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	// A path exactly equal to the longer prefix follows the same order, and
+	// the join keeps exactly one slash at the junction.
+	res = resolveBothOrders(t, src, `{"method":"GET","target":"/api/v2"}`)
+	if res.RouteID != "long-wild" {
+		t.Errorf("routeId = %q, want long-wild", res.RouteID)
+	}
+	if want := "http://v2.internal/base/"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q (one junction slash)", res.UpstreamURL, want)
+	}
+}
+
+func TestResolveConcreteBeatsWildcardAtLongestPrefix(t *testing.T) {
+	// At the longest matching prefix a concrete GET route beats a wildcard
+	// route; methods without a concrete entry still fall to the wildcard.
+	// The root wildcard never competes: it loses on prefix length first.
+	const src = `{
+	  "routes": [
+	    {"id": "root-wild", "methods": ["*"],   "pathPrefix": "/",       "upstream": "http://root.internal/r"},
+	    {"id": "t-wild",    "methods": ["*"],   "pathPrefix": "/things", "upstream": "http://wild.internal/w"},
+	    {"id": "t-get",     "methods": ["GET"], "pathPrefix": "/things", "upstream": "http://get.internal/g"}
+	  ]
+	}`
+
+	res := resolveBothOrders(t, src, `{"method":"GET","target":"/things/1"}`)
+	if res.RouteID != "t-get" {
+		t.Errorf("routeId = %q, want t-get (concrete beats wildcard at the longest prefix)", res.RouteID)
+	}
+	if want := "http://get.internal/g/1"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	res = resolveBothOrders(t, src, `{"method":"PATCH","target":"/things/1"}`)
+	if res.RouteID != "t-wild" {
+		t.Errorf("routeId = %q, want t-wild (no concrete PATCH entry)", res.RouteID)
+	}
+	if want := "http://wild.internal/w/1"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+}
+
+func TestResolveRouteListingConcreteAndWildcardCountsOnce(t *testing.T) {
+	// A route whose methods list holds both GET and "*" is a concrete match
+	// for a GET request, and it is still a single candidate: matching two
+	// method entries must not turn the route into a conflict with itself.
+	const src = `{
+	  "routes": [
+	    {"id": "both", "methods": ["GET", "*"], "pathPrefix": "/both", "upstream": "http://both.internal/b"}
+	  ]
+	}`
+	res := resolveBothOrders(t, src, `{"method":"GET","target":"/both/x"}`)
+	if res.RouteID != "both" {
+		t.Errorf("routeId = %q, want both (no self-conflict from GET plus *)", res.RouteID)
+	}
+	if want := "http://both.internal/b/x"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	// Its GET entry is concrete, so it also wins over a plain wildcard route
+	// at the same prefix.
+	const two = `{
+	  "routes": [
+	    {"id": "wild", "methods": ["*"],        "pathPrefix": "/both", "upstream": "http://wild.internal/w"},
+	    {"id": "both", "methods": ["GET", "*"], "pathPrefix": "/both", "upstream": "http://both.internal/b"}
+	  ]
+	}`
+	res = resolveBothOrders(t, two, `{"method":"GET","target":"/both/x"}`)
+	if res.RouteID != "both" {
+		t.Errorf("routeId = %q, want both (concrete GET entry beats the wildcard route)", res.RouteID)
+	}
+	if want := "http://both.internal/b/x"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+}
+
+func TestResolveConflictOnlyAmongLongestPrefixConcrete(t *testing.T) {
+	// The conflict set is whatever survives both selection steps: the
+	// shorter-prefix GET route is discarded by prefix length and the
+	// same-prefix wildcard by the concrete comparison, so only the two
+	// concrete GET routes at the longest prefix remain, and no route is
+	// returned as a success.
+	const src = `{
+	  "routes": [
+	    {"id": "short", "methods": ["GET"], "pathPrefix": "/a",   "upstream": "http://short.internal"},
+	    {"id": "wild",  "methods": ["*"],   "pathPrefix": "/a/b", "upstream": "http://wild.internal"},
+	    {"id": "zeta",  "methods": ["GET"], "pathPrefix": "/a/b", "upstream": "http://z.internal"},
+	    {"id": "alpha", "methods": ["GET"], "pathPrefix": "/a/b", "upstream": "http://a.internal"}
+	  ]
+	}`
+	for _, cfgSrc := range []string{src, reversedConfig(t, src)} {
+		cfg := mustConfig(t, cfgSrc)
+		res, rf := Resolve(cfg, mustReq(t, "GET", "/a/b/x"))
+		if rf == nil {
+			t.Fatalf("got success %+v, want route_conflict", res)
+		}
+		if rf.Code != "route_conflict" {
+			t.Fatalf("code = %q, want route_conflict", rf.Code)
+		}
+		want := []string{"alpha", "zeta"}
+		if len(rf.Candidates) != len(want) {
+			t.Fatalf("candidates = %v, want exactly %v (shorter prefix and wildcard excluded)", rf.Candidates, want)
+		}
+		for i := range want {
+			if rf.Candidates[i] != want[i] {
+				t.Fatalf("candidates = %v, want lexicographic %v", rf.Candidates, want)
+			}
+		}
+	}
+}
+
 func mustReq(t *testing.T, method, target string) *Request {
 	t.Helper()
 	req, f := ParseRequest([]byte(`{"method":"` + method + `","target":"` + target + `"}`))
