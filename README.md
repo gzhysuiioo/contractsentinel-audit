@@ -104,6 +104,12 @@ go test ./...
 
 - `invalid_config`：配置不可读、JSON 无效或任一路由不合法（含非法
   queryTransforms；能定位时指出第几条路由及 id，规则错误指出规则序号）。
+  合法 JSON 中某条路由的 `id`、`methods`、`pathPrefix`、`upstream`
+  字段类型本身不符（如 `methods` 写成字符串、数组元素不是字符串）时，
+  reason 直接指出从 1 开始的路由序号与字段，而非把整份配置说成无效
+  JSON；该路由同时提供了合法非空字符串 `id` 时附带该 id（即使它写在
+  出错字段之后），但 `id` 自身类型错误时只报位置与字段。只有 JSON
+  语法损坏才报解析失败，且不猜测路由位置。
 - `invalid_request`：请求 JSON 无效、方法缺失或不合法、`target` 不以 `/` 开头、含片段或非法百分号转义。
 - `route_conflict` / `route_not_found`：见上。
 

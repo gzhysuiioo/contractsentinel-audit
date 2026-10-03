@@ -181,6 +181,83 @@ func TestResolveCLIInvalidConfigRejectedEvenWhenFirstRouteHits(t *testing.T) {
 	}
 }
 
+// TestResolveCLIRouteFieldTypeLocated rejects valid JSON whose second route
+// has a wrong-typed methods field, even when the request would hit the first
+// route; the stderr reason must name route 2 and its orders id and say
+// methods must be an array, instead of blaming the whole document's JSON.
+func TestResolveCLIRouteFieldTypeLocated(t *testing.T) {
+	badConfig := `{
+	  "routes": [
+	    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+	    {"id": "orders", "methods": "GET", "pathPrefix": "/api/orders", "upstream": "http://orders.internal"}
+	  ]
+	}`
+	res := runResolveCLI(t, badConfig, cliSuccessRequest)
+
+	if res.exitCode == 0 {
+		t.Fatalf("exit code = 0, want non-zero")
+	}
+	if len(res.stdout) != 0 {
+		t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+	}
+
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Errorf("code = %q, want invalid_config", fail.Code)
+	}
+	if strings.Contains(fail.Reason, "not valid JSON") {
+		t.Fatalf("field type error must not read as a JSON syntax failure: %q", fail.Reason)
+	}
+	for _, want := range []string{"route 2", `"orders"`, "methods must be an array"} {
+		if !strings.Contains(fail.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+		}
+	}
+
+	// After the second route is repaired to an array, the same request
+	// resolves normally and the first route still matches.
+	fixedConfig := strings.Replace(badConfig, `"methods": "GET", "pathPrefix": "/api/orders"`,
+		`"methods": ["GET"], "pathPrefix": "/api/orders"`, 1)
+	ok := runResolveCLI(t, fixedConfig, cliSuccessRequest)
+	if ok.exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", ok.exitCode, ok.stderr)
+	}
+	var success struct {
+		RouteID     string `json:"routeId"`
+		UpstreamURL string `json:"upstreamURL"`
+	}
+	decodeOneJSON(t, ok.stdout, "stdout", &success)
+	if success.RouteID != "api" || success.UpstreamURL != "http://api.internal/v1/items?a=1&a=&x=%2f+&flag" {
+		t.Fatalf("got %+v", success)
+	}
+
+	// A numeric entry inside an otherwise legal methods array is attributed
+	// to that route's methods, and must name the entry that failed.
+	numConfig := strings.Replace(badConfig, `"methods": "GET", "pathPrefix": "/api/orders"`,
+		`"methods": ["GET", 1], "pathPrefix": "/api/orders"`, 1)
+	num := runResolveCLI(t, numConfig, cliSuccessRequest)
+	if num.exitCode == 0 {
+		t.Fatalf("exit code = 0, want non-zero")
+	}
+	var numFail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, num.stderr, "stderr", &numFail)
+	if numFail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config", numFail.Code)
+	}
+	for _, want := range []string{"route 2", `"orders"`, "methods entry 2 must be a string"} {
+		if !strings.Contains(numFail.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", numFail.Reason, want)
+		}
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

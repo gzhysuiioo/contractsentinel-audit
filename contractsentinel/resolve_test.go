@@ -309,6 +309,131 @@ func TestInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigFieldTypes(t *testing.T) {
+	// Unlike TestInvalidConfig's missing/illegal-value cases, these exercise
+	// fields whose JSON type itself is wrong: valid JSON that cannot satisfy
+	// the field's type must still be invalid_config, but the reason has to
+	// name the route position (and a valid string id), distinguish it from a
+	// JSON syntax failure, and say why the field could not be read.
+	goodRoute := `"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"`
+
+	cases := []struct {
+		name      string
+		src       string
+		want      []string // all must appear in the reason
+		forbidden []string // none may appear in the reason
+	}{
+		{
+			name: "methods string on second route, id after the bad field",
+			src: `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://a"},
+			  {"methods":"GET","id":"orders","pathPrefix":"/api/orders","upstream":"http://o"}
+			]}`,
+			want: []string{"route 2", `"orders"`, "methods must be an array"},
+		},
+		{
+			name: "methods null",
+			src:  `{"routes":[{` + goodRoute + `,"methods":null}]}`,
+			want: []string{"route 1", `"x"`, "methods must be an array"},
+		},
+		{
+			name: "methods is an object",
+			src:  `{"routes":[{` + goodRoute + `,"methods":{"GET":true}}]}`,
+			want: []string{"route 1", `"x"`, "methods must be an array"},
+		},
+		{
+			name: "numeric entry inside a legal methods array",
+			src: `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://a"},
+			  {"id":"orders","methods":["GET",1],"pathPrefix":"/api/orders","upstream":"http://o"}
+			]}`,
+			want: []string{"route 2", `"orders"`, "methods entry 2 must be a string"},
+		},
+		{
+			name: "null entry inside methods",
+			src:  `{"routes":[{` + goodRoute + `,"methods":[null]}]}`,
+			want: []string{"route 1", "methods entry 1 must be a string"},
+		},
+		{
+			name:      "id is a number",
+			src:       `{"routes":[{"id":1,"methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			want:      []string{"route 1", "id must be a string"},
+			forbidden: []string{"(id "},
+		},
+		{
+			name:      "id is an object",
+			src:       `{"routes":[{"id":{"v":1},"methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}]}`,
+			want:      []string{"route 1", "id must be a string"},
+			forbidden: []string{"(id "},
+		},
+		{
+			name: "pathPrefix is a number, id written after it",
+			src:  `{"routes":[{"methods":["GET"],"pathPrefix":1,"id":"orders","upstream":"http://o"}]}`,
+			want: []string{"route 1", `"orders"`, "pathPrefix must be a string"},
+		},
+		{
+			name: "upstream is a boolean, id written after it",
+			src:  `{"routes":[{"methods":["GET"],"pathPrefix":"/a","upstream":true,"id":"orders"}]}`,
+			want: []string{"route 1", `"orders"`, "upstream must be a string"},
+		},
+		{
+			name: "routes entry is not an object",
+			src:  `{"routes":[42]}`,
+			want: []string{"route 1", "route entry must be a JSON object"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_config")
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("field type error must not be described as a JSON syntax failure: %q", f.Reason)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			for _, bad := range tc.forbidden {
+				if strings.Contains(f.Reason, bad) {
+					t.Fatalf("reason = %q must not contain %q", f.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// Broken JSON syntax stays a parse failure and never gets a guessed
+	// route position, even when the corruption is inside the routes array.
+	for _, src := range []string{`{not json`, `{"routes": [{"id":"x"} broken`} {
+		_, f := ParseConfig([]byte(src))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("got %+v, want invalid_config for %q", f, src)
+		}
+		if !strings.Contains(f.Reason, "not valid JSON") {
+			t.Fatalf("reason = %q, want a JSON parse failure", f.Reason)
+		}
+		if strings.Contains(f.Reason, "route 1") {
+			t.Fatalf("syntax failure must not guess a route position: %q", f.Reason)
+		}
+	}
+
+	// Fixing the second route's methods lets the request resolve normally,
+	// including through the first route it originally matched.
+	cfg := mustConfig(t, `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"orders","methods":["GET"],"pathPrefix":"/api/orders","upstream":"http://orders.internal"}
+	]}`)
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/items"}`)
+	if res.RouteID != "api" || res.UpstreamURL != "http://api.internal/v1/items" {
+		t.Fatalf("got %+v, want api / http://api.internal/v1/items", res)
+	}
+}
+
 func TestInvalidRequest(t *testing.T) {
 	cases := []struct {
 		name string
