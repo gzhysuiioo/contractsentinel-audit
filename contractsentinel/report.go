@@ -108,8 +108,15 @@ type wireInput struct {
 }
 
 // ParseAuditInput decodes an audit submission JSON object into domain values.
-// Invariant values must be JSON booleans; any other type is an error.
+// Invariant values must be JSON booleans; any other type is an error. Any JSON
+// object in the submission that repeats a member name rejects the whole
+// submission: the decoder keeps only the last value silently, so a repeated
+// invariant key would choose a conclusion by member order instead of giving
+// one trustworthy result.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
+	if dup := findDuplicateJSONMember(data); dup != nil {
+		return Artifact{}, nil, nil, nil, errInvalid(duplicateMemberMessage(data, dup))
+	}
 	var in wireInput
 	if err := json.Unmarshal(data, &in); err != nil {
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
