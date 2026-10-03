@@ -244,6 +244,14 @@ func TestParseAuditInputBooleanTypeError(t *testing.T) {
 	}
 }
 
+func TestParseAuditInputNullInvariant(t *testing.T) {
+	input := `{"artifact":{"name":"A"},"rules":[],"invariants":{"balance-monotonic":null}}`
+	_, _, _, _, err := ParseAuditInput([]byte(input))
+	if err == nil || !strings.Contains(err.Error(), "balance-monotonic") || !strings.Contains(err.Error(), "boolean") {
+		t.Fatalf("expected boolean type error naming the invariant, got %v", err)
+	}
+}
+
 func TestParseAuditInputInvariantsNotObject(t *testing.T) {
 	input := `{"artifact":{"name":"A"},"rules":[],"invariants":[1,2]}`
 	if _, _, _, _, err := ParseAuditInput([]byte(input)); err == nil {

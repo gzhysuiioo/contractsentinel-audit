@@ -108,7 +108,8 @@ type wireInput struct {
 }
 
 // ParseAuditInput decodes an audit submission JSON object into domain values.
-// Invariant values must be JSON booleans; any other type is an error.
+// Invariant values must be JSON booleans; any other type, including null, is
+// an error and rejects the whole submission.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	var in wireInput
 	if err := json.Unmarshal(data, &in); err != nil {
@@ -116,11 +117,11 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 	}
 	invariants := make(map[string]bool, len(in.Invariants))
 	for key, raw := range in.Invariants {
-		var holds bool
-		if err := json.Unmarshal(raw, &holds); err != nil {
+		var holds *bool
+		if err := json.Unmarshal(raw, &holds); err != nil || holds == nil {
 			return Artifact{}, nil, nil, nil, errInvalid("invariant " + key + " must be a boolean")
 		}
-		invariants[key] = holds
+		invariants[key] = *holds
 	}
 	artifact := Artifact{
 		Name:     in.Artifact.Name,
