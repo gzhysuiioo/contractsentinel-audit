@@ -764,6 +764,112 @@ func TestInvalidRequest(t *testing.T) {
 	}
 }
 
+func TestInvalidRequestFieldTypes(t *testing.T) {
+	// Valid JSON whose method or target holds the wrong JSON type must be
+	// invalid_request with a reason naming the field, the expected string
+	// type and the type actually received — never a blanket "not valid JSON".
+	cases := []struct {
+		name string
+		src  string
+		want []string // all must appear in the reason
+	}{
+		{"method number", `{"method":42,"target":"/api"}`, []string{"method", "must be a string", "number"}},
+		{"method boolean", `{"method":true,"target":"/api"}`, []string{"method", "must be a string", "boolean"}},
+		{"method object", `{"method":{"m":"GET"},"target":"/api"}`, []string{"method", "must be a string", "object"}},
+		{"method array", `{"method":["GET"],"target":"/api"}`, []string{"method", "must be a string", "array"}},
+		{"method null is a type error", `{"method":null,"target":"/api"}`, []string{"method", "must be a string", "null"}},
+		{"target number", `{"method":"GET","target":7}`, []string{"target", "must be a string", "number"}},
+		{"target boolean", `{"method":"GET","target":false}`, []string{"target", "must be a string", "boolean"}},
+		{"target object", `{"method":"GET","target":{}}`, []string{"target", "must be a string", "object"}},
+		{"target array", `{"method":"GET","target":[]}`, []string{"target", "must be a string", "array"}},
+		{"target null is a type error", `{"method":"GET","target":null}`, []string{"target", "must be a string", "null"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, f := ParseRequest([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_request")
+			}
+			if f.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", f.Code)
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("field type error must not be described as a JSON syntax failure: %q", f.Reason)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+		})
+	}
+
+	// When both fields are wrongly typed, method is reported first no matter
+	// how the fields are ordered in the object.
+	for _, src := range []string{
+		`{"method":42,"target":[]}`,
+		`{"target":[],"method":42}`,
+	} {
+		_, f := ParseRequest([]byte(src))
+		if f == nil || !strings.Contains(f.Reason, "method") || strings.Contains(f.Reason, "target") {
+			t.Fatalf("%s: reason = %v, want the method type error reported first", src, f)
+		}
+	}
+
+	// Valid JSON whose top level is not an object is the wrong shape, not
+	// broken syntax.
+	for _, tc := range []struct {
+		src  string
+		want string
+	}{
+		{`[1,2]`, "array"},
+		{`42`, "number"},
+		{`"GET /api"`, "string"},
+		{`true`, "boolean"},
+		{`null`, "null"},
+	} {
+		_, f := ParseRequest([]byte(tc.src))
+		if f == nil || f.Code != "invalid_request" {
+			t.Fatalf("%s: got %+v, want invalid_request", tc.src, f)
+		}
+		if strings.Contains(f.Reason, "not valid JSON") {
+			t.Fatalf("%s: legal JSON must not be called a syntax failure: %q", tc.src, f.Reason)
+		}
+		if !strings.Contains(f.Reason, "must be a JSON object") || !strings.Contains(f.Reason, tc.want) {
+			t.Fatalf("%s: reason = %q, want the required object shape and the %s type", tc.src, f.Reason, tc.want)
+		}
+	}
+
+	// Broken JSON stays a parse failure and never names a field.
+	_, f := ParseRequest([]byte(`{"method": broken`))
+	if f == nil || !strings.Contains(f.Reason, "not valid JSON") {
+		t.Fatalf("reason = %v, want a JSON parse failure", f)
+	}
+	if strings.Contains(f.Reason, "must be a string") {
+		t.Fatalf("syntax failure must not guess a field: %q", f.Reason)
+	}
+
+	// Missing fields keep their distinct required-field messages, and an
+	// empty string is a content problem, not a type error.
+	_, f = ParseRequest([]byte(`{"target":"/a"}`))
+	if f == nil || !strings.Contains(f.Reason, "method is required") {
+		t.Fatalf("missing method: got %v", f)
+	}
+	_, f = ParseRequest([]byte(`{"method":"GET"}`))
+	if f == nil || !strings.Contains(f.Reason, "start with /") {
+		t.Fatalf("missing target: got %v", f)
+	}
+	_, f = ParseRequest([]byte(`{"method":"GET","target":""}`))
+	if f == nil || !strings.Contains(f.Reason, "start with /") || strings.Contains(f.Reason, "must be a string") {
+		t.Fatalf("empty target must stay a content error, not a type error: %v", f)
+	}
+	// String content checks still apply after the type checks.
+	_, f = ParseRequest([]byte(`{"method":"GET","target":"/api%2"}`))
+	if f == nil || !strings.Contains(f.Reason, "percent escape") {
+		t.Fatalf("bad percent escape: got %v", f)
+	}
+}
+
 func TestEncodedPrefixBoundary(t *testing.T) {
 	// A prefix that itself contains an encoded slash is matched against the
 	// raw target; the encoded slash is data in the same segment.
