@@ -509,10 +509,14 @@ func prefixMatch(prefix, path string) bool {
 
 // joinUpstream strips the route prefix from the request path and joins the
 // remainder onto the upstream base path with exactly one slash at the
-// junction. The base path is carried over byte for byte: joining never
-// re-encodes, reorders or drops anything outside that junction. The raw
-// query is preserved verbatim unless the route defines queryTransforms, in
-// which case they rewrite it after route selection.
+// junction: a run of literal slashes where the base path's trailing slashes
+// meet the remainder's leading slashes collapses to a single "/". Only that
+// junction run is touched — "//" inside either side, trailing slashes of the
+// remainder after non-slash content, and encoded "%2F" all stay as they are.
+// The base path is carried over byte for byte: joining never re-encodes,
+// reorders or drops anything outside that junction. The raw query is
+// preserved verbatim unless the route defines queryTransforms, in which case
+// they rewrite it after route selection.
 func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if _, err := url.Parse(route.Upstream); err != nil {
 		// Config validation already rejected this.
@@ -538,11 +542,15 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if i := strings.IndexByte(tail, '/'); i >= 0 {
 		hostPart, basePath = tail[:i], tail[i:]
 	}
-	joined := strings.TrimSuffix(basePath, "/")
+	// Collapse the junction run — the base path's trailing slashes plus the
+	// remainder's leading slashes — to exactly one literal "/". Trimming only
+	// literal '/' bytes leaves encoded slashes ("%2F"/"%2f") and every slash
+	// away from the junction untouched.
+	joined := strings.TrimRight(basePath, "/")
 	if remainder == "" {
 		joined += "/" // the junction slash is kept even with no remaining path
 	} else {
-		joined += remainder
+		joined += "/" + strings.TrimLeft(remainder, "/")
 	}
 
 	result := route.Upstream[:schemeEnd+3] + hostPart + joined
