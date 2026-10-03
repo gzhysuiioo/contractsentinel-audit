@@ -107,18 +107,87 @@ type wireInput struct {
 	Checks     []wireCheck                `json:"checks"`
 }
 
+// Fixed audit-submission fields by their original spelling. A submission is
+// decoded through these exact names only, at the top level and inside the
+// artifact, every rule and every check record: encoding/json otherwise falls
+// back to case-insensitive field matching, so an extension member such as
+// "StAtus" would silently decode into the status field and could override — or
+// launder — the formal conclusion, depending on where the extension member
+// happens to appear. The trusted content of a submission is carried by the
+// fixed fields alone; case variants, whitespace-padded names and unknown
+// members are extension data and never reach the decoder. Invariant names are
+// user-defined, not fixed fields, so the invariants object is passed through
+// unchanged: "Inv" and "inv" stay two distinct invariants and names keep
+// their surrounding whitespace. This mirrors the fixed-field rule applied
+// when stored reports are read back.
+var (
+	submissionTopKeys      = []string{"artifact", "rules", "invariants", "checks"}
+	submissionArtifactKeys = []string{"name", "abi", "bytecode", "source"}
+	submissionRuleKeys     = []string{"id", "kind", "severity", "invariant", "requiresABI", "version"}
+	submissionCheckKeys    = []string{"artifactHash", "ruleId", "version", "status", "note"}
+)
+
+// strictSubmissionJSON rewrites submission bytes to the fixed fields under
+// their original spelling, at the top level and inside the artifact, every
+// rule and every check record. The invariants object is copied verbatim so
+// user-defined names are preserved exactly. Member order and extension
+// members no longer influence the decoded submission.
+func strictSubmissionJSON(data []byte) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(submissionTopKeys))
+	for _, k := range submissionTopKeys {
+		if v, ok := obj[k]; ok {
+			out[k] = v
+		}
+	}
+	if raw, ok := out["artifact"]; ok {
+		f, err := fixedFieldsOnly(raw, submissionArtifactKeys)
+		if err != nil {
+			return nil, err
+		}
+		out["artifact"] = f
+	}
+	for _, arrayKey := range []struct {
+		name string
+		keys []string
+	}{
+		{"rules", submissionRuleKeys},
+		{"checks", submissionCheckKeys},
+	} {
+		if raw, ok := out[arrayKey.name]; ok {
+			f, err := fixedFieldsInArray(raw, arrayKey.keys)
+			if err != nil {
+				return nil, err
+			}
+			out[arrayKey.name] = f
+		}
+	}
+	return json.Marshal(out)
+}
+
 // ParseAuditInput decodes an audit submission JSON object into domain values.
 // Invariant values must be JSON booleans; any other type is an error. Any JSON
 // object in the submission that repeats a member name rejects the whole
 // submission: the decoder keeps only the last value silently, so a repeated
 // invariant key would choose a conclusion by member order instead of giving
-// one trustworthy result.
+// one trustworthy result. Only the conventionally spelled fixed fields take
+// part: a case variant or whitespace-padded name such as "StAtus" is an
+// extension member and can neither override a formal field nor stand in for a
+// missing or invalid one, regardless of where it appears or what JSON type it
+// carries. Invariant names are user-defined and therefore not fixed fields.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(duplicateMemberMessage(data, dup))
 	}
+	strict, err := strictSubmissionJSON(data)
+	if err != nil {
+		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
+	}
 	var in wireInput
-	if err := json.Unmarshal(data, &in); err != nil {
+	if err := json.Unmarshal(strict, &in); err != nil {
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	invariants := make(map[string]bool, len(in.Invariants))
