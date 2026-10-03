@@ -479,6 +479,103 @@ func duplicateArchiveError(id string, data []byte, dup *duplicateMemberError) er
 	return errCorrupt("report " + id + " archive is corrupt: " + duplicateMemberMessage(data, dup))
 }
 
+// Fixed report fields by their original spelling. A stored archive must be
+// decoded through these exact names only: encoding/json otherwise falls back
+// to case-insensitive field matching, so an extension member such as "StAtus"
+// would silently decode into the status field and could override — or launder
+// — the conclusion recorded by the original "status" member, depending on
+// where the extension member happens to appear. The trusted content of a
+// report is carried by the fixed fields alone; case variants, whitespace-
+// padded names and unknown members are extension data and never reach the
+// decoder.
+var (
+	reportTopKeys = []string{"reportId", "artifact", "rules", "findings"}
+	artifactKeys  = []string{"name", "hash"}
+	ruleKeys      = []string{"id", "kind", "severity", "invariant", "requiresABI", "version", "status", "note"}
+	findingKeys   = []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}
+)
+
+// fixedFieldsOnly rewrites one JSON object keeping only the named members.
+// Names are compared after JSON string decoding, so a member name written
+// with escapes still denotes its fixed field. Exact duplicates were already
+// rejected by findDuplicateJSONMember, so each kept name appears at most
+// once.
+func fixedFieldsOnly(raw json.RawMessage, keys []string) (json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(keys))
+	for _, k := range keys {
+		if v, ok := obj[k]; ok {
+			out[k] = v
+		}
+	}
+	return json.Marshal(out)
+}
+
+// fixedFieldsInArray rewrites every element of a JSON array with
+// fixedFieldsOnly. A null array stays null so the decoded slice keeps the
+// same nil-ness as before.
+func fixedFieldsInArray(raw json.RawMessage, keys []string) (json.RawMessage, error) {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return nil, err
+	}
+	if elems == nil {
+		return raw, nil
+	}
+	out := make([]json.RawMessage, 0, len(elems))
+	for _, e := range elems {
+		f, err := fixedFieldsOnly(e, keys)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return json.Marshal(out)
+}
+
+// strictReportJSON rewrites archive bytes to the fixed report fields under
+// their original spelling, at the top level and inside the artifact, every
+// rule and every finding. Member order and extension members no longer
+// influence the decoded report.
+func strictReportJSON(data []byte) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(reportTopKeys))
+	for _, k := range reportTopKeys {
+		if v, ok := obj[k]; ok {
+			out[k] = v
+		}
+	}
+	if raw, ok := out["artifact"]; ok {
+		f, err := fixedFieldsOnly(raw, artifactKeys)
+		if err != nil {
+			return nil, err
+		}
+		out["artifact"] = f
+	}
+	for _, arrayKey := range []struct {
+		name string
+		keys []string
+	}{
+		{"rules", ruleKeys},
+		{"findings", findingKeys},
+	} {
+		if raw, ok := out[arrayKey.name]; ok {
+			f, err := fixedFieldsInArray(raw, arrayKey.keys)
+			if err != nil {
+				return nil, err
+			}
+			out[arrayKey.name] = f
+		}
+	}
+	return json.Marshal(out)
+}
+
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
 	// Read-side counterpart of the submission check: json.Unmarshal silently
@@ -491,8 +588,12 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Report{}, duplicateArchiveError(id, data, dup)
 	}
+	strict, err := strictReportJSON(data)
+	if err != nil {
+		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
 	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
+	if err := json.Unmarshal(strict, &r); err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
 	}
 	if r.ReportID != id {
