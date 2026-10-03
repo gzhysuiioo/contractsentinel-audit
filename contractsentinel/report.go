@@ -107,64 +107,16 @@ type wireInput struct {
 	Checks     []wireCheck                `json:"checks"`
 }
 
-// Fixed submission field spellings. A submission is decoded through these
-// exact names only, mirroring strictReportJSON on the read side:
-// encoding/json otherwise falls back to case-insensitive field matching, so
-// an extension member such as "StAtus" would silently decode into the status
-// field and could override — or launder — the conclusion carried by the
-// formal "status" member, depending on where the extension member appears.
-// Case variants, whitespace-padded names and unknown members are extension
-// data and never reach the decoder. The invariants object is not rewritten:
-// invariant names are user-defined rather than fixed fields, so "Inv" and
-// "inv" stay two independent invariants and a padded name is not trimmed.
-var (
-	submissionTopKeys   = []string{"artifact", "rules", "invariants", "checks"}
-	artifactWireKeys    = []string{"name", "abi", "bytecode", "source"}
-	submissionRuleKeys  = []string{"id", "kind", "severity", "invariant", "requiresABI", "version"}
-	submissionCheckKeys = []string{"artifactHash", "ruleId", "version", "status", "note"}
-)
-
-// strictSubmissionJSON rewrites submission bytes to the fixed fields under
-// their agreed spelling, at the top level and inside the artifact, every rule
-// and every check record. Member order and extension members no longer
-// influence the decoded values: a case variant or whitespace-padded name can
-// neither override a formal value nor substitute for a missing or invalid
-// one. Names are compared after JSON string decoding, so a fixed name written
-// with escapes still denotes that field. The invariants object passes through
+// strictSubmissionJSON rewrites submission bytes to the fixed submission
+// fields under their agreed spelling, at the top level and inside the
+// artifact, every rule and every check record. The recognition convention is
+// the shared one of strictFixedFieldsJSON: member order and extension members
+// no longer influence the decoded values, so a case variant or
+// whitespace-padded name can neither override a formal value nor substitute
+// for a missing or invalid one. The invariants object passes through
 // untouched because its member names are user-defined.
 func strictSubmissionJSON(data []byte) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, err
-	}
-	out := make(map[string]json.RawMessage, len(submissionTopKeys))
-	for _, k := range submissionTopKeys {
-		if v, ok := obj[k]; ok {
-			out[k] = v
-		}
-	}
-	if raw, ok := out["artifact"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsOnly(raw, artifactWireKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["artifact"] = f
-	}
-	if raw, ok := out["rules"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsInArray(raw, submissionRuleKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["rules"] = f
-	}
-	if raw, ok := out["checks"]; ok && string(raw) != "null" {
-		f, err := fixedFieldsInArray(raw, submissionCheckKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["checks"] = f
-	}
-	return json.Marshal(out)
+	return strictFixedFieldsJSON(data, submissionFields)
 }
 
 // validateFormalCheckStatuses checks the formal "status" member of every
@@ -588,20 +540,44 @@ func duplicateArchiveError(id string, data []byte, dup *duplicateMemberError) er
 	return errCorrupt("report " + id + " archive is corrupt: " + duplicateMemberMessage(data, dup))
 }
 
-// Fixed report fields by their original spelling. A stored archive must be
-// decoded through these exact names only: encoding/json otherwise falls back
-// to case-insensitive field matching, so an extension member such as "StAtus"
-// would silently decode into the status field and could override — or launder
-// — the conclusion recorded by the original "status" member, depending on
-// where the extension member happens to appear. The trusted content of a
-// report is carried by the fixed fields alone; case variants, whitespace-
-// padded names and unknown members are extension data and never reach the
-// decoder.
+// fixedFieldSchema names the fixed fields of one JSON document shape: the
+// top-level member names, the fixed members of each nested object field, and
+// the fixed members of every element of each array field. Fields not listed
+// anywhere are extension data.
+type fixedFieldSchema struct {
+	top     []string            // fixed top-level member names
+	objects map[string][]string // fixed member names of a nested object field
+	arrays  map[string][]string // fixed member names of each array element
+}
+
+// Fixed field spellings of the two document shapes this package reads. Both
+// the audit submission and the stored report are decoded through these exact
+// names only: encoding/json otherwise falls back to case-insensitive field
+// matching, so an extension member such as "StAtus" would silently decode
+// into the status field and could override — or launder — the conclusion
+// carried by the formal "status" member, depending on where the extension
+// member appears. Case variants, whitespace-padded names and unknown members
+// are extension data and never reach the decoder. The submission's invariants
+// object is not rewritten: invariant names are user-defined rather than fixed
+// fields, so "Inv" and "inv" stay two independent invariants and a padded
+// name is not trimmed.
 var (
-	reportTopKeys = []string{"reportId", "artifact", "rules", "findings"}
-	artifactKeys  = []string{"name", "hash"}
-	ruleKeys      = []string{"id", "kind", "severity", "invariant", "requiresABI", "version", "status", "note"}
-	findingKeys   = []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}
+	submissionFields = fixedFieldSchema{
+		top:     []string{"artifact", "rules", "invariants", "checks"},
+		objects: map[string][]string{"artifact": {"name", "abi", "bytecode", "source"}},
+		arrays: map[string][]string{
+			"rules":  {"id", "kind", "severity", "invariant", "requiresABI", "version"},
+			"checks": {"artifactHash", "ruleId", "version", "status", "note"},
+		},
+	}
+	reportFields = fixedFieldSchema{
+		top:     []string{"reportId", "artifact", "rules", "findings"},
+		objects: map[string][]string{"artifact": {"name", "hash"}},
+		arrays: map[string][]string{
+			"rules":    {"id", "kind", "severity", "invariant", "requiresABI", "version", "status", "note"},
+			"findings": {"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"},
+		},
+	}
 )
 
 // fixedFieldsOnly rewrites one JSON object keeping only the named members.
@@ -645,44 +621,55 @@ func fixedFieldsInArray(raw json.RawMessage, keys []string) (json.RawMessage, er
 	return json.Marshal(out)
 }
 
-// strictReportJSON rewrites archive bytes to the fixed report fields under
-// their original spelling, at the top level and inside the artifact, every
-// rule and every finding. Member order and extension members no longer
-// influence the decoded report.
-func strictReportJSON(data []byte) ([]byte, error) {
+// strictFixedFieldsJSON rewrites data to the fixed fields of schema under
+// their agreed spelling: at the top level, inside each nested object field,
+// and inside every element of each array field. This is the single field
+// recognition convention shared by submissions and stored reports. Names are
+// compared after JSON string decoding, so a fixed name written with escapes
+// still denotes that field. Member order and extension members no longer
+// influence the decoded values: a case variant or whitespace-padded name can
+// neither override a formal value nor substitute for a missing or invalid
+// one, whatever type the extension value has. A null object or array field
+// passes through as null so the decoded value keeps its original nil-ness.
+func strictFixedFieldsJSON(data []byte, schema fixedFieldSchema) ([]byte, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(data, &obj); err != nil {
 		return nil, err
 	}
-	out := make(map[string]json.RawMessage, len(reportTopKeys))
-	for _, k := range reportTopKeys {
+	out := make(map[string]json.RawMessage, len(schema.top))
+	for _, k := range schema.top {
 		if v, ok := obj[k]; ok {
 			out[k] = v
 		}
 	}
-	if raw, ok := out["artifact"]; ok {
-		f, err := fixedFieldsOnly(raw, artifactKeys)
-		if err != nil {
-			return nil, err
-		}
-		out["artifact"] = f
-	}
-	for _, arrayKey := range []struct {
-		name string
-		keys []string
-	}{
-		{"rules", ruleKeys},
-		{"findings", findingKeys},
-	} {
-		if raw, ok := out[arrayKey.name]; ok {
-			f, err := fixedFieldsInArray(raw, arrayKey.keys)
+	for name, keys := range schema.objects {
+		if raw, ok := out[name]; ok && string(raw) != "null" {
+			f, err := fixedFieldsOnly(raw, keys)
 			if err != nil {
 				return nil, err
 			}
-			out[arrayKey.name] = f
+			out[name] = f
+		}
+	}
+	for name, keys := range schema.arrays {
+		if raw, ok := out[name]; ok && string(raw) != "null" {
+			f, err := fixedFieldsInArray(raw, keys)
+			if err != nil {
+				return nil, err
+			}
+			out[name] = f
 		}
 	}
 	return json.Marshal(out)
+}
+
+// strictReportJSON rewrites archive bytes to the fixed report fields under
+// their original spelling, at the top level and inside the artifact, every
+// rule and every finding. The recognition convention is the shared one of
+// strictFixedFieldsJSON: member order and extension members no longer
+// influence the decoded report.
+func strictReportJSON(data []byte) ([]byte, error) {
+	return strictFixedFieldsJSON(data, reportFields)
 }
 
 // loadStoredReport parses archive bytes for id and fully validates them.
