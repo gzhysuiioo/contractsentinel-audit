@@ -116,8 +116,15 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 	}
 	invariants := make(map[string]bool, len(in.Invariants))
 	for key, raw := range in.Invariants {
-		var holds bool
-		if err := json.Unmarshal(raw, &holds); err != nil {
+		// Only JSON true/false is a conclusion. Unmarshalling directly into a
+		// bool would turn null into the zero value false, which would falsely
+		// record a defect; require the token to be a boolean instead.
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil {
+			return Artifact{}, nil, nil, nil, errInvalid("invariant " + key + " must be a boolean")
+		}
+		holds, ok := token.(bool)
+		if !ok {
 			return Artifact{}, nil, nil, nil, errInvalid("invariant " + key + " must be a boolean")
 		}
 		invariants[key] = holds

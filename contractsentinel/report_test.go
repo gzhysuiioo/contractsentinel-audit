@@ -244,6 +244,104 @@ func TestParseAuditInputBooleanTypeError(t *testing.T) {
 	}
 }
 
+// null 没有给出成立与否的结论，绝不能被当成 false 而登记缺陷。
+func TestParseAuditInputNullRejected(t *testing.T) {
+	input := `{
+		"artifact": {"name":"Vault","abi":"abi","bytecode":"0x1","source":"Vault.sol"},
+		"rules": [{"id":"invariant-preserved","kind":"symbolic","severity":"critical","invariant":"balance-monotonic","version":"0.9.0"}],
+		"invariants": {"balance-monotonic": null}
+	}`
+	_, _, _, _, err := ParseAuditInput([]byte(input))
+	if err == nil {
+		t.Fatal("null invariant value must be rejected")
+	}
+	var ei errInvalid
+	if !errors.As(err, &ei) {
+		t.Fatalf("expected errInvalid (input error), got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "balance-monotonic") {
+		t.Fatalf("error must name the invariant: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boolean") {
+		t.Fatalf("error must say the value must be a boolean: %v", err)
+	}
+}
+
+// 即使无效值对应的不变式没有被任何规则引用，也必须整体拒绝，其他合法值
+// 不能使提交变成可接受输入。
+func TestParseAuditInputNullForUnreferencedInvariantRejected(t *testing.T) {
+	input := `{
+		"artifact": {"name":"Vault","abi":"abi","bytecode":"0x1","source":"Vault.sol"},
+		"rules": [{"id":"r1","kind":"static","severity":"high","invariant":"other-inv","version":"1"}],
+		"invariants": {"other-inv": true, "unreferenced": null}
+	}`
+	_, _, _, _, err := ParseAuditInput([]byte(input))
+	if err == nil {
+		t.Fatal("unreferenced null invariant must still reject the whole submission")
+	}
+	if !strings.Contains(err.Error(), "unreferenced") {
+		t.Fatalf("error must name the offending invariant: %v", err)
+	}
+}
+
+// 每个非布尔类型都必须被拒绝，且失败不返回任何部分数据。
+func TestParseAuditInputNonBooleanValuesRejected(t *testing.T) {
+	cases := map[string]string{
+		"string": `"x"`,
+		"number": `1`,
+		"array":  `[true]`,
+		"object": `{"holds":true}`,
+		"null":   `null`,
+	}
+	for name, val := range cases {
+		input := `{"artifact":{"name":"A"},"rules":[],"invariants":{"inv":` + val + `}}`
+		artifact, rules, invariants, checks, err := ParseAuditInput([]byte(input))
+		if err == nil {
+			t.Errorf("%s: expected rejection", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "inv") || !strings.Contains(err.Error(), "boolean") {
+			t.Errorf("%s: error must name invariant and require a boolean: %v", name, err)
+		}
+		if artifact != (Artifact{}) || rules != nil || invariants != nil || checks != nil {
+			t.Errorf("%s: failure must return no partial data: %+v %+v %+v %+v", name, artifact, rules, invariants, checks)
+		}
+	}
+}
+
+// 省略 invariants、空对象、或整个字段为 null，都按没有布尔结果处理。
+func TestParseAuditInputMissingInvariantsMeansNoResults(t *testing.T) {
+	for _, input := range []string{
+		`{"artifact":{"name":"A"},"rules":[]}`,
+		`{"artifact":{"name":"A"},"rules":[],"invariants":{}}`,
+		`{"artifact":{"name":"A"},"rules":[],"invariants":null}`,
+	} {
+		_, _, invariants, _, err := ParseAuditInput([]byte(input))
+		if err != nil {
+			t.Fatalf("absent/empty/null invariants field must be accepted: %v (input %s)", err, input)
+		}
+		if len(invariants) != 0 {
+			t.Fatalf("want no invariant results, got %+v (input %s)", invariants, input)
+		}
+	}
+}
+
+// 端到端：null 不变式不得被 BuildReport 当成缺陷；显式 false 仍是缺陷。
+func TestBuildReportRejectsNullBeforeAudit(t *testing.T) {
+	input := `{
+		"artifact": {"name":"Vault","abi":"abi","bytecode":"0x1","source":"Vault.sol"},
+		"rules": [{"id":"invariant-preserved","kind":"symbolic","severity":"critical","invariant":"balance-monotonic","version":"0.9.0"}],
+		"invariants": {"balance-monotonic": null}
+	}`
+	artifact, rules, invariants, checks, err := ParseAuditInput([]byte(input))
+	if err == nil {
+		t.Fatalf("null must fail parsing, got invariants=%+v", invariants)
+	}
+	_ = artifact
+	_ = rules
+	_ = checks
+}
+
 func TestParseAuditInputInvariantsNotObject(t *testing.T) {
 	input := `{"artifact":{"name":"A"},"rules":[],"invariants":[1,2]}`
 	if _, _, _, _, err := ParseAuditInput([]byte(input)); err == nil {
