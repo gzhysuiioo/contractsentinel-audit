@@ -472,8 +472,25 @@ func validSubmittedReport(r Report) error {
 	return validateReport(r, func(msg string) error { return errInvalid(msg) })
 }
 
+// duplicateArchiveError classifies an archive that repeats a JSON member as
+// corrupt and names the requested report id, the decoded member name and the
+// object carrying it (with array position and rule id when applicable).
+func duplicateArchiveError(id string, data []byte, dup *duplicateMemberError) error {
+	return errCorrupt("report " + id + " archive is corrupt: " + duplicateMemberMessage(data, dup))
+}
+
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
+	// Read-side counterpart of the submission check: json.Unmarshal silently
+	// keeps the last value for a repeated member, so an archive that writes a
+	// rule status as 发现缺陷 and then 通过 would decode to whichever came
+	// last. The recomputed id and the rule/finding correspondence all operate
+	// on that last-wins value and could therefore pass, accepting an archive
+	// with two conflicting conclusions. Any repeated member in any object
+	// makes the archive corrupt, regardless of the last value.
+	if dup := findDuplicateJSONMember(data); dup != nil {
+		return Report{}, duplicateArchiveError(id, data, dup)
+	}
 	var r Report
 	if err := json.Unmarshal(data, &r); err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())

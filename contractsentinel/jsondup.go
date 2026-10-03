@@ -139,28 +139,37 @@ func locateDupObject(data []byte, path []dupPathStep) string {
 			return "the invariants object"
 		}
 		return "the invariants object (" + renderDupPath(path[1:]) + ")"
-	case "rules", "checks":
+	case "rules", "checks", "findings":
 		// The entry itself is the second path step (an array index).
 		if len(path) >= 2 && path[1].index >= 0 {
 			loc := fmt.Sprintf("%s[%d]", head.key, path[1].index) + renderDupPath(path[2:])
 			if id := arrayEntryID(data, head.key, path[1].index); id != "" {
-				if head.key == "rules" {
+				switch head.key {
+				case "rules":
 					return fmt.Sprintf("rule %q (%s)", id, loc)
+				case "checks":
+					return fmt.Sprintf("check record for rule %q (%s)", id, loc)
+				default:
+					return fmt.Sprintf("finding for rule %q (%s)", id, loc)
 				}
-				return fmt.Sprintf("check record for rule %q (%s)", id, loc)
 			}
-			if head.key == "rules" {
+			switch head.key {
+			case "rules":
 				return "rule entry " + loc
+			case "checks":
+				return "check record " + loc
+			default:
+				return "finding entry " + loc
 			}
-			return "check record " + loc
 		}
 	}
 	return "object at " + renderDupPath(path)
 }
 
-// arrayEntryID extracts the identifying field of one rules/checks array
-// element. The unmarshal is last-key-wins for repeated members, which is
-// fine here: identification only needs some id carried by the offending
+// arrayEntryID extracts the identifying field of one rules/checks/findings
+// array element. Rules carry their own id; check and finding records name the
+// rule via ruleId. The unmarshal is last-key-wins for repeated members, which
+// is fine here: identification only needs some id carried by the offending
 // entry, and the index already makes it unambiguous.
 func arrayEntryID(data []byte, field string, index int) string {
 	var root map[string]any
