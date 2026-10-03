@@ -107,18 +107,127 @@ type wireInput struct {
 	Checks     []wireCheck                `json:"checks"`
 }
 
+// Fixed submission field spellings. A submission is decoded through these
+// exact names only, mirroring strictReportJSON on the read side:
+// encoding/json otherwise falls back to case-insensitive field matching, so
+// an extension member such as "StAtus" would silently decode into the status
+// field and could override — or launder — the conclusion carried by the
+// formal "status" member, depending on where the extension member appears.
+// Case variants, whitespace-padded names and unknown members are extension
+// data and never reach the decoder. The invariants object is not rewritten:
+// invariant names are user-defined rather than fixed fields, so "Inv" and
+// "inv" stay two independent invariants and a padded name is not trimmed.
+var (
+	submissionTopKeys   = []string{"artifact", "rules", "invariants", "checks"}
+	artifactWireKeys    = []string{"name", "abi", "bytecode", "source"}
+	submissionRuleKeys  = []string{"id", "kind", "severity", "invariant", "requiresABI", "version"}
+	submissionCheckKeys = []string{"artifactHash", "ruleId", "version", "status", "note"}
+)
+
+// strictSubmissionJSON rewrites submission bytes to the fixed fields under
+// their agreed spelling, at the top level and inside the artifact, every rule
+// and every check record. Member order and extension members no longer
+// influence the decoded values: a case variant or whitespace-padded name can
+// neither override a formal value nor substitute for a missing or invalid
+// one. Names are compared after JSON string decoding, so a fixed name written
+// with escapes still denotes that field. The invariants object passes through
+// untouched because its member names are user-defined.
+func strictSubmissionJSON(data []byte) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(submissionTopKeys))
+	for _, k := range submissionTopKeys {
+		if v, ok := obj[k]; ok {
+			out[k] = v
+		}
+	}
+	if raw, ok := out["artifact"]; ok && string(raw) != "null" {
+		f, err := fixedFieldsOnly(raw, artifactWireKeys)
+		if err != nil {
+			return nil, err
+		}
+		out["artifact"] = f
+	}
+	if raw, ok := out["rules"]; ok && string(raw) != "null" {
+		f, err := fixedFieldsInArray(raw, submissionRuleKeys)
+		if err != nil {
+			return nil, err
+		}
+		out["rules"] = f
+	}
+	if raw, ok := out["checks"]; ok && string(raw) != "null" {
+		f, err := fixedFieldsInArray(raw, submissionCheckKeys)
+		if err != nil {
+			return nil, err
+		}
+		out["checks"] = f
+	}
+	return json.Marshal(out)
+}
+
+// validateFormalCheckStatuses checks the formal "status" member of every
+// strict check record. The strict rewrite dropped extension members, so the
+// status seen here is the agreed-spelling one alone: a missing formal status,
+// a non-string one, or an unsupported value rejects the whole submission
+// even when an adjacent "StAtus" extension member carried a legal-looking
+// value. The error names the rule the record is for so the offending entry is
+// identifiable.
+func validateFormalCheckStatuses(strict []byte) error {
+	var top struct {
+		Checks []map[string]json.RawMessage `json:"checks"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	for _, rec := range top.Checks {
+		where := "check record"
+		if raw, ok := rec["ruleId"]; ok {
+			var ruleID string
+			if err := json.Unmarshal(raw, &ruleID); err == nil && ruleID != "" {
+				where = "check for rule " + ruleID
+			}
+		}
+		raw, ok := rec["status"]
+		if !ok {
+			return errInvalid(where + ": status is required")
+		}
+		var status string
+		if err := json.Unmarshal(raw, &status); err != nil {
+			return errInvalid(where + ": status must be a string")
+		}
+		if !validCheckStatus(status) {
+			return errInvalid(where + ": unknown status " + status)
+		}
+	}
+	return nil
+}
+
 // ParseAuditInput decodes an audit submission JSON object into domain values.
 // Invariant values must be JSON booleans; any other type is an error. Any JSON
 // object in the submission that repeats a member name rejects the whole
 // submission: the decoder keeps only the last value silently, so a repeated
 // invariant key would choose a conclusion by member order instead of giving
-// one trustworthy result.
+// one trustworthy result. Only the fixed fields under their agreed spelling
+// participate: case variants and whitespace-padded names are extension data
+// and are ignored, so they can neither override a formal value nor supply one
+// when the formal member is missing or unsupported. Invariant names are not
+// fixed fields — they are user-defined, compared case sensitively and never
+// trimmed.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(duplicateMemberMessage(data, dup))
 	}
+	strict, err := strictSubmissionJSON(data)
+	if err != nil {
+		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
+	}
+	if err := validateFormalCheckStatuses(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
 	var in wireInput
-	if err := json.Unmarshal(data, &in); err != nil {
+	if err := json.Unmarshal(strict, &in); err != nil {
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	invariants := make(map[string]bool, len(in.Invariants))
