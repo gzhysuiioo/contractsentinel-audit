@@ -472,8 +472,18 @@ func validSubmittedReport(r Report) error {
 	return validateReport(r, func(msg string) error { return errInvalid(msg) })
 }
 
-// loadStoredReport parses archive bytes for id and fully validates them.
+// loadStoredReport parses archive bytes for id and fully validates them. An
+// archive that repeats a member name inside any JSON object is corrupt: the
+// decoder keeps only the last value, so a conflicting earlier conclusion
+// (for example a 发现缺陷 status followed by a 通过 status) would be silently
+// dropped while the recomputed id and the finding attribution still match
+// the surviving content. Such an archive has no single trustworthy reading
+// and is rejected before decoding, exactly like a duplicate-member audit
+// submission.
 func loadStoredReport(data []byte, id string) (Report, error) {
+	if dup := findDuplicateJSONMember(data); dup != nil {
+		return Report{}, errCorrupt("report " + id + ": " + duplicateMemberMessage(data, dup))
+	}
 	var r Report
 	if err := json.Unmarshal(data, &r); err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
