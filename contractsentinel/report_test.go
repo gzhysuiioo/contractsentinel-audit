@@ -349,6 +349,99 @@ func TestParseAuditInputInvariantsNotObject(t *testing.T) {
 	}
 }
 
+// --- 重复 JSON 成员 ---
+
+// 同一个 invariants 对象中同名成员出现两次，没有唯一可信的结论：无论两个值
+// 相悖、相同，还是 null 在前布尔在后，都必须整体拒绝，而不是保留后写的值。
+func TestParseAuditInputDuplicateInvariantMemberRejected(t *testing.T) {
+	cases := map[string]string{
+		"false then true":  `{"inv":false,"inv":true}`,
+		"true then false":  `{"inv":true,"inv":false}`,
+		"same value twice": `{"inv":true,"inv":true}`,
+		"null then bool":   `{"inv":null,"inv":true}`,
+		"bool then null":   `{"inv":true,"inv":null}`,
+		"unicode escape":   `{"inv":true,"inv":false}`,
+	}
+	for name, invariants := range cases {
+		input := `{"artifact":{"name":"A"},"rules":[],"invariants":` + invariants + `}`
+		artifact, rules, gotInvariants, checks, err := ParseAuditInput([]byte(input))
+		if err == nil {
+			t.Errorf("%s: duplicate invariant member must be rejected", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"inv"`) {
+			t.Errorf("%s: error must state the duplication and name the member: %v", name, err)
+		}
+		if !strings.Contains(err.Error(), "invariants") {
+			t.Errorf("%s: error must locate the invariants object: %v", name, err)
+		}
+		if artifact != (Artifact{}) || rules != nil || gotInvariants != nil || checks != nil {
+			t.Errorf("%s: failure must return no partial data: %+v %+v %+v %+v", name, artifact, rules, gotInvariants, checks)
+		}
+	}
+}
+
+// 重复成员规则适用于提交中的每一个对象：顶层、产物、单条规则、单条检查
+// 记录，以及未知字段里嵌套的对象。错误必须指出重复名与所在对象。
+func TestParseAuditInputDuplicateMemberLocations(t *testing.T) {
+	cases := map[string]struct {
+		input string
+		where string
+		name  string
+	}{
+		"top-level":            {`{"artifact":{"name":"A"},"rules":[],"artifact":{"name":"B"}}`, "top-level", `"artifact"`},
+		"artifact":             {`{"artifact":{"name":"A","name":"B"},"rules":[]}`, "artifact", `"name"`},
+		"rule":                 {`{"artifact":{"name":"A"},"rules":[{"id":"r1","version":"1","id":"r2"}]}`, "rules[0]", `"id"`},
+		"check":                {`{"artifact":{"name":"A"},"rules":[],"checks":[{"ruleId":"r1","ruleId":"r2"}]}`, "checks[0]", `"ruleId"`},
+		"nested unknown field": {`{"artifact":{"name":"A"},"rules":[],"meta":{"x":1,"x":2}}`, "meta", `"x"`},
+	}
+	for name, tc := range cases {
+		_, _, _, _, err := ParseAuditInput([]byte(tc.input))
+		if err == nil {
+			t.Errorf("%s: duplicate member must be rejected", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), tc.name) {
+			t.Errorf("%s: error must state the duplication and name the member: %v", name, err)
+		}
+		if !strings.Contains(err.Error(), tc.where) {
+			t.Errorf("%s: error must locate the object (%s): %v", name, tc.where, err)
+		}
+	}
+}
+
+// 名称按解码后的内容比较、区分大小写、不修剪空白：解码后不同的名字不是
+// 重复；不同对象使用相同成员名是正常输入。
+func TestParseAuditInputDistinctNamesAccepted(t *testing.T) {
+	input := `{
+		"artifact": {"name":"A"},
+		"rules": [{"id":"r1","version":"1"},{"id":"r2","version":"1"}],
+		"invariants": {"inv":true,"Inv":false,"inv ":true}
+	}`
+	_, rules, invariants, _, err := ParseAuditInput([]byte(input))
+	if err != nil {
+		t.Fatalf("distinct decoded names and per-object names must be accepted: %v", err)
+	}
+	if len(invariants) != 3 {
+		t.Fatalf("case/whitespace-distinct names must all be kept, got %+v", invariants)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("each rule having its own id member is normal input, got %+v", rules)
+	}
+}
+
+// 说明或源码字符串里看起来像 JSON 的文字是普通内容，不参与成员重复检查。
+func TestParseAuditInputJSONLikeStringsAreContent(t *testing.T) {
+	input := `{
+		"artifact": {"name":"A","source":"{\"inv\":false,\"inv\":true}"},
+		"rules": [],
+		"invariants": {"inv":true}
+	}`
+	if _, _, _, _, err := ParseAuditInput([]byte(input)); err != nil {
+		t.Fatalf("JSON-looking text inside a string is plain content: %v", err)
+	}
+}
+
 // --- ReportID binding ---
 
 func TestReportIDDeterministicAndStable(t *testing.T) {

@@ -2,6 +2,7 @@
 package contractsentinel
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -108,8 +110,14 @@ type wireInput struct {
 }
 
 // ParseAuditInput decodes an audit submission JSON object into domain values.
-// Invariant values must be JSON booleans; any other type is an error.
+// Invariant values must be JSON booleans; any other type is an error. Any
+// JSON object in the submission that lists the same member name twice rejects
+// the whole input: a duplicated name has no single trustworthy value, so no
+// conclusion may be drawn from it.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
+	if err := rejectDuplicateMembers(data); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
 	var in wireInput
 	if err := json.Unmarshal(data, &in); err != nil {
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
@@ -157,6 +165,95 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		})
 	}
 	return artifact, rules, invariants, checks, nil
+}
+
+// rejectDuplicateMembers scans the raw submission and refuses the whole input
+// if any single JSON object lists the same member name twice. The check
+// covers every object in the document: the top-level object, the artifact,
+// each rule, each check record, and objects nested inside unknown fields.
+// Names are compared after JSON string decoding, so a name and its Unicode
+// escape spelling collide; comparison is case-sensitive and nothing is
+// trimmed. The same name in different objects is normal input, and string
+// values that merely look like JSON are content, not structure. Malformed
+// JSON is left for the real decode to report as invalid JSON.
+func rejectDuplicateMembers(data []byte) error {
+	type frame struct {
+		path     string          // location of this container, "" for the top-level value
+		keys     map[string]bool // member names seen so far (objects only)
+		isObject bool
+		wantKey  bool   // object: the next string token is a member name
+		lastKey  string // object: member name whose value is being read
+		count    int    // array: elements seen so far
+	}
+	var stack []*frame
+	// closeValue records that one value inside the current container finished.
+	closeValue := func() {
+		if len(stack) == 0 {
+			return
+		}
+		top := stack[len(stack)-1]
+		if top.isObject {
+			top.wantKey = true
+		} else {
+			top.count++
+		}
+	}
+	// childPath locates a container about to be opened inside the current one.
+	childPath := func() string {
+		if len(stack) == 0 {
+			return ""
+		}
+		top := stack[len(stack)-1]
+		if top.isObject {
+			if top.path == "" {
+				return top.lastKey
+			}
+			return top.path + "." + top.lastKey
+		}
+		return top.path + "[" + strconv.Itoa(top.count) + "]"
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// End of input, or a syntax error the real decode will report.
+			return nil
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				path := childPath()
+				closeValue()
+				stack = append(stack, &frame{path: path, keys: make(map[string]bool), isObject: true, wantKey: true})
+			case '[':
+				path := childPath()
+				closeValue()
+				stack = append(stack, &frame{path: path})
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+				closeValue()
+			}
+		case string:
+			if len(stack) > 0 && stack[len(stack)-1].isObject && stack[len(stack)-1].wantKey {
+				top := stack[len(stack)-1]
+				if top.keys[t] {
+					where := "object " + top.path
+					if top.path == "" {
+						where = "the top-level object"
+					}
+					return errInvalid("duplicate member " + strconv.Quote(t) + " in " + where)
+				}
+				top.keys[t] = true
+				top.wantKey = false
+				top.lastKey = t
+			} else {
+				closeValue()
+			}
+		default:
+			closeValue()
+		}
+	}
 }
 
 // ArtifactHash computes the content hash of an artifact. Only the raw ABI,

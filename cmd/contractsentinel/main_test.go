@@ -160,6 +160,98 @@ func TestCLIAuditExplicitFalseStillReportsDefect(t *testing.T) {
 	}
 }
 
+// 同一对象中重复写出同名成员（先 false 后 true）没有唯一可信结论：非零退出、
+// 原因进 stderr 并指出重复名与所在对象、stdout 不出现任何报告片段。
+func TestCLIAuditDuplicateMemberFailsCleanly(t *testing.T) {
+	bin := auditBinary(t)
+	work := t.TempDir()
+	input := writeInput(t, work, "in.json", `{
+		"artifact": {"name":"Vault","abi":"abi","bytecode":"0x1","source":"Vault.sol"},
+		"rules": [{"id":"invariant-preserved","kind":"symbolic","severity":"critical","invariant":"balance-monotonic","version":"0.9.0"}],
+		"invariants": {"balance-monotonic": false, "balance-monotonic": true}
+	}`)
+	store := filepath.Join(work, "nested", "reports")
+
+	cmd := exec.Command(bin, "audit", "--input", input, "--store", store)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	if err == nil {
+		t.Fatal("audit must exit non-zero for a duplicate member")
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 0 {
+		t.Fatalf("exit code = 0, want non-zero")
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout must not contain a full or partial report:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "duplicate") {
+		t.Fatalf("stderr must state the member is duplicated:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "balance-monotonic") {
+		t.Fatalf("stderr must name the duplicated member:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "invariants") {
+		t.Fatalf("stderr must locate the object holding the duplicate:\n%s", stderr.String())
+	}
+	if _, err := os.Stat(store); !os.IsNotExist(err) {
+		t.Fatalf("rejected submission must not create the report store: %v", err)
+	}
+}
+
+// 目录中已有报告时，一次含重复成员的提交必须保持原有内容原样不变，重复
+// 输入中的其他合法结果也不能单独落盘。
+func TestCLIAuditDuplicateMemberKeepsExistingReports(t *testing.T) {
+	bin := auditBinary(t)
+	work := t.TempDir()
+	validInput := writeInput(t, work, "valid.json", validInvariantInput)
+	store := filepath.Join(work, "reports")
+
+	setup := exec.Command(bin, "audit", "--input", validInput, "--store", store)
+	if out, err := setup.CombinedOutput(); err != nil {
+		t.Fatalf("valid audit setup failed: %v\n%s", err, out)
+	}
+	before, err := listFiles(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("setup expected 1 report, got %d: %v", len(before), before)
+	}
+	existingPath := filepath.Join(store, before[0])
+	existingBytes, err := os.ReadFile(existingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 重复成员夹带在一份其他方面合法的提交中：整份拒绝，什么都不新增。
+	badInput := writeInput(t, work, "bad.json", `{
+		"artifact": {"name":"Vault","abi":"abi","bytecode":"0x1","source":"Vault.sol"},
+		"rules": [{"id":"invariant-preserved","kind":"symbolic","severity":"critical","invariant":"balance-monotonic","version":"0.9.0"}],
+		"invariants": {"balance-monotonic": false, "balance-monotonic": true}
+	}`)
+	fail := exec.Command(bin, "audit", "--input", badInput, "--store", store)
+	if out, err := fail.CombinedOutput(); err == nil {
+		t.Fatalf("duplicate-member audit must fail, output:\n%s", out)
+	}
+	after, err := listFiles(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) || after[0] != before[0] {
+		t.Fatalf("failure changed the store contents:\nbefore=%v\nafter=%v", before, after)
+	}
+	kept, err := os.ReadFile(existingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kept, existingBytes) {
+		t.Fatal("failure modified the existing report")
+	}
+}
+
 func listFiles(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
