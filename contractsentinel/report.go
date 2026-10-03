@@ -491,8 +491,13 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Report{}, duplicateArchiveError(id, data, dup)
 	}
-	var r Report
-	if err := json.Unmarshal(data, &r); err != nil {
+	// Decode with exact-case member recognition instead of json.Unmarshal:
+	// only the fixed spellings (reportId, status, ...) carry report content.
+	// A case variant such as "StAtus" is an unknown extension and must never
+	// populate the fixed field, so the trusted conclusion cannot move with
+	// the position of an extension.
+	r, err := decodeStoredReport(data)
+	if err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
 	}
 	if r.ReportID != id {
