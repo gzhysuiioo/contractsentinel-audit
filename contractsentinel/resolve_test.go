@@ -226,6 +226,139 @@ func TestResolveJunctionSlashCollapse(t *testing.T) {
 	}
 }
 
+// TestResolveEncodedBasePathJunction guards byte-for-byte joining when the
+// upstream base path itself contains percent-encoded bytes. The base path
+// and the remainder both bring runs of literal slashes to the junction; only
+// that one meeting run collapses to a single slash. Encoded slashes in either
+// letter case are path data on both sides, internal double slashes and
+// trailing slashes survive, dot segments are not removed, and the userinfo
+// encoding, IPv6 brackets and port pass through untouched. None of these
+// routes defines queryTransforms, so the raw query (duplicate names, empty
+// values, valueless parameters, a bare empty "?") follows the existing
+// preserve-verbatim behavior.
+func TestResolveEncodedBasePathJunction(t *testing.T) {
+	const encodedUpstream = "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f///"
+	const rootUpstream = "https://user:p%40ss@[2001:db8::1]:8443/r%2f//"
+	cfg := mustConfig(t, `{
+	  "routes": [
+	    {"id": "api",  "methods": ["GET"], "pathPrefix": "/api",  "upstream": "`+encodedUpstream+`"},
+	    {"id": "root", "methods": ["*"],  "pathPrefix": "/",     "upstream": "`+rootUpstream+`"},
+	    {"id": "dots", "methods": ["GET"], "pathPrefix": "/dots", "upstream": "http://dots.internal/a/./b/../c//"}
+	  ]
+	}`)
+
+	cases := []struct {
+		name     string
+		request  string
+		routeID  string
+		upstream string
+	}{
+		{
+			name:     "encoded slashes on both sides and internal slashes survive the junction",
+			request:  `{"method":"GET","target":"/api//%2F/x//y/?a=1&a=&flag"}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/%2F/x//y/?a=1&a=&flag",
+		},
+		{
+			name:     "request equal to the non-root prefix keeps the encoded base ending in one slash",
+			request:  `{"method":"GET","target":"/api"}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/",
+		},
+		{
+			name:     "exact non-root prefix with an empty question mark keeps that question mark",
+			request:  `{"method":"GET","target":"/api?"}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/?",
+		},
+		{
+			name:     "root prefix receiving the root path keeps its encoded base ending in one slash",
+			request:  `{"method":"GET","target":"/"}`,
+			routeID:  "root",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/r%2f/",
+		},
+		{
+			name:     "root path with an empty question mark keeps that question mark",
+			request:  `{"method":"GET","target":"/?"}`,
+			routeID:  "root",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/r%2f/?",
+		},
+		{
+			name:     "no query string produces no question mark, remainder trailing slashes stay",
+			request:  `{"method":"GET","target":"/api//x//"}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/x//",
+		},
+		{
+			name:     "a bare empty question mark is preserved, unlike having no query at all",
+			request:  `{"method":"GET","target":"/api//x//?"}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/x//?",
+		},
+		{
+			name:     "duplicate names empty values and valueless parameters stay byte for byte",
+			request:  `{"method":"GET","target":"/api//p?a=1&a=&flag&b=2&b="}`,
+			routeID:  "api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/p?a=1&a=&flag&b=2&b=",
+		},
+		{
+			name:     "root route keeps remainder internal slashes and the raw query verbatim",
+			request:  `{"method":"GET","target":"//a//b/?z=1&z=&w"}`,
+			routeID:  "root",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/r%2f/a//b/?z=1&z=&w",
+		},
+		{
+			name:     "dot segments in the encoded-style base path are never resolved",
+			request:  `{"method":"GET","target":"/dots/x"}`,
+			routeID:  "dots",
+			upstream: "http://dots.internal/a/./b/../c/x",
+		},
+		{
+			name:     "dot-segment base with an exact prefix still ends in the single junction slash",
+			request:  `{"method":"GET","target":"/dots"}`,
+			routeID:  "dots",
+			upstream: "http://dots.internal/a/./b/../c/",
+		},
+		{
+			name:     "dot-segment base preserves the remainder's double and trailing slashes",
+			request:  `{"method":"GET","target":"/dots//x/y//?keep"}`,
+			routeID:  "dots",
+			upstream: "http://dots.internal/a/./b/../c/x/y//?keep",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := resolveJSON(t, cfg, tc.request)
+			if res.RouteID != tc.routeID {
+				t.Errorf("routeId = %q, want %q", res.RouteID, tc.routeID)
+			}
+			if res.UpstreamURL != tc.upstream {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.upstream)
+			}
+		})
+	}
+
+	// An illegal percent escape in any upstream's path rejects the whole
+	// configuration up front — including a route the request would never hit —
+	// and the reason locates the offending route position and id.
+	badCfg := `{"routes":[
+	  {"id":"hit",  "methods":["GET"],"pathPrefix":"/hit",  "upstream":"http://hit.internal/"},
+	  {"id":"dead", "methods":["GET"],"pathPrefix":"/dead", "upstream":"http://dead.internal/base%zz"}
+	]}`
+	_, f := ParseConfig([]byte(badCfg))
+	if f == nil {
+		t.Fatal("expected invalid_config for an illegal percent escape in an upstream path")
+	}
+	if f.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config", f.Code)
+	}
+	for _, want := range []string{"route 2", `"dead"`, "invalid URL escape"} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+}
+
 func TestResolveSegmentBoundary(t *testing.T) {
 	cfg := mustConfig(t, sampleConfig)
 
