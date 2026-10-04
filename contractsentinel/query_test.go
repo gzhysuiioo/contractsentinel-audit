@@ -152,6 +152,173 @@ func TestQueryTransformSet(t *testing.T) {
 	}
 }
 
+func TestQueryTransformSetSpecialCharNames(t *testing.T) {
+	// A rule's name and value are literal text: '&', '=', '%' and '+' inside
+	// them are data, never query structure. On the request side only a raw
+	// '&' separates fragments and only the first raw '=' of a fragment splits
+	// name from value, so an encoded "&" or "=" stays inside one name.
+	cases := []struct {
+		name      string
+		rules     string
+		target    string
+		wantQuery string // expected suffix after http://h.internal/base/p
+	}{
+		{
+			// Both sources decode to the same name (lowercase and uppercase
+			// hex alike) and merge at the first hit's position; the encoded
+			// '&' and '=' in the replacement cannot split out extra
+			// parameters, and untouched fragments, the empty fragment and the
+			// order all keep their original bytes.
+			name:      "name and value with ampersand and equals merge at first hit",
+			rules:     `[{"op":"set","name":"a&b=c","value":"x&y=z"}]`,
+			target:    "/p?keep=%2f+&a%26b%3dc=1&&a%26b%3Dc=2&tail=",
+			wantQuery: "?keep=%2f+&a%26b%3Dc=x%26y%3Dz&&tail=",
+		},
+		{
+			name:      "valueless parameter with encoded name gains an equals sign",
+			rules:     `[{"op":"set","name":"a&b=c","value":"v"}]`,
+			target:    "/p?a%26b%3Dc",
+			wantQuery: "?a%26b%3Dc=v",
+		},
+		{
+			// The fragment "a=b=1" has name "a" and value "b=1": the rule
+			// name "a=b" must not match it, so it is appended instead.
+			name:      "first raw equals splits, so a=b=1 is not named a=b",
+			rules:     `[{"op":"set","name":"a=b","value":"v"}]`,
+			target:    "/p?a=b=1",
+			wantQuery: "?a=b=1&a%3Db=v",
+		},
+		{
+			name:      "encoded equals in the request name matches a literal equals",
+			rules:     `[{"op":"set","name":"a=b","value":"v"}]`,
+			target:    "/p?a%3Db=1",
+			wantQuery: "?a%3Db=v",
+		},
+		{
+			// The literal name "%26" decodes one level further than "&": it
+			// matches only "%2526", never the "%26" that decodes to "&".
+			name:      "literal percent escape name matches only its double-encoded form",
+			rules:     `[{"op":"set","name":"%26","value":"v"}]`,
+			target:    "/p?%26=1&%2526=2",
+			wantQuery: "?%26=1&%2526=v",
+		},
+		{
+			// The literal name "a+b" contains a real plus: it matches only
+			// "a%2Bb". A raw '+' and "%20" both decode to a space, and a
+			// decoded '+' never turns back into a space.
+			name:      "literal plus name matches encoded plus only, not space forms",
+			rules:     `[{"op":"set","name":"a+b","value":"v"}]`,
+			target:    "/p?a+b=1&a%2Bb=2&a%20b=3",
+			wantQuery: "?a+b=1&a%2Bb=v&a%20b=3",
+		},
+		{
+			name:      "space name does not match an encoded plus",
+			rules:     `[{"op":"set","name":"a b","value":"v"}]`,
+			target:    "/p?a%2Bb=1",
+			wantQuery: "?a%2Bb=1&a%20b=v",
+		},
+		{
+			name:      "literal percent in the name is encoded and matched as %25",
+			rules:     `[{"op":"set","name":"100%","value":"v"}]`,
+			target:    "/p?100%25=1",
+			wantQuery: "?100%25=v",
+		},
+		{
+			name:      "absent special name is appended after a trailing empty fragment",
+			rules:     `[{"op":"set","name":"x&y","value":"v"}]`,
+			target:    "/p?a=1&",
+			wantQuery: "?a=1&&x%26y=v",
+		},
+		{
+			name:      "absent special name creates the query string",
+			rules:     `[{"op":"set","name":"x&y","value":"="}]`,
+			target:    "/p",
+			wantQuery: "?x%26y=%3D",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformResult(t, tc.rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestQueryTransformSetSpecialNamesDoNotAffectRouting(t *testing.T) {
+	// Special characters in parameter names are query content only: route
+	// selection and path joining are decided before transforms run and must
+	// be unaffected by them.
+	cfg := mustConfig(t, `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1",
+	   "queryTransforms":[{"op":"set","name":"a&b=c","value":"x&y=z"}]},
+	  {"id":"root","methods":["*"],"pathPrefix":"/","upstream":"http://root.internal"}
+	]}`)
+
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/x/y?keep=%2f+&a%26b%3dc=1"}`)
+	if res.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", res.RouteID)
+	}
+	if want := "http://api.internal/v1/x/y?keep=%2f+&a%26b%3Dc=x%26y%3Dz"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	// The same query on a path that only the transform-free root route
+	// matches is preserved byte for byte.
+	res = resolveJSON(t, cfg, `{"method":"GET","target":"/other?a%26b%3dc=1&keep=%2f+"}`)
+	if res.RouteID != "root" {
+		t.Errorf("routeId = %q, want root", res.RouteID)
+	}
+	if want := "http://root.internal/other?a%26b%3dc=1&keep=%2f+"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+}
+
+func TestQueryTransformSetInvalidEscapeNoPartialSuccess(t *testing.T) {
+	// A malformed percent escape anywhere in the target fails the whole
+	// request as invalid_request, even when another parameter would have
+	// been replaced by the set rule: no partially rewritten query may come
+	// back as a success.
+	cfg := transformConfig(t, `[{"op":"set","name":"a&b=c","value":"x&y=z"}]`)
+	targets := []string{
+		"/p?a%26b%3dc=1&bad%zz=2", // bad escape after a replaceable parameter
+		"/p?bad%zz=2&a%26b%3dc=1", // bad escape before a replaceable parameter
+		"/p?a%26b%zz=1",           // bad escape inside the target name itself
+		"/p?a%26b%3dc=1%2",        // truncated escape in the replaceable value
+	}
+	for _, target := range targets {
+		// The front door: ParseRequest rejects the target outright.
+		_, rf := ParseRequest([]byte(`{"method":"GET","target":"` + target + `"}`))
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("ParseRequest(%q): got %+v, want invalid_request", target, rf)
+		}
+		// A caller that bypasses ParseRequest still gets invalid_request from
+		// Resolve whenever the malformed escape sits in a decoded name, and
+		// never a partial Resolution.
+		res, rf := Resolve(cfg, &Request{Method: "GET", Target: target})
+		if rf != nil && rf.Code != "invalid_request" {
+			t.Fatalf("Resolve(%q): got code %q, want invalid_request", target, rf.Code)
+		}
+		if res != nil && rf != nil {
+			t.Fatalf("Resolve(%q): got both %+v and %+v, want at most one", target, res, rf)
+		}
+	}
+
+	// A bad escape in a name that the set rule would have replaced is always
+	// caught, even via Resolve directly.
+	for _, target := range []string{"/p?a%26b%zz=1", "/p?bad%zz=2&a%26b%3dc=1"} {
+		res, rf := Resolve(cfg, &Request{Method: "GET", Target: target})
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("Resolve(%q): got %+v, want invalid_request", target, rf)
+		}
+		if res != nil {
+			t.Fatalf("Resolve(%q): got partial success %+v, want no resolution", target, res)
+		}
+	}
+}
+
 func TestQueryTransformRemove(t *testing.T) {
 	cases := []struct {
 		name      string

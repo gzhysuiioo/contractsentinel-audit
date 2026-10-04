@@ -433,6 +433,68 @@ func TestResolveCLIRenameThenSetMergesInConfigOrder(t *testing.T) {
 	}
 }
 
+// TestResolveCLISetSpecialCharNames drives the set transform with names and
+// values that contain '&', '=', '%' and '+' the way a user does: the rule
+// comes from the config file, the request from stdin, and the merged query is
+// observed inside upstreamURL. The rule's name and value are literal text;
+// on the wire only raw '&' separates fragments and the first raw '=' splits
+// a fragment, so the encoded "&" and "=" never create extra parameters. Both
+// sources of the same decoded name merge at the first hit's position while
+// untouched fragments, the empty fragment and their order keep their bytes.
+func TestResolveCLISetSpecialCharNames(t *testing.T) {
+	config := `{
+	  "routes": [
+	    {"id": "orders", "methods": ["GET"], "pathPrefix": "/api/orders",
+	     "upstream": "http://orders.internal",
+	     "queryTransforms": [{"op": "set", "name": "a&b=c", "value": "x&y=z"}]}
+	  ]
+	}`
+	request := `{"method":"GET","target":"/api/orders/7?keep=%2f+&a%26b%3dc=1&&a%26b%3Dc=2&tail="}`
+
+	success := assertResolveSuccess(t, runResolveCLI(t, config, request))
+	if success.RouteID != "orders" {
+		t.Errorf("routeId = %q, want orders", success.RouteID)
+	}
+	wantURL := "http://orders.internal/7?keep=%2f+&a%26b%3Dc=x%26y%3Dz&&tail="
+	if success.UpstreamURL != wantURL {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, wantURL)
+	}
+}
+
+// TestResolveCLISetInvalidEscapeNoPartialSuccess pairs a working set rule
+// with a request whose query holds a malformed percent escape next to a
+// replaceable parameter: the whole request is invalid_request, stdout stays
+// completely empty and no partially rewritten upstreamURL is emitted.
+func TestResolveCLISetInvalidEscapeNoPartialSuccess(t *testing.T) {
+	config := `{
+	  "routes": [
+	    {"id": "orders", "methods": ["GET"], "pathPrefix": "/api/orders",
+	     "upstream": "http://orders.internal",
+	     "queryTransforms": [{"op": "set", "name": "a&b=c", "value": "x&y=z"}]}
+	  ]
+	}`
+	res := runResolveCLI(t, config,
+		`{"method":"GET","target":"/api/orders/7?a%26b%3dc=1&bad%zz=2"}`)
+
+	if res.exitCode == 0 {
+		t.Fatalf("exit code = 0, want non-zero")
+	}
+	if len(res.stdout) != 0 {
+		t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+	}
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_request" {
+		t.Errorf("code = %q, want invalid_request", fail.Code)
+	}
+	if !strings.Contains(fail.Reason, "percent escape") {
+		t.Errorf("reason = %q, want a percent-escape reason", fail.Reason)
+	}
+}
+
 // TestResolveCLIRenameInvalidToRejectsConfig exercises the rename boundary at
 // the command boundary: a missing, empty or non-string "to" invalidates the
 // whole configuration even though the offending route can never match the
