@@ -231,6 +231,231 @@ go run ./cmd/contractsentinel report \
 
 此外，记录引用了 `rules` 中不存在的规则、同一规则出现多条 checks 记录、`status` 写成 `未检查` 等未知值（`unknown status …`）、或三种需要说明的状态给了空白说明（`note is required for status …`），同样整份拒绝。
 
+## 比较同一目录中的两份报告（diff）
+
+`diff` 命令比较**同一报告目录中已保存的两份报告**，回答“相对某个基准，逐规则发生了什么变化”。它不重新检查合约，只读回两份归档里的既有结论。
+
+### 为什么“新报告缺陷变少”不一定表示缺陷已消除
+
+报告的缺陷总数只统计 **`发现缺陷`** 记录；`超时`、`工具缺失`、`未检查` 都不是缺陷，也**不是通过**。因此基准侧的一条 `发现缺陷` 在新侧变成 `超时` 后，新报告的缺陷计数会从 1 变成 0 —— 但这只说明“这次检查没有跑到结论”，旧反例并没有被证伪，缺陷没有被修复。比较输出因此同时给出两套数字：
+
+- **缺陷总数** `beforeDefects` / `afterDefects`：两侧各自的真实缺陷条数，只描述“每份报告里有几个 finding”；
+- **变化分类计数**（`newDefects`、`resolvedDefects`、`statusChanges` 等）：描述每条规则相对基准属于哪一种变化。
+
+只有在**规则定义完全一致**（`id`、`version`、`kind`、`severity`、`invariant`、`requiresABI` 全部相同）时：
+
+- **`通过` → `发现缺陷`** 才计为 **`新发现缺陷`**；
+- **`发现缺陷` → `通过`** 才计为 **`已消除缺陷`**。
+
+其他状态迁移一律是 **`检查状态变化`**（例如 `发现缺陷`↔`超时`、`工具缺失`→`通过`、`未检查`→`通过`），不能据此推断“新出现缺陷”或“缺陷已修复”。状态相同但说明不同是 **`检查说明变化`**；状态和说明都相同是 **`无变化`**。一侧缺少该规则是 **`新增规则`** / **`移除规则`**；规则还在但版本或其他定义字段不同是 **`规则变化`** —— 定义变了，两侧状态不可直接比较，更不能据状态差异推断修复。
+
+### 命令与参数
+
+```bash
+go run ./cmd/contractsentinel diff --store <报告目录> --before <基准报告标识> --after <新报告标识>
+# 或等价的离线二进制：
+./cs diff --store <报告目录> --before <基准报告标识> --after <新报告标识>
+```
+
+- `--store`：两份报告所在的**同一个**报告目录（即 `audit` 的 `--store`）。比较只读取该目录，不创建目录、不写入或修复任何归档。
+- `--before`：**基准侧**报告标识（旧结论）。
+- `--after`：**新侧**报告标识（新结论）。
+- 比较方向完全由两个参数的**位置**决定：交换 `--before` 与 `--after`，`新发现缺陷` 与 `已消除缺陷` 等方向性结论随之反转。
+- 两个标识都必须是 **audit 成功输出中的 `reportId`**（64 位小写十六进制字符串），**不是产物哈希** `artifactHash`：产物哈希标识被检查的内容，同一产物内容在所有报告里都相同；`reportId` 才标识整份报告。
+- `diff` 只读取已保存的结论与证据，**不会重新运行符号执行或模糊测试**，完全离线；同一对报告重复比较输出字节一致。
+
+每条规则的两侧结论和原始证据都在输出里：`results[]` 每项含 `ruleId`、`change`、`before`、`after`；每一侧的 `rule` 给出该侧完整规则定义、`status` 与原始 `note`，`finding` 在该侧为 `发现缺陷` 时携带绑定的产物哈希、规则版本与逐字 `evidence`，否则为 `null`。结果按 `ruleId` 排序，与报告内的排列顺序无关。
+
+### 完整离线示例：发现缺陷 → 超时，缺陷计数 1→0 但不算修复
+
+两份提交使用**完全相同的产物内容**（因此 `artifactHash` 相同，均为 `0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7`）和**同一条带版本的规则** `reentrancy-guard` `1.4.2`。结论由提交直接给出，不依赖任何外部工具或链上网络。
+
+基准提交保存为 `audit-before.json`：
+
+```json
+{
+  "artifact": {
+    "name": "Vault",
+    "abi": "[{\"name\":\"withdraw\",\"type\":\"function\",\"stateMutability\":\"payable\"}]",
+    "bytecode": "0x6080604052",
+    "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Vault {\n    mapping(address => uint256) private balances;\n\n    function withdraw(uint256 amount) public {\n        (bool sent, ) = msg.sender.call{value: amount}(\"\");\n        require(sent, \"transfer failed\");\n        balances[msg.sender] -= amount;\n    }\n}\n"
+  },
+  "rules": [
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.4.2"
+    }
+  ],
+  "invariants": {},
+  "checks": [
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "reentrancy-guard",
+      "version": "1.4.2",
+      "status": "发现缺陷",
+      "note": "反例：攻击者先存入 1 ether 后调用 withdraw；外部 call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，旧余额被第二次转出。"
+    }
+  ]
+}
+```
+
+新提交保存为 `audit-after.json`：`artifact` 与 `rules` 与基准**逐字段相同**，只有 checks 的结论不同（超时必须附非空白说明）：
+
+```json
+{
+  "artifact": {
+    "name": "Vault",
+    "abi": "[{\"name\":\"withdraw\",\"type\":\"function\",\"stateMutability\":\"payable\"}]",
+    "bytecode": "0x6080604052",
+    "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Vault {\n    mapping(address => uint256) private balances;\n\n    function withdraw(uint256 amount) public {\n        (bool sent, ) = msg.sender.call{value: amount}(\"\");\n        require(sent, \"transfer failed\");\n        balances[msg.sender] -= amount;\n    }\n}\n"
+  },
+  "rules": [
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.4.2"
+    }
+  ],
+  "invariants": {},
+  "checks": [
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "reentrancy-guard",
+      "version": "1.4.2",
+      "status": "超时",
+      "note": "符号执行在 120s 截止时间到达时仍未遍历完 call 之后的状态空间，no-reentrant-withdraw 既未被证明也未被证伪。"
+    }
+  ]
+}
+```
+
+依次提交到同一目录，并从各自成功输出的 `reportId` 取用报告标识（内容寻址、确定性，本机复跑得到相同标识）：
+
+```bash
+mkdir -p reports
+go run ./cmd/contractsentinel audit --input audit-before.json --store ./reports
+# 基准报告 reportId:
+#   6c4c0459676af4d364af25c9a123ee2329e5e83a797a84ba17aba88ae7f737a0
+go run ./cmd/contractsentinel audit --input audit-after.json --store ./reports
+# 新报告 reportId:
+#   ae60e17958f09f4eda41d891a3ec06d2d60f68158c5323d4d08229d11d3da577
+
+go run ./cmd/contractsentinel diff \
+  --store ./reports \
+  --before 6c4c0459676af4d364af25c9a123ee2329e5e83a797a84ba17aba88ae7f737a0 \
+  --after  ae60e17958f09f4eda41d891a3ec06d2d60f68158c5323d4d08229d11d3da577
+```
+
+关键比较输出（完整输出就是这一条规则的两侧内容，无时间戳字段）：
+
+```json
+{
+  "before": {
+    "reportId": "6c4c0459676af4d364af25c9a123ee2329e5e83a797a84ba17aba88ae7f737a0",
+    "artifact": {
+      "name": "Vault",
+      "hash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7"
+    }
+  },
+  "after": {
+    "reportId": "ae60e17958f09f4eda41d891a3ec06d2d60f68158c5323d4d08229d11d3da577",
+    "artifact": {
+      "name": "Vault",
+      "hash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7"
+    }
+  },
+  "artifactNameChanged": false,
+  "artifactHashChanged": false,
+  "results": [
+    {
+      "ruleId": "reentrancy-guard",
+      "change": "检查状态变化",
+      "before": {
+        "rule": {
+          "id": "reentrancy-guard",
+          "kind": "static",
+          "severity": "high",
+          "invariant": "no-reentrant-withdraw",
+          "requiresABI": false,
+          "version": "1.4.2",
+          "status": "发现缺陷",
+          "note": "反例：攻击者先存入 1 ether 后调用 withdraw；外部 call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，旧余额被第二次转出。"
+        },
+        "finding": {
+          "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+          "ruleId": "reentrancy-guard",
+          "version": "1.4.2",
+          "severity": "high",
+          "invariant": "no-reentrant-withdraw",
+          "evidence": "反例：攻击者先存入 1 ether 后调用 withdraw；外部 call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，旧余额被第二次转出。"
+        }
+      },
+      "after": {
+        "rule": {
+          "id": "reentrancy-guard",
+          "kind": "static",
+          "severity": "high",
+          "invariant": "no-reentrant-withdraw",
+          "requiresABI": false,
+          "version": "1.4.2",
+          "status": "超时",
+          "note": "符号执行在 120s 截止时间到达时仍未遍历完 call 之后的状态空间，no-reentrant-withdraw 既未被证明也未被证伪。"
+        },
+        "finding": null
+      }
+    }
+  ],
+  "summary": {
+    "newDefects": 0,
+    "resolvedDefects": 0,
+    "statusChanges": 1,
+    "noteChanges": 0,
+    "noChange": 0,
+    "addedRules": 0,
+    "removedRules": 0,
+    "changedRules": 0,
+    "beforeDefects": 1,
+    "afterDefects": 0
+  }
+}
+```
+
+解读：
+
+- 这条规则的分类是 **`检查状态变化`**，不是 `已消除缺陷`：迁移方向是 `发现缺陷` → `超时`，不是 `发现缺陷` → `通过`。
+- 基准侧（`before`）**保留原始缺陷证据**：`finding` 非空，`evidence` 就是提交时的反例原文，并绑定产物哈希与版本 `1.4.2`；新侧（`after`）只有超时说明，`finding` 为 `null`。两侧的原始结论都能直接在同一条结果里核对。
+- `summary.beforeDefects` 为 **1**、`summary.afterDefects` 为 **0**（缺陷总数一和零），但 `newDefects` 与 `resolvedDefects` **都为 0**，`statusChanges` 为 1。计数下降只是因为新侧检查跑到截止时间、没有得到正常结论——**超时不代表检查通过**，旧反例仍在基准侧，不能声称已修复。
+- 对照口径：若同版本规则新侧是 `通过`，这条才会计为 `已消除缺陷`（`resolvedDefects: 1`）；若基准是 `通过`、新侧是 `发现缺陷`，才计为 `新发现缺陷`。若两侧版本不同（或 kind/severity/invariant/requiresABI 任一不同），该规则显示为 `规则变化`（`changedRules` 计数），状态不参与新发现/已消除统计。
+
+### diff 失败条件（不产生部分结果，归档保持原样）
+
+下列情况命令都以**非零状态退出**，原因写入 **stderr**，**stdout 没有任何比较结果**（不会只输出已读到的第一份报告），报告目录与其中已有归档保持原样（不创建目录、不改写、不修复、不留临时文件）：
+
+1. **报告标识格式不合法**：标识不是 64 位小写十六进制字符串（大写也不行），例如 `xyz`：
+
+   ```text
+   diff failed: invalid report id xyz: want 64 lowercase hex characters
+   ```
+
+2. **任一报告不存在**（目录不存在同样如此，且目录不会被顺手创建）：
+
+   ```text
+   diff failed: report 0000…0000 not found
+   ```
+
+3. **任一归档损坏**（JSON 非法、内容与标识不符、字段不合法等；第二份报告损坏时同样不输出第一份的局部结果）：
+
+   ```text
+   diff failed: invalid JSON in report 6c4c…37a0: invalid character 'b' looking for beginning of object key string
+   ```
+
 ## 仅提交不变式布尔值（既有用法，保持不变）
 
 在 checks 导入能力之前就存在的用法仍然有效：提交只给 `invariants`（不变式名到布尔值的映射）而不给 `checks`。值为 `false` 的不变式使引用它的规则记为 `发现缺陷` 并生成 finding，证据为 `invariant <不变式名> does not hold`；值为 `true` 记为 `通过`；未出现的规则记为 `未检查`。
