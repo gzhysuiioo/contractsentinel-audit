@@ -733,6 +733,176 @@ func TestInvalidConfigFieldTypes(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigTopLevelShape(t *testing.T) {
+	// A syntactically legal JSON document that is not an object is a shape
+	// error, never a syntax failure: the reason says the config must be a
+	// JSON object and names the type actually received, and no route
+	// position is guessed.
+	for _, tc := range []struct {
+		src  string
+		kind string
+	}{
+		{`[]`, "an array"},
+		{`"routes"`, "a string"},
+		{`42`, "a number"},
+		{`true`, "a boolean"},
+		{`false`, "a boolean"},
+		{`null`, "null"},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for %q", tc.src)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"config must be a JSON object", tc.kind} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("legal JSON must not be called a syntax failure: %q", f.Reason)
+			}
+			if strings.Contains(f.Reason, "route") {
+				t.Fatalf("top-level shape error must not guess a route position: %q", f.Reason)
+			}
+		})
+	}
+}
+
+func TestInvalidConfigRoutesType(t *testing.T) {
+	// If routes is present it must be an array; null and every other JSON
+	// type are a routes type error, never "no routes" (which would let
+	// requests resolve as route_not_found).
+	for _, tc := range []struct {
+		src  string
+		kind string
+	}{
+		{`{"routes":null}`, "null"},
+		{`{"routes":{}}`, "an object"},
+		{`{"routes":"x"}`, "a string"},
+		{`{"routes":42}`, "a number"},
+		{`{"routes":true}`, "a boolean"},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil || f.Code != "invalid_config" {
+				t.Fatalf("got %+v, want invalid_config for %q", f, tc.src)
+			}
+			for _, want := range []string{"routes must be an array", tc.kind} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("legal JSON must not be called a syntax failure: %q", f.Reason)
+			}
+		})
+	}
+
+	// Extra fields around a wrong-typed routes value keep being tolerated;
+	// only the routes type is reported.
+	if _, f := ParseConfig([]byte(`{"version":2,"extra":null,"routes":42}`)); f == nil ||
+		!strings.Contains(f.Reason, "routes must be an array") {
+		t.Fatalf("got %+v, want the routes type error with extra fields present", f)
+	}
+}
+
+func TestConfigEmptyShapesStillValid(t *testing.T) {
+	// An object without routes and an object with routes: [] are both legal
+	// empty route tables; requests still resolve to route_not_found.
+	req := mustReq(t, "GET", "/anything")
+	for _, src := range []string{`{}`, `{"routes":[]}`, `  {"extra": 1}  `} {
+		cfg := mustConfig(t, src)
+		if _, f := Resolve(cfg, req); f == nil || f.Code != "route_not_found" {
+			t.Fatalf("src=%s: got %+v, want route_not_found", src, f)
+		}
+	}
+}
+
+func TestInvalidConfigRouteEntryShape(t *testing.T) {
+	// Every element of routes must be an object; null and the other JSON
+	// types are an entry type error naming the 1-based position and the
+	// received type, never a fabricated missing id.
+	for _, tc := range []struct {
+		src  string
+		kind string
+	}{
+		{`{"routes":[null]}`, "null"},
+		{`{"routes":[42]}`, "a number"},
+		{`{"routes":["x"]}`, "a string"},
+		{`{"routes":[true]}`, "a boolean"},
+		{`{"routes":[[]]}`, "an array"},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil || f.Code != "invalid_config" {
+				t.Fatalf("got %+v, want invalid_config for %q", f, tc.src)
+			}
+			for _, want := range []string{"route 1", "route entry must be a JSON object", tc.kind} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			for _, bad := range []string{"not valid JSON", "id must", "(id "} {
+				if strings.Contains(f.Reason, bad) {
+					t.Fatalf("reason = %q must not contain %q", f.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// A non-object entry after earlier routes (the first of which would
+	// match any request) still rejects the whole config, and the reported
+	// position is the bad entry's own 1-based index.
+	cfgSrc := `{"routes":[
+	  {"id":"hit","methods":["*"],"pathPrefix":"/","upstream":"http://hit.internal"},
+	  {"id":"ok","methods":["GET"],"pathPrefix":"/ok","upstream":"http://ok.internal"},
+	  null
+	]}`
+	_, f := ParseConfig([]byte(cfgSrc))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got %+v, want invalid_config for a later null entry", f)
+	}
+	for _, want := range []string{"route 3", "route entry must be a JSON object", "null"} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+	if strings.Contains(f.Reason, "route 2") || strings.Contains(f.Reason, "id must") {
+		t.Fatalf("reason must pin route 3's entry type error, got %q", f.Reason)
+	}
+}
+
+func TestInvalidConfigSyntaxStaysParseFailure(t *testing.T) {
+	// Broken syntax is only ever a parse failure: even when the readable
+	// prefix already contains "routes" or a whole first route, no field or
+	// route position is inferred.
+	for _, src := range []string{
+		`{not json`,
+		`{"routes": [{"id":"x"} broken`,
+		`{"routes": [{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}, broken`,
+		`{"routes":`,
+	} {
+		t.Run(src, func(t *testing.T) {
+			_, f := ParseConfig([]byte(src))
+			if f == nil || f.Code != "invalid_config" {
+				t.Fatalf("got %+v, want invalid_config for %q", f, src)
+			}
+			if !strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("reason = %q, want a JSON parse failure", f.Reason)
+			}
+			for _, bad := range []string{"route 1", "must be a JSON object", "routes must be an array"} {
+				if strings.Contains(f.Reason, bad) {
+					t.Fatalf("parse failure must not infer %q: %q", bad, f.Reason)
+				}
+			}
+		})
+	}
+}
+
 func TestInvalidRequest(t *testing.T) {
 	cases := []struct {
 		name string

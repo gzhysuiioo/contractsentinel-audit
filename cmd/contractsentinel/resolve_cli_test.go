@@ -598,6 +598,120 @@ func TestResolveCLIRequestErrorReasons(t *testing.T) {
 	}
 }
 
+// TestResolveCLIConfigShapeErrors drives the structural-config distinction
+// the way a user sees it: legal JSON with the wrong shape (top level or
+// routes), a null entry after a route the request would hit, and broken
+// syntax paired with a broken request. Shape errors name the required and
+// received types and still win over request errors; only genuinely broken
+// syntax reads as a parse failure. Every failure exits non-zero, leaves
+// stdout empty and emits one {code, reason} JSON object.
+func TestResolveCLIConfigShapeErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		config    string
+		request   string
+		want      []string
+		forbidden []string
+	}{
+		{
+			name:      "top level array is legal JSON but the wrong shape",
+			config:    `[]`,
+			request:   cliSuccessRequest,
+			want:      []string{"config must be a JSON object", "an array"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "top level null is a shape error, not an empty config",
+			config:    `null`,
+			request:   cliSuccessRequest,
+			want:      []string{"config must be a JSON object", "null"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "routes null is a routes type error, not no routes",
+			config:    `{"routes":null}`,
+			request:   cliSuccessRequest,
+			want:      []string{"routes must be an array", "null"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name: "null entry after a matching route rejects the whole config",
+			config: `{"routes":[
+			  {"id":"hit","methods":["*"],"pathPrefix":"/","upstream":"http://hit.internal"},
+			  null
+			]}`,
+			request:   `{"method":"GET","target":"/ping"}`,
+			want:      []string{"route 2", "route entry must be a JSON object", "null"},
+			forbidden: []string{"not valid JSON", "id must"},
+		},
+		{
+			name:      "broken config syntax stays a parse failure even with a full first route",
+			config:    `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}, broken`,
+			request:   cliSuccessRequest,
+			want:      []string{"not valid JSON"},
+			forbidden: []string{"route 1", "must be a JSON object"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runResolveCLI(t, tc.config, tc.request)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, bad := range tc.forbidden {
+				if strings.Contains(fail.Reason, bad) {
+					t.Errorf("reason = %q must not contain %q", fail.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// A shape error outranks a request error: a top-level-null config with
+	// broken JSON on stdin still yields invalid_config, never
+	// invalid_request.
+	res := runResolveCLI(t, `null`, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+
+	// An object without routes remains a legal empty config at the command
+	// boundary: the request is processed and ends in route_not_found.
+	empty := runResolveCLI(t, `{"version": 1}`, cliSuccessRequest)
+	if empty.exitCode == 0 || len(empty.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want failure with empty stdout", empty.exitCode, empty.stdout)
+	}
+	var emptyFail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, empty.stderr, "stderr", &emptyFail)
+	if emptyFail.Code != "route_not_found" {
+		t.Fatalf("code = %q, want route_not_found", emptyFail.Code)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not
