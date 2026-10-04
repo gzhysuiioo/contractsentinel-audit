@@ -598,6 +598,133 @@ func TestResolveCLIRequestErrorReasons(t *testing.T) {
 	}
 }
 
+// TestResolveCLIConfigShapeErrors exercises configs that are legal JSON but
+// the wrong structure at the command boundary: a non-object top level
+// (including null) says the config must be a JSON object; a non-array routes
+// field (including null) says routes must be an array; a null element after a
+// route the request would hit rejects the whole config by element position.
+// None of these may be reported as a JSON syntax failure, stdout stays empty,
+// and a structurally invalid config wins over an invalid request.
+func TestResolveCLIConfigShapeErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		config    string
+		want      []string
+		forbidden []string
+	}{
+		{
+			name:      "top level array",
+			config:    `[]`,
+			want:      []string{"config must be a JSON object", "got an array"},
+			forbidden: []string{"not valid JSON", "route "},
+		},
+		{
+			name:      "top level null",
+			config:    `null`,
+			want:      []string{"config must be a JSON object", "got null"},
+			forbidden: []string{"not valid JSON", "route "},
+		},
+		{
+			name:      "top level string",
+			config:    `"routes"`,
+			want:      []string{"config must be a JSON object", "got a string"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "routes null is a type error, not an empty config",
+			config:    `{"routes":null}`,
+			want:      []string{"routes must be an array", "got null"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name:      "routes object",
+			config:    `{"routes":{}}`,
+			want:      []string{"routes must be an array", "got an object"},
+			forbidden: []string{"not valid JSON"},
+		},
+		{
+			name: "null element after a route the request would match",
+			config: `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    null
+			  ]
+			}`,
+			want:      []string{"route 2", "route entry must be an object", "got null"},
+			forbidden: []string{"not valid JSON", "id"},
+		},
+		{
+			name:      "boolean element as the only route",
+			config:    `{"routes":[true]}`,
+			want:      []string{"route 1", "route entry must be an object", "got a boolean"},
+			forbidden: []string{"not valid JSON", "id"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runResolveCLI(t, tc.config, cliSuccessRequest)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, bad := range tc.forbidden {
+				if strings.Contains(fail.Reason, bad) {
+					t.Errorf("reason = %q must not contain %q", fail.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// A structurally wrong config is reported before the request is even
+	// examined, so routes:null paired with broken-JSON request still yields
+	// invalid_config.
+	res := runResolveCLI(t, `{"routes":null}`, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+	if !strings.Contains(fail.Reason, "routes must be an array") {
+		t.Fatalf("reason = %q, want the routes type error", fail.Reason)
+	}
+
+	// A broken-JSON config is still a parse failure at the boundary, even
+	// though the fragment looks like it starts a routes array.
+	broken := runResolveCLI(t, `{"routes":[ broken`, cliSuccessRequest)
+	if broken.exitCode == 0 {
+		t.Fatal("broken config must exit non-zero")
+	}
+	var brokenFail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, broken.stderr, "stderr", &brokenFail)
+	if brokenFail.Code != "invalid_config" || !strings.Contains(brokenFail.Reason, "not valid JSON") {
+		t.Fatalf("got %+v, want invalid_config parse failure", brokenFail)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

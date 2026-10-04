@@ -678,7 +678,22 @@ func TestInvalidConfigFieldTypes(t *testing.T) {
 		{
 			name: "routes entry is not an object",
 			src:  `{"routes":[42]}`,
-			want: []string{"route 1", "route entry must be a JSON object"},
+			want: []string{"route 1", "route entry must be an object", "got a number"},
+		},
+		{
+			name:      "null route entry is an element type error, not a missing id",
+			src:       `{"routes":[null]}`,
+			want:      []string{"route 1", "route entry must be an object", "got null"},
+			forbidden: []string{"id"},
+		},
+		{
+			name: "null route entry after a valid earlier route still rejects the config",
+			src: `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://a"},
+			  null
+			]}`,
+			want:      []string{"route 2", "route entry must be an object", "got null"},
+			forbidden: []string{"id must"},
 		},
 	}
 	for _, tc := range cases {
@@ -707,8 +722,14 @@ func TestInvalidConfigFieldTypes(t *testing.T) {
 	}
 
 	// Broken JSON syntax stays a parse failure and never gets a guessed
-	// route position, even when the corruption is inside the routes array.
-	for _, src := range []string{`{not json`, `{"routes": [{"id":"x"} broken`} {
+	// route position, even when the document opens with a routes field,
+	// contains a complete first route, or is corrupt inside the array.
+	for _, src := range []string{
+		`{not json`,
+		`{"routes": [{"id":"x"} broken`,
+		`{"routes":[ broken`,
+		`{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h"}] broken`,
+	} {
 		_, f := ParseConfig([]byte(src))
 		if f == nil || f.Code != "invalid_config" {
 			t.Fatalf("got %+v, want invalid_config for %q", f, src)
@@ -716,8 +737,9 @@ func TestInvalidConfigFieldTypes(t *testing.T) {
 		if !strings.Contains(f.Reason, "not valid JSON") {
 			t.Fatalf("reason = %q, want a JSON parse failure", f.Reason)
 		}
-		if strings.Contains(f.Reason, "route 1") {
-			t.Fatalf("syntax failure must not guess a route position: %q", f.Reason)
+		if strings.Contains(f.Reason, "route 1") || strings.Contains(f.Reason, "must be a JSON object") ||
+			strings.Contains(f.Reason, "routes must") {
+			t.Fatalf("syntax failure must not guess a shape or route position: %q", f.Reason)
 		}
 	}
 
@@ -730,6 +752,110 @@ func TestInvalidConfigFieldTypes(t *testing.T) {
 	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/items"}`)
 	if res.RouteID != "api" || res.UpstreamURL != "http://api.internal/v1/items" {
 		t.Fatalf("got %+v, want api / http://api.internal/v1/items", res)
+	}
+}
+
+func TestInvalidConfigTopLevelShape(t *testing.T) {
+	// A syntactically legal JSON document that is not an object is a shape
+	// error, never a syntax failure: the reason says the config must be a
+	// JSON object and names the type actually received. No route number is
+	// guessed because there is no routes array to position one in.
+	for _, tc := range []struct {
+		src  string
+		kind string
+	}{
+		{`[]`, "an array"},
+		{`42`, "a number"},
+		{`"routes"`, "a string"},
+		{`true`, "a boolean"},
+		{`false`, "a boolean"},
+		{`null`, "null"},
+	} {
+		t.Run(tc.src, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for %q", tc.src)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"config must be a JSON object", "got " + tc.kind} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("legal JSON must not be called a syntax failure: %q", f.Reason)
+			}
+			if strings.Contains(f.Reason, "route ") {
+				t.Fatalf("top-level shape error must not guess a route number: %q", f.Reason)
+			}
+		})
+	}
+
+	// An object that supplies routes must supply an array; every other JSON
+	// type, null included, is a routes type error rather than "no routes".
+	for _, tc := range []struct {
+		name string
+		src  string
+		kind string
+	}{
+		{"routes null", `{"routes":null}`, "null"},
+		{"routes object", `{"routes":{}}`, "an object"},
+		{"routes string", `{"routes":"[]"}`, "a string"},
+		{"routes number", `{"routes":3}`, "a number"},
+		{"routes boolean", `{"routes":true}`, "a boolean"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, f := ParseConfig([]byte(tc.src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for %q", tc.src)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"routes must be an array", "got " + tc.kind} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("legal JSON must not be called a syntax failure: %q", f.Reason)
+			}
+		})
+	}
+
+	// No routes key and routes:[] stay legal empty configs, and a request
+	// against either resolves to route_not_found rather than a config error.
+	req, f := ParseRequest([]byte(`{"method":"GET","target":"/api"}`))
+	if f != nil {
+		t.Fatalf("unexpected request failure: %+v", f)
+	}
+	for _, src := range []string{`{}`, `{"routes":[]}`, `{"other":"ignored"}`} {
+		t.Run(src, func(t *testing.T) {
+			cfg, cf := ParseConfig([]byte(src))
+			if cf != nil {
+				t.Fatalf("empty config must be valid, got %+v", cf)
+			}
+			if _, rf := Resolve(cfg, req); rf == nil || rf.Code != "route_not_found" {
+				t.Fatalf("got %+v, want route_not_found", rf)
+			}
+		})
+	}
+
+	// A non-object element after an earlier route that the request would hit
+	// still rejects the whole configuration at parse time.
+	_, f = ParseConfig([]byte(`{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://a"},
+	  "str"
+	]}`))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got %+v, want invalid_config", f)
+	}
+	for _, want := range []string{"route 2", "route entry must be an object", "got a string"} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
 	}
 }
 

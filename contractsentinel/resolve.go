@@ -53,17 +53,27 @@ type routeJSON struct {
 }
 
 // decodeRoute type-checks and decodes one raw route object. loc is the
-// route's 1-based location in its config (e.g. "route 2"). Field type errors
-// carry that location and, when the route supplies a valid non-empty string
-// id anywhere in its object (even after the offending field), that id.
-// Missing fields stay silent here and are rejected later by validate, which
-// preserves the existing missing-field behavior.
+// route's 1-based location in its config (e.g. "route 2"). The element's JSON
+// type is checked first: a null entry or any non-object value fails on the
+// entry itself, naming the position, the required object type and the type
+// actually received, instead of falling through to a missing-field error such
+// as a missing id. Field type errors then carry that location and, when the
+// route supplies a valid non-empty string id anywhere in its object (even
+// after the offending field), that id. Missing fields stay silent here and
+// are rejected later by validate, which preserves the existing missing-field
+// behavior.
 func decodeRoute(data []byte, loc string) (Route, *Failure) {
+	elem := bytes.TrimSpace(data)
+	if len(elem) == 0 || elem[0] != '{' {
+		return Route{}, failuref("invalid_config",
+			"%s: route entry must be an object, got %s", loc, jsonTypeName(elem))
+	}
 	var rj routeJSON
-	if err := json.Unmarshal(data, &rj); err != nil {
-		// A type error at this level means the route itself is not a JSON
-		// object (e.g. an entry of routes that is a string or number).
-		return Route{}, failuref("invalid_config", "%s: route entry must be a JSON object", loc)
+	if err := json.Unmarshal(elem, &rj); err != nil {
+		// The element already parsed as one JSON value and starts with '{';
+		// an object that cannot be read is a syntax failure rather than a
+		// field type error.
+		return Route{}, failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
 
 	var route Route
@@ -233,27 +243,58 @@ type Config struct {
 	Routes []Route `json:"routes"`
 }
 
-// UnmarshalJSON decodes the routes array one entry at a time and validates
-// each entry's field types and queryTransforms against its 1-based position
-// in this config. Decoding entries from raw values means wrong field types
-// are reported on the offending route (with its id when available) instead
-// of as a generic JSON syntax failure. The position comes from the array
+// UnmarshalJSON first confirms the document is one syntactically valid JSON
+// value, then checks its structure: the top-level value must be a JSON object
+// and, when present, the routes field must hold an array. A syntactically
+// legal value of the wrong shape (an array, string, number, boolean or null
+// at the top level; a non-array routes, null included) is an invalid_config
+// naming both the required type and the type received, never a JSON parse
+// failure. The routes array is then decoded one entry at a time, each entry
+// type-checked and validated against its 1-based position in this config; a
+// non-object entry (null included) fails on that entry before any field is
+// inspected. Decoding entries from raw values means wrong field types are
+// reported on the offending route (with its id when available) instead of
+// as a generic JSON syntax failure. The position comes from the array
 // decoded here, so configs parsed concurrently or interleaved in the same
 // process cannot shift each other's route numbering. A broken JSON document
 // still fails the outer decode and is reported as a parse failure, without a
-// guessed route position.
+// guessed route position or field.
 func (cfg *Config) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Routes []json.RawMessage `json:"routes"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	// First confirm the document is one syntactically valid JSON value: only
+	// then is a wrong shape a structural error rather than a parse failure.
+	// This mirrors ParseRequest: broken syntax (including an empty file and a
+	// corrupt first route) stays a parse error with no guessed position.
+	var doc json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
 		return err
 	}
+	body := bytes.TrimSpace(doc)
+	if body[0] != '{' {
+		return failuref("invalid_config", "config must be a JSON object, got %s", jsonTypeName(body))
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return err
+	}
+
+	var rawRoutes []json.RawMessage
+	if raw, ok := fields["routes"]; ok {
+		body := bytes.TrimSpace(raw)
+		if len(body) == 0 || body[0] != '[' {
+			// null is a type error here, never an absent field: a config
+			// that explicitly supplies routes must supply an array.
+			return failuref("invalid_config", "routes must be an array, got %s", jsonTypeName(body))
+		}
+		if err := json.Unmarshal(body, &rawRoutes); err != nil {
+			return err
+		}
+	}
+
 	// Pass 1: decode and type-check every entry, so a wrong field type on a
 	// later route fails before any queryTransforms validation (matching the
 	// precedence of decoding before validation).
-	cfg.Routes = make([]Route, len(raw.Routes))
-	for i, entry := range raw.Routes {
+	cfg.Routes = make([]Route, len(rawRoutes))
+	for i, entry := range rawRoutes {
 		route, f := decodeRoute(entry, fmt.Sprintf("route %d", i+1))
 		if f != nil {
 			return f
