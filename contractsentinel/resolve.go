@@ -442,12 +442,22 @@ func validateUpstream(raw, loc, id string) *Failure {
 // IP literal in square brackets: brackets are reserved for an IPv6 (or
 // future IP-version) literal, so their content must parse as an IPv6 address
 // — full form, compressed form or an IPv6 address with an embedded IPv4
-// tail. A port, userinfo and a percent-encoded zone ("%25eth0") are allowed
-// and never alter the literal's bytes; an empty pair of brackets, a plain
+// tail — and the brackets must wrap the whole host exactly once:
+//
+//	"[" IPv6 "]" [ ":" *DIGIT ]
+//
+// A port, userinfo and a percent-encoded zone ("%25eth0") are allowed and
+// never alter the literal's bytes; an empty pair of brackets, a plain
 // hostname such as "[not-an-ip]", a bare IPv4 address such as
-// "[127.0.0.1]" and a malformed IPv6 literal are rejected with a reason
-// that names the route, its id and the upstream field. This is a content
-// error in a syntactically valid JSON document, never a JSON parse failure.
+// "[127.0.0.1]", a malformed IPv6 literal, a missing closing bracket, a
+// second bracket group such as "[::1][::2]", a stray closing bracket or any
+// other text between the closing bracket and the start of the base path
+// (including junk around the port such as "[::1]:80a" or "[::1]x]:80") are
+// rejected — a legal first literal never legitimizes trailing content. The
+// reason names the route, its id and the upstream field. This is a content
+// error in a syntactically valid JSON document, never a JSON parse failure,
+// and the rule is enforced here on the raw bytes rather than left to
+// url.Parse's parser strictness.
 func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 	// The authority starts after the scheme separator and ends at the first
 	// path slash (query and fragment were rejected by the caller).
@@ -471,7 +481,7 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 	label := routeLabel(loc, id)
 	if !strings.HasPrefix(hostPort, "[") {
 		return failuref("invalid_config",
-			"%s: upstream bracketed host must be a valid IPv6 address: '[' may only enclose the host", label)
+			"%s: upstream bracketed host must be a single '[' IPv6 address ']' pair: '[' may only open the host", label)
 	}
 	closeBracket := strings.IndexByte(hostPort, ']')
 	if closeBracket < 0 {
@@ -492,6 +502,27 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 		// IPv6, so "[127.0.0.1]" is rejected even though it is a valid IP.
 		return invalidBracketedHost(label, literal)
 	}
+	// The one closing bracket ends the host: the rest of the authority may
+	// be empty or the optional port the generic parser already allows
+	// (":" followed by digits, an empty port included). A repeated bracket
+	// group, a stray ']', or any other text before, beside or after a port
+	// fails here even though the first literal was valid — the brackets
+	// must enclose the whole host exactly once.
+	suffix := hostPort[closeBracket+1:]
+	switch {
+	case suffix == "":
+		return nil
+	case strings.ContainsAny(suffix, "[]"):
+		return invalidBracketedHostShape(label, suffix)
+	case suffix[0] != ':':
+		return invalidBracketedHostShape(label, suffix)
+	}
+	port := suffix[1:]
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return invalidBracketedHostShape(label, suffix)
+		}
+	}
 	return nil
 }
 
@@ -500,6 +531,15 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 func invalidBracketedHost(label, literal string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream host in brackets must be a valid IPv6 address, but %q is not a legal IPv6 address", label, literal)
+}
+
+// invalidBracketedHostShape builds the content error for a bracketed host
+// whose trailing bytes break the "single '[' IPv6 ']' pair plus optional
+// port" grammar, e.g. a repeated bracket group, a stray closing bracket or
+// non-port text after the closing bracket.
+func invalidBracketedHostShape(label, suffix string) *Failure {
+	return failuref("invalid_config",
+		"%s: upstream bracketed host must be a single '[' IPv6 address ']' pair followed only by an optional port, but %q follows the closing ']'", label, suffix)
 }
 
 // requestJSON mirrors Request but keeps method and target raw, so a valid

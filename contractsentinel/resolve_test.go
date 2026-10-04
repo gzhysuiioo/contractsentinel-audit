@@ -369,6 +369,78 @@ func TestInvalidConfigBracketedHostMustBeIPv6(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigBracketedHostShape(t *testing.T) {
+	// One pair of square brackets must wrap the whole host: after the
+	// closing ']' only the optional port (":" plus digits) may follow before
+	// the base path. A valid first literal never legitimizes a repeated
+	// bracket group, a stray ']', text between the address and the port, or
+	// non-port bytes — with or without userinfo. Every such upstream rejects
+	// the whole configuration as invalid_config with a content reason naming
+	// the route position, its id and the upstream field, never as broken
+	// JSON.
+	badUpstreams := []struct {
+		name     string
+		upstream string
+	}{
+		{"repeated bracket group", "http://[::1][::2]/v1"},
+		{"text and a stray closing bracket", "http://[::1]extra]/v1"},
+		{"stray closing bracket", "http://[::1]]/v1"},
+		{"repeated bracket group before a port", "http://[::1][::2]:8080/v1"},
+		{"repeated bracket group after a port", "http://[::1]:8080[::2]/v1"},
+		{"bare text after the closing bracket", "http://[::1]extra/v1"},
+		{"digits after the bracket without a colon", "http://[::1]8080/v1"},
+		{"non digit bytes in the port", "http://[::1]:80a/v1"},
+		{"extra colon group in the port", "http://[::1]:80:80/v1"},
+		{"userinfo with a repeated bracket group", "http://user:pw@[::1][::2]/v1"},
+		{"encoded userinfo with text and a stray bracket", "https://user:p%40ss@[::1]extra]/v1"},
+		{"encoded userinfo with junk after the port", "https://user:p%40ss@[::1]:8443x/v1"},
+		{"userinfo with a second bracket group after the port", "http://u@[::1]:8080[::2]/v1"},
+	}
+	for _, tc := range badUpstreams {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+			  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + tc.upstream + `"}
+			]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "bracketed host", "IPv6"} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("a bad bracketed host shape is a content error, not a JSON syntax failure: %q", f.Reason)
+			}
+			if cfg != nil {
+				t.Fatalf("a rejected config must not be returned, got %+v", cfg)
+			}
+		})
+	}
+
+	// The offending route may be one the request never hits: config
+	// validation still fails up front (and hands back no config at all)
+	// instead of letting the first, valid route resolve the request.
+	for _, up := range []string{"http://[::1][::2]/v1", "http://[::1]extra]/v1"} {
+		src := `{"routes":[
+		  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+		  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + up + `"}
+		]}`
+		cfg, f := ParseConfig([]byte(src))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("upstream %q: got %+v, want invalid_config", up, f)
+		}
+		if cfg != nil {
+			t.Fatalf("upstream %q: a rejected config must not be returned", up)
+		}
+	}
+}
+
 func TestResolveValidIPv6Upstreams(t *testing.T) {
 	// Full, compressed and IPv4-tail forms are legal, as are a port,
 	// percent-encoded userinfo and a percent-encoded zone. Validation must
@@ -416,6 +488,12 @@ func TestResolveValidIPv6Upstreams(t *testing.T) {
 			upstream: "http://[2001:DB8::ABCD]/b",
 			target:   "/x",
 			want:     "http://[2001:DB8::ABCD]/b/x",
+		},
+		{
+			name:     "userinfo, port, encoded base path and encoded slash query all stay verbatim",
+			upstream: "https://user:p%40ss@[2001:DB8::1]:8443/v%2f",
+			target:   "/api/x?q=%2f",
+			want:     "https://user:p%40ss@[2001:DB8::1]:8443/v%2f/x?q=%2f",
 		},
 	}
 	for _, tc := range cases {
