@@ -33,7 +33,7 @@ Go 1.26，仅使用标准库，全部行为可在本机 CPU 上离线复现。
 ### 提交 JSON 的结构
 
 - `artifact`：合约产物，含 `name`、`abi`、`bytecode`、`source` 四个字符串字段。
-- `rules`：本次适用的规则数组，每条规则必须有非空 `id` 与 `version`，`id` 在数组内唯一；`requiresABI` 为真时产物必须有非空 `abi`，`kind` 为 `symbolic` 时产物必须有非空 `bytecode`。
+- `rules`：本次适用的规则数组，每条规则必须有非空 `id` 与 `version`，`id` 在数组内唯一；`requiresABI` 为真时产物必须有非空 `abi`，`kind` 为 `symbolic` 时产物必须有非空 `bytecode`。`requiresABI` 可以省略（按 `false` 处理），但一旦写出就必须是 JSON 布尔值 `true` 或 `false`：`null`、字符串、数字、对象或数组都会使整份提交失败，而不会被当成 `false` 继续。
 - `invariants`：不变式名到 JSON 布尔值的映射（既有用法，见文末）。
 - `checks`：外部检查器给出的逐规则记录数组，每条记录含：
   - `artifactHash`：该结论所针对产物的哈希，必须与本次 `artifact` 实际算出的哈希一致；
@@ -242,6 +242,14 @@ go run ./cmd/contractsentinel report \
    ```
 
    合法字符不受影响：中文、换行、前后空格、正确成对的代理转义（如 `😀`）与直接书写的同一字符都可使用，`note`/证据保留解码后的原文，两种写法的产物哈希与报告标识一致；原文中本就存在的 U+FFFD 只是普通字符，`"\\uD800"`（转义反斜线后跟 `uD800`）也只是普通文本，不会被误判。
+
+5. **规则的 `requiresABI` 不是布尔值。** 正式 `requiresABI` 成员（约定拼写，含 Unicode 转义写法）一旦写出，值必须是 `true` 或 `false`；写成 `null`、字符串、数字、对象或数组时整份失败，不会被当成 `false` 继续，即使产物已有 ABI、规则没有收到任何检查结论也一样。错误会点名出错的规则：
+
+   ```text
+   audit failed: rule reentrancy-guard: requiresABI must be a boolean
+   ```
+
+   省略该成员仍按 `false` 处理；`RequiresABI`、`" requiresABI "` 这类大小写变体或带空格的名称只是扩展信息，其中的 `null` 不触发本错误，也不能替代或挽救正式成员的非法值。
 
 此外，记录引用了 `rules` 中不存在的规则、同一规则出现多条 checks 记录、`status` 写成 `未检查` 等未知值（`unknown status …`）、或三种需要说明的状态给了空白说明（`note is required for status …`），同样整份拒绝。
 

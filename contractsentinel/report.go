@@ -169,8 +169,56 @@ func validateFormalCheckStatuses(strict []byte) error {
 	return nil
 }
 
+// validateFormalRequiresABI checks the formal "requiresABI" member of every
+// strict rule definition. The strict rewrite dropped extension members, so the
+// value seen here is the agreed-spelling one alone. Decoding the member
+// straight into a Go bool would turn null into the zero value false: a rule
+// whose requirement was never actually stated would be recorded as not
+// needing an ABI, indistinguishable from an explicit false, and could even
+// produce a defect finding from a false invariant. When the formal member is
+// present its value must be the JSON boolean true or false — null, a string,
+// a number, an object or an array rejects the whole submission, whether or
+// not the artifact carries an ABI and whether or not the rule received any
+// check conclusion. An omitted member still means false. A case-variant or
+// whitespace-padded name is extension data and its value, null included,
+// never reaches this check; it can neither trigger the error nor rescue an
+// illegal formal value. The error names the rule so the offending entry is
+// identifiable.
+func validateFormalRequiresABI(strict []byte) error {
+	var top struct {
+		Rules []map[string]json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	for _, rule := range top.Rules {
+		where := "rule"
+		if raw, ok := rule["id"]; ok {
+			var id string
+			if err := json.Unmarshal(raw, &id); err == nil && id != "" {
+				where = "rule " + id
+			}
+		}
+		raw, ok := rule["requiresABI"]
+		if !ok {
+			continue
+		}
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil {
+			return errInvalid(where + ": requiresABI must be a boolean")
+		}
+		if _, isBool := token.(bool); !isBool {
+			return errInvalid(where + ": requiresABI must be a boolean")
+		}
+	}
+	return nil
+}
+
 // ParseAuditInput decodes an audit submission JSON object into domain values.
-// Invariant values must be JSON booleans; any other type is an error. Any JSON
+// Invariant values must be JSON booleans; any other type is an error. A formal
+// requiresABI member on a rule must likewise be a JSON boolean: null or any
+// non-boolean value rejects the whole submission instead of being read as the
+// zero value false, while an omitted member still means false. Any JSON
 // object in the submission that repeats a member name rejects the whole
 // submission: the decoder keeps only the last value silently, so a repeated
 // invariant key would choose a conclusion by member order instead of giving
@@ -197,6 +245,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	if err := validateFormalCheckStatuses(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalRequiresABI(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	var in wireInput
