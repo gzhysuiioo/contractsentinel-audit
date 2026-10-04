@@ -16,12 +16,17 @@ import (
 // the upstream URL requests on that route are forwarded to. An optional
 // queryTransforms list rewrites the request query string after the route has
 // been selected.
+//
+// QueryTransforms is read via routeJSON (and parseQueryTransforms) rather than
+// through its struct tag, but the tag names it queryTransforms so a config
+// parsed by ParseConfig and re-serialized with encoding/json keeps the rules;
+// each rule's own MarshalJSON then renders only the fields its op allows.
 type Route struct {
 	ID              string            `json:"id"`
 	Methods         []string          `json:"methods"`
 	PathPrefix      string            `json:"pathPrefix"`
 	Upstream        string            `json:"upstream"`
-	QueryTransforms []*QueryTransform `json:"-"`
+	QueryTransforms []*QueryTransform `json:"queryTransforms,omitempty"`
 
 	// queryTransformsRaw holds the undecoded queryTransforms value until
 	// Config.UnmarshalJSON validates it once the route's position in its own
@@ -38,6 +43,63 @@ type QueryTransform struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 	To    string `json:"to"`
+}
+
+// MarshalJSON renders a rule in exactly the shape parseQueryTransforms
+// accepts, so a parsed config can be serialized and parsed again without
+// losing rules or tripping a field restriction:
+//
+//   - set keeps name and a string value, including the empty string, so an
+//     empty value is not mistaken for a missing one;
+//   - remove keeps only op and name and never emits value;
+//   - rename keeps op, name and the non-empty to and never emits value.
+//
+// name, value and to are written as the literal strings read from the input
+// config: encoding/json only applies JSON string escaping here, never query
+// percent-encoding or '+'/space handling, so spaces, non-ASCII bytes, '+'
+// and '%' in them survive the save unchanged and match the same parameters
+// after the config is read back.
+func (qt *QueryTransform) MarshalJSON() ([]byte, error) {
+	if qt == nil {
+		// ParseConfig never produces nil rules, but keep marshaling a slice
+		// that holds one from panicking; the reader rejects the null rule.
+		return []byte("null"), nil
+	}
+	var b strings.Builder
+	b.WriteString(`{"op":`)
+	if err := writeJSONString(&b, qt.Op); err != nil {
+		return nil, err
+	}
+	b.WriteString(`,"name":`)
+	if err := writeJSONString(&b, qt.Name); err != nil {
+		return nil, err
+	}
+	switch qt.Op {
+	case "set":
+		b.WriteString(`,"value":`)
+		if err := writeJSONString(&b, qt.Value); err != nil {
+			return nil, err
+		}
+	case "rename":
+		b.WriteString(`,"to":`)
+		if err := writeJSONString(&b, qt.To); err != nil {
+			return nil, err
+		}
+	}
+	b.WriteByte('}')
+	return []byte(b.String()), nil
+}
+
+// writeJSONString appends the JSON encoding of s to b. It marshals through
+// encoding/json so the literal is escaped exactly like every other JSON
+// string in the document; only the surrounding allocation is skipped.
+func writeJSONString(b *strings.Builder, s string) error {
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	b.Write(encoded)
+	return nil
 }
 
 // routeJSON mirrors Route but keeps every field raw: the basic fields are
