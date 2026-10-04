@@ -714,6 +714,51 @@ func strictReportJSON(data []byte) ([]byte, error) {
 	return strictFixedJSON(data, reportShape)
 }
 
+// validateArchiveRequiresABI is the read-side counterpart of the submission
+// check in validateFormalRequiresABI. A ReportRule.RequiresABI is a Go bool,
+// so decoding the strict archive straight into Report turns a formal null
+// member into the zero value false: an archive that wrote "requiresABI":null
+// would read byte-for-byte like one that wrote false, the recomputed id and
+// the rule/finding correspondence would all pass on that laundered value, and
+// a diff could even compare it as an unchanged rule. When the formal member
+// is present its value must therefore be the JSON boolean true or false;
+// null, a string, a number, an object or an array makes the whole archive
+// corrupt, independently of the rule's check status and of whether it has a
+// finding — the offending rule is never skipped and no partial report is
+// returned. An omitted member still means false. The strict rewrite dropped
+// extension members, so a case-variant or whitespace-padded name is invisible
+// here: a boolean it carries neither supplies nor rescues the formal value,
+// and a null it carries never reaches this check.
+func validateArchiveRequiresABI(strict []byte, id string) error {
+	var top struct {
+		Rules []map[string]json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	for _, rule := range top.Rules {
+		where := "rule"
+		if raw, ok := rule["id"]; ok {
+			var ruleID string
+			if err := json.Unmarshal(raw, &ruleID); err == nil && ruleID != "" {
+				where = "rule " + ruleID
+			}
+		}
+		raw, ok := rule["requiresABI"]
+		if !ok {
+			continue
+		}
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil {
+			return errCorrupt("report " + id + " archive is corrupt: " + where + ": requiresABI must be a boolean")
+		}
+		if _, isBool := token.(bool); !isBool {
+			return errCorrupt("report " + id + " archive is corrupt: " + where + ": requiresABI must be a boolean")
+		}
+	}
+	return nil
+}
+
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
 	// Read-side counterpart of the submission character gate in
@@ -743,6 +788,13 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	strict, err := strictReportJSON(data)
 	if err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	// Check the formal requiresABI member against its raw JSON token before
+	// decoding into the Go bool below; otherwise a null value would silently
+	// become the zero value false and could pass every later check, including
+	// the content id, as if the archive had explicitly said false.
+	if err := validateArchiveRequiresABI(strict, id); err != nil {
+		return Report{}, err
 	}
 	var r Report
 	if err := json.Unmarshal(strict, &r); err != nil {

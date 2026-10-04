@@ -207,6 +207,21 @@ go run ./cmd/contractsentinel report \
 - `solvency-symbolic`：`"version": "0.9.3"`、`"status": "工具缺失"`，note 说明引擎缺失；
 - `findings` 中只有一条，归属 `reentrancy-guard` / 版本 `1.4.2` / 产物哈希 `0cdb8997…3a8ca7`，`evidence` 是上面的完整反例说明——而不是仅仅一个缺陷计数。
 
+### 读回失败条件（归档损坏，非零退出，不动归档）
+
+`report` 读取时报告标识必须是**恰好 64 位小写十六进制字符串**，且归档字节必须完整合法。下列情况命令都以**非零状态退出**，原因写入 **stderr**，stdout 不出现任何报告片段（不会输出部分规则或部分字段），原归档保持原样（不删除、不自动修补、不留临时文件）：
+
+- 标识格式不合法（`invalid report id …`）；
+- 目录中没有该标识的归档，或报告目录本身不存在（`report … not found`）；
+- 归档损坏或内容与标识不符：JSON 语法错误、任何对象重复成员名、成员名称或字符串值含非法 UTF-8 / 错误代理转义、`reportId` 与重算内容不符、规则与缺陷的一一绑定被破坏等；
+- **规则的 `requiresABI` 不是布尔值。** 正式 `requiresABI` 成员（约定拼写，含 Unicode 转义写法）一旦在归档中出现，值必须是 `true` 或 `false`；写成 `null`、字符串、数字、对象或数组时**整份归档判为损坏**。`null` 在解码时会被静默当成 Go 零值 `false`：即使把归档里原本的 `false` 换成 `null` 后，报告标识、规则状态与缺陷绑定仍能全部吻合，读出的规则定义也显示 `false`，但这掩盖了归档内容不合法的事实，因此照样拒绝。这条规则适用于报告中的**每条规则**，与该规则是否已经检查、是否发现缺陷无关；一条规则不合法时不会只跳过它返回其余规则。错误会点名报告标识与出错规则：
+
+  ```text
+  report failed: report a6fa091b…3b34 archive is corrupt: rule reentrancy-guard: requiresABI must be a boolean
+  ```
+
+  省略该成员仍按 `false` 读回；合法 `true` / `false` 按原值读回，报告标识、规则状态与原始证据不变。`RequiresABI`、`" requiresABI "` 这类大小写变体或带空格的名称仍只作为扩展信息忽略，其中的 `null` 不导致本错误，也不能替代正式成员；正式成员非法时，旁边的变体即使写了合法布尔值（无论位于它之前还是之后）都不能使读取成功。
+
 ### 提交失败条件（整份失败，不产生部分报告）
 
 下列情况都会使**整份提交**被拒绝：命令以**非零状态退出**，原因写入**标准错误（stderr）**，stdout 没有任何报告片段，报告目录中**不会**出现成功报告（目录原本不存在时也不会被创建）。
@@ -486,6 +501,14 @@ go run ./cmd/contractsentinel diff \
   ```text
   diff failed: invalid JSON in report 738004a6…0e4e0: invalid character 'b' looking for beginning of object key string
   ```
+
+- 任一归档的规则定义里，正式 `requiresABI` 成员写成了 `null`、字符串、数字、对象或数组等非布尔值：
+
+  ```text
+  diff failed: report a6fa091b…3b34 archive is corrupt: rule reentrancy-guard: requiresABI must be a boolean
+  ```
+
+  `null` 会被解码静默当成 `false`，损坏归档因此可能与合法归档同标识，甚至被误判为“无变化”；比较前的类型校验会先拒绝整份归档，**任一侧**命中都直接失败，不输出任何比较结果，也不会把被默认成 `false` 的规则拿去判断“规则变化”或“无变化”。省略 `requiresABI` 仍按 `false`，合法 `true` / `false` 的既有比较行为不变。
 
 ## 仅提交不变式布尔值（既有用法，保持不变）
 
