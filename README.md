@@ -229,6 +229,20 @@ go run ./cmd/contractsentinel report \
    audit failed: rule reentrancy-guard: both a check record and an invariant value are provided
    ```
 
+4. **提交文件本身不是合法字符序列。** 标准 JSON 解码会把两类坏输入**静默替换成 U+FFFD**，这会改写缺陷证据、并在坏文本出现在 `source` 时改变参与产物哈希的内容，因此 `audit` 在解码之前先做字符合法性检查，命中即**整份失败**（不删除坏字符、不替换后继续，也不会登记成缺陷、工具缺失或超时）：
+
+   - 文件中任何位置含有**非法 UTF-8 字节**；
+   - JSON 字符串（成员名称与字符串值都算，即使异常只出现在**未知扩展成员及其嵌套内容**里）中的 Unicode 转义含有**未配对的高/低代理项**，或**配对顺序错误**（如 `\uDC00\uD800`、高代理后不跟低代理）。
+
+   错误信息说明这是字符编码或 Unicode 转义问题，并给出**行、列与字节偏移**，方便定位修正原始内容，例如：
+
+   ```text
+   audit failed: invalid JSON: invalid Unicode escape in JSON string at line 5, column 47 (byte offset 233): lone high surrogate \uD800 is not followed by a low surrogate \uDC00-\uDFFF
+   audit failed: invalid JSON: invalid UTF-8 encoding at line 1, column 7 (byte offset 6): illegal byte 0xFF is not valid UTF-8
+   ```
+
+   合法字符的处理保持兼容：中文、换行、前后空格、**正确成对的代理转义**（`😀`）以及**直接书写的同一个字符**（`😀`）都可提交，note 与缺陷 `evidence` 保留解码后的原文；同一字符串用直接书写和合法转义两种写法表示时，产物哈希与 `reportId` 一致。原文中**本来就有的 U+FFFD** 只是普通字符，不会仅因出现替换字符而被拒绝；`"\\uD800"`（转义后的反斜线后接 `uD800`）也只是普通文本，不会被误判为孤立代理项。已合法提交的报告内容与标识不因该检查改变。
+
 此外，记录引用了 `rules` 中不存在的规则、同一规则出现多条 checks 记录、`status` 写成 `未检查` 等未知值（`unknown status …`）、或三种需要说明的状态给了空白说明（`note is required for status …`），同样整份拒绝。
 
 ## 比较两份已保存的报告（diff）

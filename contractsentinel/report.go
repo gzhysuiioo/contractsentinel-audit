@@ -169,7 +169,12 @@ func validateFormalCheckStatuses(strict []byte) error {
 }
 
 // ParseAuditInput decodes an audit submission JSON object into domain values.
-// Invariant values must be JSON booleans; any other type is an error. Any JSON
+// Invariant values must be JSON booleans; any other type is an error. The
+// submission is rejected at the character level before decoding: illegal
+// UTF-8 bytes anywhere, or unpaired/misordered surrogate escapes in any JSON
+// string (member names and values, including extension members), reject the
+// whole submission so content is never rewritten to U+FFFD; a directly
+// written U+FFFD and the literal text \uD800 stay ordinary content. Any JSON
 // object in the submission that repeats a member name rejects the whole
 // submission: the decoder keeps only the last value silently, so a repeated
 // invariant key would choose a conclusion by member order instead of giving
@@ -180,6 +185,17 @@ func validateFormalCheckStatuses(strict []byte) error {
 // fixed fields — they are user-defined, compared case sensitively and never
 // trimmed.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
+	// Character legality comes before decoding. encoding/json rewrites illegal
+	// UTF-8 bytes and unpaired surrogate escapes into U+FFFD instead of
+	// failing, which would let a defect record keep its bindings while its
+	// evidence was silently replaced — and would change the content hashed for
+	// the artifact. The scan covers every JSON string, member names and values
+	// alike, including strings nested inside extension members that never
+	// participate in the report. A directly written U+FFFD and the literal
+	// text "\uD800" are ordinary content and pass.
+	if err := validateJSONCharacters(data); err != nil {
+		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
+	}
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(duplicateMemberMessage(data, dup))
 	}
