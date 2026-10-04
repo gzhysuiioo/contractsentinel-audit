@@ -560,6 +560,17 @@ func duplicateArchiveError(id string, data []byte, dup *duplicateMemberError) er
 	return errCorrupt("report " + id + " archive is corrupt: " + duplicateMemberMessage(data, dup))
 }
 
+// characterArchiveError classifies an archive whose raw bytes contain a
+// character the decoder would silently rewrite — an invalid UTF-8 byte, or an
+// unpaired or wrongly ordered surrogate escape in any member name or string
+// value — as corrupt. The message names the requested report id and keeps the
+// scanner's classification (character encoding vs Unicode escape), byte
+// offset, line/column and JSON path, so the original file can be repaired by
+// hand; the archive itself is never rewritten.
+func characterArchiveError(id string, charErr *charEncodingError) error {
+	return errCorrupt("report " + id + " archive is corrupt: " + charErr.Error())
+}
+
 // reportShape is the fixed-field shape of a stored report archive: the agreed
 // spellings at the top level and inside the artifact, every rule and every
 // finding. The trusted content of a report is carried by these fixed fields
@@ -585,6 +596,18 @@ func strictReportJSON(data []byte) ([]byte, error) {
 
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
+	// Read-side counterpart of the submission character check: json.Unmarshal
+	// silently rewrites an invalid UTF-8 byte or an unpaired / wrongly ordered
+	// surrogate escape to U+FFFD, so an archive whose note and evidence were
+	// damaged into lone escapes would decode back to the original text and
+	// pass both the recomputed id and the rule/finding correspondence on the
+	// rewritten content. A successful read must mean the archive bytes
+	// themselves are legal, so any such character — in a fixed field, a
+	// member name, or an unknown extension member's nested content — makes
+	// the whole archive corrupt before anything is decoded.
+	if charErr := validateJSONCharacters(data); charErr != nil {
+		return Report{}, characterArchiveError(id, charErr)
+	}
 	// Read-side counterpart of the submission check: json.Unmarshal silently
 	// keeps the last value for a repeated member, so an archive that writes a
 	// rule status as 发现缺陷 and then 通过 would decode to whichever came

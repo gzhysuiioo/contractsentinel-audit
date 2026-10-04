@@ -207,6 +207,16 @@ go run ./cmd/contractsentinel report \
 - `solvency-symbolic`：`"version": "0.9.3"`、`"status": "工具缺失"`，note 说明引擎缺失；
 - `findings` 中只有一条，归属 `reentrancy-guard` / 版本 `1.4.2` / 产物哈希 `0cdb8997…3a8ca7`，`evidence` 是上面的完整反例说明——而不是仅仅一个缺陷计数。
 
+### 读取以归档本身合法为前提
+
+读取成功必须表示归档字节本身合法，不能靠字符替换接受损坏内容。与提交侧同一标准：归档**任何位置**（成员名称、规则说明、缺陷证据，以及不参与报告标识的未知扩展成员中的嵌套对象和数组）含有**非法 UTF-8 字节**，或 JSON 字符串的 `\uXXXX` 转义存在**孤立高代理项、孤立低代理项或配对顺序错误**时，`report` 把整份报告判为损坏并拒绝返回。这一点针对的正是解码器的静默改写：一份说明与证据都含合法 U+FFFD 的报告，把这两处换成孤立代理转义后，解码会把它们改写回 U+FFFD，重算的 `reportId` 与缺陷归属校验都能在改写后的内容上通过——即使如此也必须失败。命中时命令非零退出，stdout 不输出报告片段，stderr 指出请求的报告标识、问题分类（字符编码或 Unicode 转义）以及原始文件中的字节偏移、行列与可定位的 JSON 路径（成员名损坏时指出其所在对象）：
+
+```text
+report failed: report a6fa091b…3b13b34 archive is corrupt: invalid Unicode escape: unpaired high surrogate escape \uD800 in JSON string value at .rules[0].note (byte offset 535, line 24, column 19)
+```
+
+同一归档被 `diff` 用作任意一侧时整次比较失败、不输出已读成功一侧的部分结果；`audit` 提交遇到同标识的既有损坏归档时拒绝本次提交，而不是视为已经保存成功。这些失败都保留归档原字节，不自动修复、替换或删除它。合法中文、前后空格、换行、正确配对的代理转义与直接书写的同一字符继续正常读取，说明与证据保留解码后的原文；原文中合法存在的 U+FFFD 与表示普通文本的转义反斜线后接 `uD800` 不会被误判。
+
 ### 提交失败条件（整份失败，不产生部分报告）
 
 下列情况都会使**整份提交**被拒绝：命令以**非零状态退出**，原因写入**标准错误（stderr）**，stdout 没有任何报告片段，报告目录中**不会**出现成功报告（目录原本不存在时也不会被创建）。
@@ -477,6 +487,12 @@ go run ./cmd/contractsentinel diff \
 
   ```text
   diff failed: invalid JSON in report 738004a6…0e4e0: invalid character 'b' looking for beginning of object key string
+  ```
+
+- 任一归档含非法字符（非法 UTF-8 字节，或孤立、错序的 Unicode 代理转义），即使解码改写后报告标识仍然相符（见上文“读取以归档本身合法为前提”）：
+
+  ```text
+  diff failed: report 738004a6…0e4e0 archive is corrupt: invalid character encoding: invalid UTF-8 byte 0xff in JSON string value at .findings[0].evidence (byte offset 912, line 31, column 18)
   ```
 
 ## 仅提交不变式布尔值（既有用法，保持不变）
