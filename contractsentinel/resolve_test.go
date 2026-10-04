@@ -330,6 +330,21 @@ func TestInvalidConfigBracketedHostMustBeIPv6(t *testing.T) {
 		{"empty percent encoded zone", "http://[fe80::1%25]/v1"},
 		{"future version literal is not plain ipv6", "http://[v1.fe80::]/v1"},
 		{"bad escape in literal", "http://[fe80::1%zz]/v1"},
+		// A valid leading literal does not license extra brackets or bytes
+		// after its closing ']': the host must be exactly one bracket pair
+		// around one IPv6 literal, optionally followed by one port.
+		{"repeated bracket group", "http://[::1][::2]/v1"},
+		{"text and stray closing bracket", "http://[::1]extra]/v1"},
+		{"extra closing bracket", "http://[::1]]/v1"},
+		{"repeated bracket group without path", "http://[::1][::2]"},
+		{"text and stray bracket without path", "http://[::1]extra]"},
+		{"repeated group with userinfo", "http://u:p@[::1][::2]/v1"},
+		{"repeated group with userinfo and port", "http://u:p@[::1][::2]:8080/v1"},
+		{"stray bracket with userinfo", "http://u:p@[::1]extra]/v1"},
+		{"second bracket group after the port", "http://[::1]:8080[::2]/v1"},
+		{"second empty bracket group", "http://[::1][]:8080/v1"},
+		{"text between literal and port", "http://[::1]x:8080/v1"},
+		{"non numeric port after valid literal", "http://[::1]:80a/v1"},
 	}
 	for _, tc := range badUpstreams {
 		t.Run(tc.name, func(t *testing.T) {
@@ -351,6 +366,9 @@ func TestInvalidConfigBracketedHostMustBeIPv6(t *testing.T) {
 			}
 			if strings.Contains(f.Reason, "not valid JSON") {
 				t.Fatalf("a bad bracketed host is a content error, not a JSON syntax failure: %q", f.Reason)
+			}
+			if strings.Contains(f.Reason, "not a valid URL") {
+				t.Fatalf("malformed bracket spelling must be blamed on the bracket rule, not a generic URL parse error: %q", f.Reason)
 			}
 		})
 	}
@@ -416,6 +434,15 @@ func TestResolveValidIPv6Upstreams(t *testing.T) {
 			upstream: "http://[2001:DB8::ABCD]/b",
 			target:   "/x",
 			want:     "http://[2001:DB8::ABCD]/b/x",
+		},
+		{
+			// Validation decides legality only: every configured byte
+			// (userinfo, uppercase literal, port, encoded base path) and
+			// every request byte (encoded slash in the query) survives.
+			name:     "userinfo uppercase literal port and encoded values preserved byte for byte",
+			upstream: "https://user:p%40ss@[2001:DB8::1]:8443/v%2f",
+			target:   "/api/x?q=%2f",
+			want:     "https://user:p%40ss@[2001:DB8::1]:8443/v%2f/x?q=%2f",
 		},
 	}
 	for _, tc := range cases {

@@ -897,6 +897,15 @@ func TestResolveCLIBracketedHostMustBeIPv6(t *testing.T) {
 		{"bare ipv4 in brackets", "http://[127.0.0.1]:8080/v1"},
 		{"empty brackets", "http://[]/v1"},
 		{"malformed ipv6", "http://[2001:db8:::1]/v1"},
+		// A legal leading address must not make extra brackets or bytes
+		// after its closing ']' pass: the host is exactly one bracket pair
+		// around one IPv6 literal, optionally followed by one port, even
+		// with userinfo present.
+		{"repeated bracket group", "http://[::1][::2]/v1"},
+		{"text and stray closing bracket", "http://[::1]extra]/v1"},
+		{"repeated bracket group with userinfo and port", "http://u:p@[::1][::2]:8080/v1"},
+		{"second bracket group after the port", "http://[::1]:8080[::2]/v1"},
+		{"non numeric port after valid literal", "http://[::1]:80a/v1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -969,6 +978,16 @@ func TestResolveCLIValidIPv6Upstreams(t *testing.T) {
 			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f",
 			target:   "/api/orders?a=1&a=",
 			wantURL:  "https://user:p%40ss@[2001:db8::1]:8443/v%2f/orders?a=1&a=",
+		},
+		{
+			// Validation only decides legality; a fully legal upstream is
+			// never rewritten: uppercase literal, userinfo, port, encoded
+			// base path and the encoded slash in the query all survive.
+			name:     "legal upstream bytes and request query preserved verbatim",
+			prefix:   "/api",
+			upstream: "https://user:p%40ss@[2001:DB8::1]:8443/v%2f",
+			target:   "/api/x?q=%2f",
+			wantURL:  "https://user:p%40ss@[2001:DB8::1]:8443/v%2f/x?q=%2f",
 		},
 		{
 			name:     "encoded zone keeps its original spelling",

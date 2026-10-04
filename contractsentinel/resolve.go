@@ -442,12 +442,18 @@ func validateUpstream(raw, loc, id string) *Failure {
 // IP literal in square brackets: brackets are reserved for an IPv6 (or
 // future IP-version) literal, so their content must parse as an IPv6 address
 // — full form, compressed form or an IPv6 address with an embedded IPv4
-// tail. A port, userinfo and a percent-encoded zone ("%25eth0") are allowed
-// and never alter the literal's bytes; an empty pair of brackets, a plain
-// hostname such as "[not-an-ip]", a bare IPv4 address such as
-// "[127.0.0.1]" and a malformed IPv6 literal are rejected with a reason
-// that names the route, its id and the upstream field. This is a content
-// error in a syntactically valid JSON document, never a JSON parse failure.
+// tail — and the brackets must be exactly one pair wrapping the whole host.
+// A port, userinfo and a percent-encoded zone ("%25eth0") are allowed and
+// never alter the literal's bytes. After the single closing ']' only an
+// optional port (":digits") may follow before the base path: a second
+// bracket group such as "[::1][::2]", a stray ']' such as "[::1]]", or any
+// text sandwiched between the host brackets and the port such as
+// "[::1]extra]" or "[::1]x:8080" cannot ride on a valid leading address. An
+// empty pair of brackets, a plain hostname such as "[not-an-ip]", a bare
+// IPv4 address such as "[127.0.0.1]" and a malformed IPv6 literal are
+// rejected with a reason that names the route, its id and the upstream
+// field. This is a content error in a syntactically valid JSON document,
+// never a JSON parse failure.
 func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 	// The authority starts after the scheme separator and ends at the first
 	// path slash (query and fragment were rejected by the caller).
@@ -471,14 +477,27 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 	label := routeLabel(loc, id)
 	if !strings.HasPrefix(hostPort, "[") {
 		return failuref("invalid_config",
-			"%s: upstream bracketed host must be a valid IPv6 address: '[' may only enclose the host", label)
+			"%s: upstream bracketed host must start with '[' enclosing a valid IPv6 address", label)
 	}
 	closeBracket := strings.IndexByte(hostPort, ']')
 	if closeBracket < 0 {
 		return failuref("invalid_config",
-			"%s: upstream bracketed host must be a valid IPv6 address but the closing ']' is missing", label)
+			"%s: upstream bracketed host must be a valid IPv6 address enclosed in one pair of '[' ']' brackets, but the closing ']' is missing", label)
 	}
 	literal := hostPort[1:closeBracket]
+	// Whatever follows the closing bracket must be just the optional port.
+	// The port grammar is RFC 3986's *DIGIT (an empty port after ':' parses
+	// the same way url.Parse accepts it today); anything else — a repeated
+	// bracket group, an extra ']', a non-numeric port or bytes between the
+	// ']' and the port — makes the bracket spelling illegal even though the
+	// leading literal itself is a valid IPv6 address.
+	if rest := hostPort[closeBracket+1:]; rest != "" {
+		port, ok := strings.CutPrefix(rest, ":")
+		if !ok || !allDigits(port) {
+			return failuref("invalid_config",
+				"%s: upstream bracketed host must be exactly one '[' ... ']' pair around a valid IPv6 address followed by an optional port, but found %q after ']'", label, rest)
+		}
+	}
 	// The zone delimiter is percent-encoded in the URL ("%25"); decode the
 	// literal's escapes once so netip sees "fe80::1%eth0" while every other
 	// byte keeps its original spelling.
@@ -493,6 +512,18 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 		return invalidBracketedHost(label, literal)
 	}
 	return nil
+}
+
+// allDigits reports whether s consists solely of ASCII digits. An empty
+// string counts as all digits, matching the RFC 3986 port production
+// (*DIGIT) and url.Parse's acceptance of a host followed by a bare ':'.
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // invalidBracketedHost builds the content error for a bracketed host whose
