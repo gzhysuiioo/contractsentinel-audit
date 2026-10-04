@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Check statuses recorded per rule in a report.
@@ -454,9 +455,95 @@ func ReportID(r Report) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// firstInvalidUTF8ByteIndex returns the byte index of the first byte of s that
+// is not valid UTF-8, or -1 when s is legal text.
+func firstInvalidUTF8ByteIndex(s string) int {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return i
+		}
+		i += size
+	}
+	return -1
+}
+
+// validateReportText checks every string carried by an in-memory report for
+// valid UTF-8. It is the object counterpart of the byte-level character gates
+// on JSON submissions (ParseAuditInput) and stored archives
+// (loadStoredReport): a Report constructed directly in Go crosses neither gate,
+// and json.Marshal — both when the id is recomputed and when the archive is
+// written — silently replaces an invalid byte with U+FFFD, so without this
+// check a note carrying 0xFF could be "successfully" saved while the archived
+// text differed from what the caller handed in, with the recomputed id still
+// matching the laundered content. Every string is checked, not just the rule
+// currently producing a defect: the id, artifact name and hash, the complete
+// rule definitions and status notes of 通过/未检查 rules as well, and every
+// binding field and evidence of findings. Array fields carry the 0-based
+// element position so the offending rule or finding is identifiable. fail is
+// errInvalid for submissions and errCorrupt for stored archives, as for every
+// other legality condition in validateReport.
+func validateReportText(r Report, fail func(string) error) error {
+	check := func(field, value string) error {
+		if i := firstInvalidUTF8ByteIndex(value); i >= 0 {
+			return fail(fmt.Sprintf("report contains invalid UTF-8 in field %s: invalid byte 0x%02x", field, value[i]))
+		}
+		return nil
+	}
+	if err := check("reportId", r.ReportID); err != nil {
+		return err
+	}
+	if err := check("artifact.name", r.Artifact.Name); err != nil {
+		return err
+	}
+	if err := check("artifact.hash", r.Artifact.Hash); err != nil {
+		return err
+	}
+	for i, rule := range r.Rules {
+		ruleFields := []struct {
+			name  string
+			value string
+		}{
+			{"id", rule.ID},
+			{"kind", rule.Kind},
+			{"severity", rule.Severity},
+			{"invariant", rule.Invariant},
+			{"version", rule.Version},
+			{"status", rule.Status},
+			{"note", rule.Note},
+		}
+		for _, f := range ruleFields {
+			if err := check(fmt.Sprintf("rules[%d].%s", i, f.name), f.value); err != nil {
+				return err
+			}
+		}
+	}
+	for i, finding := range r.Findings {
+		findingFields := []struct {
+			name  string
+			value string
+		}{
+			{"artifactHash", finding.ArtifactHash},
+			{"ruleId", finding.RuleID},
+			{"version", finding.Version},
+			{"severity", finding.Severity},
+			{"invariant", finding.Invariant},
+			{"evidence", finding.Evidence},
+		}
+		for _, f := range findingFields {
+			if err := check(fmt.Sprintf("findings[%d].%s", i, f.name), f.value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // validateReport checks every archive legality condition against r. It is the
-// single definition of a legal report: the id and artifact hash are 64
-// lowercase hex characters, the id matches the content, the artifact name is
+// single definition of a legal report: every carried string is valid UTF-8 (a
+// directly constructed object bypasses the JSON character gates, and
+// json.Marshal would otherwise rewrite a bad byte to U+FFFD before the id is
+// even recomputed), the id and artifact hash are 64 lowercase hex characters, the id matches the content, the artifact name is
 // present, rule ids are present and unique with non-empty versions, statuses
 // use the five recorded values, tool-missing and timeout notes are
 // non-blank, and 发现缺陷 rules correspond one-to-one with findings whose
@@ -465,6 +552,9 @@ func ReportID(r Report) string {
 // recomputed id never makes an invalid report legal. fail is errInvalid for
 // submissions and errCorrupt for stored archives.
 func validateReport(r Report, fail func(string) error) error {
+	if err := validateReportText(r, fail); err != nil {
+		return err
+	}
 	if !validReportID(r.ReportID) {
 		return fail("report id " + r.ReportID + " is not a 64-character lowercase hex string")
 	}
@@ -648,7 +738,9 @@ var saveReportHook func(finalPath string)
 // submissions succeed, different reports never overwrite each other, and
 // readers only ever observe complete files. A submission is fully validated
 // before any store operation, so an invalid report creates no store and no
-// files. A pre-existing file with the same id must be a valid archive of the
+// files: that includes a directly constructed report whose strings carry an
+// invalid UTF-8 byte, which json.Marshal would otherwise save rewritten to
+// U+FFFD. A pre-existing file with the same id must be a valid archive of the
 // same report; a corrupted archive makes the submission fail while keeping the
 // original file, even when the corruption appears only during the save. The
 // first successfully archived bytes are never replaced by later submissions.
