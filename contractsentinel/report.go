@@ -169,27 +169,23 @@ func validateFormalCheckStatuses(strict []byte) error {
 	return nil
 }
 
-// validateFormalRequiresABI checks the formal "requiresABI" member of every
-// strict rule definition. The strict rewrite dropped extension members, so the
-// value seen here is the agreed-spelling one alone. Decoding the member
+// firstNonBooleanFormalRequiresABI scans the strict rule array for the formal
+// "requiresABI" member under its agreed spelling and returns the location of
+// the first rule whose present value is not a JSON boolean. The strict rewrite
+// dropped extension members, so the value seen here is the agreed-spelling one
+// alone: a missing formal member (still meaning false) is skipped, while null,
+// a string, a number, an object or an array are reported. Decoding the member
 // straight into a Go bool would turn null into the zero value false: a rule
-// whose requirement was never actually stated would be recorded as not
-// needing an ABI, indistinguishable from an explicit false, and could even
-// produce a defect finding from a false invariant. When the formal member is
-// present its value must be the JSON boolean true or false — null, a string,
-// a number, an object or an array rejects the whole submission, whether or
-// not the artifact carries an ABI and whether or not the rule received any
-// check conclusion. An omitted member still means false. A case-variant or
-// whitespace-padded name is extension data and its value, null included,
-// never reaches this check; it can neither trigger the error nor rescue an
-// illegal formal value. The error names the rule so the offending entry is
-// identifiable.
-func validateFormalRequiresABI(strict []byte) error {
+// whose requirement was never actually stated would read as not needing an
+// ABI, indistinguishable from an explicit false, and could even produce a
+// defect finding from a false invariant. The returned location is "rule <id>"
+// when a readable non-empty id is present, otherwise just "rule".
+func firstNonBooleanFormalRequiresABI(strict []byte) (string, error) {
 	var top struct {
 		Rules []map[string]json.RawMessage `json:"rules"`
 	}
 	if err := json.Unmarshal(strict, &top); err != nil {
-		return errInvalid("invalid JSON: " + err.Error())
+		return "", err
 	}
 	for _, rule := range top.Rules {
 		where := "rule"
@@ -205,11 +201,32 @@ func validateFormalRequiresABI(strict []byte) error {
 		}
 		var token any
 		if err := json.Unmarshal(raw, &token); err != nil {
-			return errInvalid(where + ": requiresABI must be a boolean")
+			return where, nil
 		}
 		if _, isBool := token.(bool); !isBool {
-			return errInvalid(where + ": requiresABI must be a boolean")
+			return where, nil
 		}
+	}
+	return "", nil
+}
+
+// validateFormalRequiresABI checks the formal "requiresABI" member of every
+// strict rule definition in an audit submission. When the formal member is
+// present its value must be the JSON boolean true or false — null, a string,
+// a number, an object or an array rejects the whole submission, whether or
+// not the artifact carries an ABI and whether or not the rule received any
+// check conclusion. An omitted member still means false. A case-variant or
+// whitespace-padded name is extension data and its value, null included,
+// never reaches this check; it can neither trigger the error nor rescue an
+// illegal formal value. The error names the rule so the offending entry is
+// identifiable.
+func validateFormalRequiresABI(strict []byte) error {
+	where, err := firstNonBooleanFormalRequiresABI(strict)
+	if err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	if where != "" {
+		return errInvalid(where + ": requiresABI must be a boolean")
 	}
 	return nil
 }
@@ -743,6 +760,28 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	strict, err := strictReportJSON(data)
 	if err != nil {
 		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	// Read-side counterpart of the submission check in
+	// validateFormalRequiresABI, and deliberately ahead of the typed decode
+	// below: decoding strict straight into the ReportRule bools would accept
+	// a present null as the zero value false, so an archive that wrote null
+	// where the original rule stated no requirement would read back as an
+	// explicit false — the recomputed id and the rule/finding correspondence
+	// can all match the decoded content, hiding that the archive text is
+	// illegal. A string, number, object or array would make the typed decode
+	// fail with a generic unmarshal error that never names the rule, so they
+	// are checked here too. A present formal member must be the JSON boolean
+	// true or false in every rule, whatever the rule's check status or
+	// finding looks like; an omitted member still means false. Case variants
+	// and whitespace-padded names were dropped by the strict rewrite, so
+	// their values, null included, neither trigger this nor rescue the
+	// formal value.
+	where, err := firstNonBooleanFormalRequiresABI(strict)
+	if err != nil {
+		return Report{}, errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	if where != "" {
+		return Report{}, errCorrupt("report " + id + " archive is corrupt: " + where + ": requiresABI must be a boolean")
 	}
 	var r Report
 	if err := json.Unmarshal(strict, &r); err != nil {
