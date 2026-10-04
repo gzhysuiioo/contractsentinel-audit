@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Check statuses recorded per rule in a report.
@@ -553,6 +554,73 @@ func validSubmittedReport(r Report) error {
 	return validateReport(r, func(msg string) error { return errInvalid(msg) })
 }
 
+// firstInvalidUTF8ByteInString returns the first byte that is not valid UTF-8
+// inside s. A Go string can carry any bytes, including bytes no JSON text may
+// contain: json.Marshal (and therefore the canonical marshalling inside
+// ReportID) silently replaces such a byte with U+FFFD instead of failing, so
+// neither the id/content check nor the archive round trip can see it.
+func firstInvalidUTF8ByteInString(s string) (byte, bool) {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return s[i], true
+		}
+		i += size
+	}
+	return 0, false
+}
+
+// validateSubmittedText is the in-memory counterpart of the JSON character
+// gates in ParseAuditInput and loadStoredReport. SaveReport accepts a Report
+// built directly by a Go caller, whose strings never passed through JSON
+// decoding; encoding/json marshals such a value without an error while
+// replacing every invalid UTF-8 byte with U+FFFD, and ReportID computes from
+// the same rewritten canonical form, so the recomputed id and the
+// rule/finding correspondence would all match an archive whose text no
+// longer equals what the caller handed over. Every caller-supplied string is
+// therefore checked on the raw object — reportId, artifact name and hash,
+// each rule definition field and status note, and each finding binding field
+// and evidence — independently of which rules produced defects and of
+// whether the report carries any finding at all. The rejection is an input
+// error naming the exact field, with the array position of rules and
+// findings, and it runs before any filesystem operation.
+func validateSubmittedText(r Report) error {
+	check := func(field, value string) error {
+		if b, bad := firstInvalidUTF8ByteInString(value); bad {
+			return errInvalid(fmt.Sprintf("invalid UTF-8 byte 0x%02x in report field %s", b, field))
+		}
+		return nil
+	}
+	if err := check("reportId", r.ReportID); err != nil {
+		return err
+	}
+	if err := check("artifact.name", r.Artifact.Name); err != nil {
+		return err
+	}
+	if err := check("artifact.hash", r.Artifact.Hash); err != nil {
+		return err
+	}
+	ruleFields := []string{"id", "kind", "severity", "invariant", "version", "status", "note"}
+	for i, rule := range r.Rules {
+		values := []string{rule.ID, rule.Kind, rule.Severity, rule.Invariant, rule.Version, rule.Status, rule.Note}
+		for j, value := range values {
+			if err := check(fmt.Sprintf("rules[%d].%s", i, ruleFields[j]), value); err != nil {
+				return err
+			}
+		}
+	}
+	findingFields := []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}
+	for i, finding := range r.Findings {
+		values := []string{finding.ArtifactHash, finding.RuleID, finding.Version, finding.Severity, finding.Invariant, finding.Evidence}
+		for j, value := range values {
+			if err := check(fmt.Sprintf("findings[%d].%s", i, findingFields[j]), value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // duplicateArchiveError classifies an archive that repeats a JSON member as
 // corrupt and names the requested report id, the decoded member name and the
 // object carrying it (with array position and rule id when applicable).
@@ -648,11 +716,19 @@ var saveReportHook func(finalPath string)
 // submissions succeed, different reports never overwrite each other, and
 // readers only ever observe complete files. A submission is fully validated
 // before any store operation, so an invalid report creates no store and no
-// files. A pre-existing file with the same id must be a valid archive of the
-// same report; a corrupted archive makes the submission fail while keeping the
-// original file, even when the corruption appears only during the save. The
-// first successfully archived bytes are never replaced by later submissions.
+// files. Every string in a directly constructed report must be valid UTF-8:
+// json.Marshal would otherwise rewrite an invalid byte to U+FFFD while the
+// content-addressed id matched the rewritten copy, reporting success for an
+// archive whose text differs from the caller's; such a report is rejected as
+// an input error before the store directory is touched. A pre-existing file
+// with the same id must be a valid archive of the same report; a corrupted
+// archive makes the submission fail while keeping the original file, even
+// when the corruption appears only during the save. The first successfully
+// archived bytes are never replaced by later submissions.
 func SaveReport(dir string, r Report) error {
+	if err := validateSubmittedText(r); err != nil {
+		return err
+	}
 	if err := validSubmittedReport(r); err != nil {
 		return err
 	}
