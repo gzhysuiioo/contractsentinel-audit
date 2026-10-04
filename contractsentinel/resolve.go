@@ -40,19 +40,6 @@ type QueryTransform struct {
 	To    string `json:"to"`
 }
 
-// routeJSON mirrors Route but keeps every field raw: the basic fields are
-// type-checked in Config.UnmarshalJSON with the route's position (and, when
-// available, its id), so a wrong field type is reported on that route rather
-// than as a generic JSON decode error, and queryTransforms can surface
-// null, wrong types and malformed rules the same way.
-type routeJSON struct {
-	ID              json.RawMessage `json:"id"`
-	Methods         json.RawMessage `json:"methods"`
-	PathPrefix      json.RawMessage `json:"pathPrefix"`
-	Upstream        json.RawMessage `json:"upstream"`
-	QueryTransforms json.RawMessage `json:"queryTransforms"`
-}
-
 // decodeRoute type-checks and decodes one raw route object. loc is the
 // route's 1-based location in its config (e.g. "route 2"). The element's JSON
 // type is checked first: a null entry or any non-object value fails on the
@@ -69,8 +56,11 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 		return Route{}, failuref("invalid_config",
 			"%s: route entry must be an object, got %s", loc, jsonTypeName(elem))
 	}
-	var rj routeJSON
-	if err := json.Unmarshal(elem, &rj); err != nil {
+	// Decode the object as a raw field map rather than a typed struct so the
+	// id can be type-checked first and identify errors on later fields
+	// regardless of the object's key order.
+	fields, err := jsonObject(elem)
+	if err != nil {
 		// The element already parsed as one JSON value and starts with '{';
 		// an object that cannot be read is a syntax failure rather than a
 		// field type error.
@@ -83,7 +73,7 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 	// string becomes the label; a wrong-typed id is reported against the id
 	// field and never rendered (e.g. as a number or object) as the route's
 	// identity.
-	if f := decodeStringField(rj.ID, loc, "id", &route.ID); f != nil {
+	if f := decodeStringField(fields["id"], loc, "id", &route.ID); f != nil {
 		return Route{}, f
 	}
 	label := loc
@@ -91,27 +81,25 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 		label = routeLabel(loc, route.ID)
 	}
 
-	if f := decodeMethodsField(rj.Methods, label, &route.Methods); f != nil {
+	if f := decodeMethodsField(fields["methods"], label, &route.Methods); f != nil {
 		return Route{}, f
 	}
-	if f := decodeStringField(rj.PathPrefix, label, "pathPrefix", &route.PathPrefix); f != nil {
+	if f := decodeStringField(fields["pathPrefix"], label, "pathPrefix", &route.PathPrefix); f != nil {
 		return Route{}, f
 	}
-	if f := decodeStringField(rj.Upstream, label, "upstream", &route.Upstream); f != nil {
+	if f := decodeStringField(fields["upstream"], label, "upstream", &route.Upstream); f != nil {
 		return Route{}, f
 	}
-	route.queryTransformsRaw = rj.QueryTransforms
+	route.queryTransformsRaw = fields["queryTransforms"]
 	return route, nil
 }
 
-// decodeStringField type-checks a raw route field that must hold a string.
-// An absent field is left as the zero value for later required-field
-// validation; null or any non-string JSON value fails here.
+// decodeStringField type-checks a raw route field that must hold a string,
+// using the shared jsonStringField check. An absent field is left as the zero
+// value for later required-field validation; null or any non-string JSON
+// value fails here, located at the route's label.
 func decodeStringField(raw json.RawMessage, label, field string, dst *string) *Failure {
-	if len(raw) == 0 {
-		return nil
-	}
-	if !jsonString(raw, dst) {
+	if _, ok := jsonStringField(raw, dst); !ok {
 		return failuref("invalid_config", "%s: %s must be a string", label, field)
 	}
 	return nil
@@ -129,14 +117,14 @@ func decodeMethodsField(raw json.RawMessage, label string, dst *[]string) *Failu
 	if string(body) == "null" || len(body) == 0 || body[0] != '[' {
 		return failuref("invalid_config", "%s: methods must be an array of strings", label)
 	}
-	var elems []json.RawMessage
-	if err := json.Unmarshal(body, &elems); err != nil {
+	elems, err := jsonArray(body)
+	if err != nil {
 		return failuref("invalid_config", "%s: methods must be an array of strings", label)
 	}
 	methods := make([]string, 0, len(elems))
 	for i, elem := range elems {
 		var m string
-		if !jsonString(bytes.TrimSpace(elem), &m) {
+		if _, ok := jsonStringField(bytes.TrimSpace(elem), &m); !ok {
 			return failuref("invalid_config", "%s: methods entry %d must be a string", label, i+1)
 		}
 		methods = append(methods, m)
@@ -149,12 +137,12 @@ func decodeMethodsField(raw json.RawMessage, label string, dst *[]string) *Failu
 // of one route. loc identifies the route; rule errors additionally carry a
 // 1-based rule index.
 func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransform, *Failure) {
-	body := strings.TrimSpace(string(raw))
-	if body == "null" {
+	body := bytes.TrimSpace(raw)
+	if string(body) == "null" {
 		return nil, failuref("invalid_config", "%s: queryTransforms must not be null", routeLabel(loc, id))
 	}
-	var elems []json.RawMessage
-	if err := json.Unmarshal([]byte(body), &elems); err != nil {
+	elems, err := jsonArray(body)
+	if err != nil {
 		return nil, failuref("invalid_config", "%s: queryTransforms must be an array", routeLabel(loc, id))
 	}
 	transforms := make([]*QueryTransform, 0, len(elems))
@@ -163,29 +151,33 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 		if string(bytes.TrimSpace(elem)) == "null" {
 			return nil, failuref("invalid_config", "%s: rule must not be null", ruleLoc)
 		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(elem, &fields); err != nil {
+		fields, err := jsonObject(elem)
+		if err != nil {
 			return nil, failuref("invalid_config", "%s: rule must be a JSON object", ruleLoc)
 		}
 
 		qt := &QueryTransform{}
-		opRaw, ok := fields["op"]
-		switch {
-		case !ok:
+		opRaw, hasOp := fields["op"]
+		if !hasOp {
 			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
-		case !jsonString(opRaw, &qt.Op):
+		}
+		if _, ok := jsonStringField(opRaw, &qt.Op); !ok {
 			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
-		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename":
+		}
+		if qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename" {
 			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove and rename are supported)", ruleLoc, qt.Op)
 		}
 
-		nameRaw, ok := fields["name"]
-		switch {
-		case !ok:
+		// name is required and must be a non-empty string; a missing key is a
+		// content error while null or another type is a field type error.
+		nameRaw, hasName := fields["name"]
+		if !hasName {
 			return nil, failuref("invalid_config", "%s: name is required", ruleLoc)
-		case !jsonString(nameRaw, &qt.Name):
+		}
+		if _, ok := jsonStringField(nameRaw, &qt.Name); !ok {
 			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
-		case qt.Name == "":
+		}
+		if qt.Name == "" {
 			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
 		}
 
@@ -196,7 +188,7 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			if !hasValue {
 				return nil, failuref("invalid_config", "%s: set requires a string value", ruleLoc)
 			}
-			if !jsonString(valueRaw, &qt.Value) {
+			if _, ok := jsonStringField(valueRaw, &qt.Value); !ok {
 				return nil, failuref("invalid_config", "%s: value must be a string", ruleLoc)
 			}
 		case "remove":
@@ -207,27 +199,19 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			if hasValue {
 				return nil, failuref("invalid_config", "%s: rename must not include a value", ruleLoc)
 			}
-			switch {
-			case !hasTo:
+			if !hasTo {
 				return nil, failuref("invalid_config", "%s: rename requires a non-empty string to", ruleLoc)
-			case !jsonString(toRaw, &qt.To):
+			}
+			if _, ok := jsonStringField(toRaw, &qt.To); !ok {
 				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			case qt.To == "":
+			}
+			if qt.To == "" {
 				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
 			}
 		}
 		transforms = append(transforms, qt)
 	}
 	return transforms, nil
-}
-
-// jsonString decodes raw into s and reports whether raw is a JSON string
-// (null, numbers, objects and arrays fail).
-func jsonString(raw json.RawMessage, s *string) bool {
-	if len(raw) == 0 || raw[0] != '"' {
-		return false
-	}
-	return json.Unmarshal(raw, s) == nil
 }
 
 // routeLabel renders the human-readable route location, adding the id when
@@ -265,28 +249,28 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 	// then is a wrong shape a structural error rather than a parse failure.
 	// This mirrors ParseRequest: broken syntax (including an empty file and a
 	// corrupt first route) stays a parse error with no guessed position.
-	var doc json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	doc, err := jsonValue(data)
+	if err != nil {
 		return err
 	}
 	body := bytes.TrimSpace(doc)
 	if body[0] != '{' {
 		return failuref("invalid_config", "config must be a JSON object, got %s", jsonTypeName(body))
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
+	fields, err := jsonObject(body)
+	if err != nil {
 		return err
 	}
 
 	var rawRoutes []json.RawMessage
 	if raw, ok := fields["routes"]; ok {
-		body := bytes.TrimSpace(raw)
-		if len(body) == 0 || body[0] != '[' {
+		routesBody := bytes.TrimSpace(raw)
+		if len(routesBody) == 0 || routesBody[0] != '[' {
 			// null is a type error here, never an absent field: a config
 			// that explicitly supplies routes must supply an array.
-			return failuref("invalid_config", "routes must be an array, got %s", jsonTypeName(body))
+			return failuref("invalid_config", "routes must be an array, got %s", jsonTypeName(routesBody))
 		}
-		if err := json.Unmarshal(body, &rawRoutes); err != nil {
+		if rawRoutes, err = jsonArray(routesBody); err != nil {
 			return err
 		}
 	}
@@ -542,14 +526,6 @@ func invalidBracketedHostShape(label, suffix string) *Failure {
 		"%s: upstream bracketed host must be a single '[' IPv6 address ']' pair followed only by an optional port, but %q follows the closing ']'", label, suffix)
 }
 
-// requestJSON mirrors Request but keeps method and target raw, so a valid
-// JSON document whose fields merely have the wrong JSON type is reported on
-// the offending field instead of as a generic JSON decode error.
-type requestJSON struct {
-	Method json.RawMessage `json:"method"`
-	Target json.RawMessage `json:"target"`
-}
-
 // ParseRequest parses and validates one JSON request. Three failure shapes are
 // kept apart: a document whose JSON syntax is broken fails as a parse failure
 // without guessing a field; a syntactically valid non-object document (array,
@@ -561,8 +537,8 @@ type requestJSON struct {
 // (required method, legal token, absolute target without a fragment or a bad
 // percent escape) validated, so an empty string stays a content error.
 func ParseRequest(data []byte) (*Request, *Failure) {
-	var doc json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	doc, err := jsonValue(data)
+	if err != nil {
 		return nil, failuref("invalid_request", "request is not valid JSON: %v", err)
 	}
 	body := bytes.TrimSpace(doc)
@@ -570,8 +546,10 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 		return nil, failuref("invalid_request", "request must be a JSON object")
 	}
 
-	var rj requestJSON
-	if err := json.Unmarshal(body, &rj); err != nil {
+	// Decode as a raw field map so method is always type-checked before
+	// target, no matter which key was written first.
+	fields, err := jsonObject(body)
+	if err != nil {
 		// The document already parsed as one JSON value and starts with '{';
 		// keep this as a parse failure rather than a field error if the object
 		// itself cannot be read.
@@ -579,10 +557,10 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 	}
 
 	var req Request
-	if f := decodeRequestStringField(rj.Method, "method", &req.Method); f != nil {
+	if f := decodeRequestStringField(fields["method"], "method", &req.Method); f != nil {
 		return nil, f
 	}
-	if f := decodeRequestStringField(rj.Target, "target", &req.Target); f != nil {
+	if f := decodeRequestStringField(fields["target"], "target", &req.Target); f != nil {
 		return nil, f
 	}
 
@@ -604,38 +582,15 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 }
 
 // decodeRequestStringField type-checks one request field that must hold a
-// string. An absent field (no such key) is left as the zero value so the
-// later content checks keep their "field is required" behavior; null or any
-// non-string JSON value is a type error that names the field and the JSON
-// type that was actually supplied.
+// string, using the shared jsonStringField check. An absent field (no such
+// key) is left as the zero value so the later content checks keep their
+// "field is required" behavior; null or any non-string JSON value is a type
+// error that names the field and the JSON type that was actually supplied.
 func decodeRequestStringField(raw json.RawMessage, field string, dst *string) *Failure {
-	if len(raw) == 0 {
-		return nil
+	if got, ok := jsonStringField(raw, dst); !ok {
+		return failuref("invalid_request", "%s must be a string, got %s", field, got)
 	}
-	if jsonString(raw, dst) {
-		return nil
-	}
-	return failuref("invalid_request", "%s must be a string, got %s", field, jsonTypeName(raw))
-}
-
-// jsonTypeName names the JSON type of a syntactically valid raw value, in the
-// terms the request error reasons use: "null", "a boolean", "a number",
-// "a string", "an array" or "an object".
-func jsonTypeName(raw json.RawMessage) string {
-	switch bytes.TrimSpace(raw)[0] {
-	case 'n':
-		return "null"
-	case 't', 'f':
-		return "a boolean"
-	case '"':
-		return "a string"
-	case '[':
-		return "an array"
-	case '{':
-		return "an object"
-	default:
-		return "a number"
-	}
+	return nil
 }
 
 // Resolve matches a validated request against a validated configuration and
