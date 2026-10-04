@@ -226,6 +226,124 @@ func TestResolveJunctionSlashCollapse(t *testing.T) {
 	}
 }
 
+func TestResolveEncodedBasePathJoin(t *testing.T) {
+	// The upstream base path is sliced out of the raw configured URL and the
+	// remainder is appended with exactly one slash at the junction. Encoded
+	// slashes (both cases), the userinfo encoding, the IPv6 brackets and the
+	// port are content that must survive byte for byte; only the run where
+	// the base path's trailing slashes meet the remainder's leading slashes
+	// collapses. None of these routes defines queryTransforms, so the raw
+	// query is preserved verbatim.
+	cfg := mustConfig(t, `{
+	  "routes": [
+	    {"id": "enc",  "methods": ["GET"], "pathPrefix": "/api", "upstream": "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f///"},
+	    {"id": "dots", "methods": ["GET"], "pathPrefix": "/d",   "upstream": "http://dots.internal/a/./b/../c//"},
+	    {"id": "root", "methods": ["*"],   "pathPrefix": "/",    "upstream": "https://root.internal/v%2f//base%2f///"}
+	  ]
+	}`)
+
+	cases := []struct {
+		name     string
+		request  string
+		routeID  string
+		upstream string
+	}{
+		{
+			name:     "encoded base path, userinfo, IPv6 and port survive the join",
+			request:  `{"method":"GET","target":"/api//%2F/x//y/?a=1&a=&flag"}`,
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/%2F/x//y/?a=1&a=&flag",
+		},
+		{
+			name:     "exact prefix keeps the encoded base path and one junction slash",
+			request:  `{"method":"GET","target":"/api"}`,
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/",
+		},
+		{
+			name:     "exact prefix with empty query keeps the bare question mark",
+			request:  `{"method":"GET","target":"/api?"}`,
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/?",
+		},
+		{
+			name:     "no query string stays distinct from an empty one",
+			request:  `{"method":"GET","target":"/api/x"}`,
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/x",
+		},
+		{
+			name:     "duplicate, empty and valueless parameters stay as written",
+			request:  `{"method":"GET","target":"/api/p?b=1&b=&flag&b=2&c=%2f"}`,
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/p?b=1&b=&flag&b=2&c=%2f",
+		},
+		{
+			name:     "root prefix with root target keeps encoded base and junction slash",
+			request:  `{"method":"GET","target":"/"}`,
+			routeID:  "root",
+			upstream: "https://root.internal/v%2f//base%2f/",
+		},
+		{
+			name:     "dot segments in the base path are never resolved",
+			request:  `{"method":"GET","target":"/d/x"}`,
+			routeID:  "dots",
+			upstream: "http://dots.internal/a/./b/../c/x",
+		},
+		{
+			name:     "exact prefix on a dot-segment base keeps the trailing junction slash",
+			request:  `{"method":"GET","target":"/d"}`,
+			routeID:  "dots",
+			upstream: "http://dots.internal/a/./b/../c/",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := resolveJSON(t, cfg, tc.request)
+			if res.RouteID != tc.routeID {
+				t.Errorf("routeId = %q, want %q", res.RouteID, tc.routeID)
+			}
+			if res.UpstreamURL != tc.upstream {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.upstream)
+			}
+		})
+	}
+}
+
+func TestInvalidConfigUpstreamPercentEscape(t *testing.T) {
+	// A malformed percent escape anywhere in the upstream URL rejects the
+	// whole configuration as invalid_config, and the reason locates the
+	// offending route by position and id even when an earlier route is fine.
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"bad hex in path", "http://h.internal/base%zz/x"},
+		{"truncated escape at end of path", "http://h.internal/base%2"},
+		{"lone percent in path", "http://h.internal/base%/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+			  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + tc.upstream + `"}
+			]}`
+			_, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream"} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+		})
+	}
+}
+
 func TestResolveSegmentBoundary(t *testing.T) {
 	cfg := mustConfig(t, sampleConfig)
 

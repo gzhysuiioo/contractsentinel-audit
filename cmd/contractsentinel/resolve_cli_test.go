@@ -725,6 +725,101 @@ func TestResolveCLIConfigShapeErrors(t *testing.T) {
 	}
 }
 
+// TestResolveCLIEncodedBasePathJoin drives the encoded-base-path join the way
+// a user does: the upstream carries a percent-encoded userinfo, an IPv6 host
+// with brackets, a port and a base path with encoded slashes and trailing
+// slash runs. Only the junction run collapses to one slash; every other byte
+// of the configured upstream and the request target must reach upstreamURL
+// unchanged. The routes define no queryTransforms, so the raw query (empty
+// question mark included) is preserved verbatim. Everything runs offline:
+// the upstream hosts never need to exist.
+func TestResolveCLIEncodedBasePathJoin(t *testing.T) {
+	config := `{
+	  "routes": [
+	    {"id": "enc",  "methods": ["GET"], "pathPrefix": "/api", "upstream": "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f///"},
+	    {"id": "root", "methods": ["*"],   "pathPrefix": "/",    "upstream": "https://root.internal/v%2f//base%2f///"}
+	  ]
+	}`
+	cases := []struct {
+		name     string
+		target   string
+		routeID  string
+		upstream string
+	}{
+		{
+			name:     "junction collapse leaves encoded content byte for byte",
+			target:   "/api//%2F/x//y/?a=1&a=&flag",
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/%2F/x//y/?a=1&a=&flag",
+		},
+		{
+			name:     "request equal to the prefix keeps encoded base and one slash",
+			target:   "/api",
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/",
+		},
+		{
+			name:     "empty question mark stays distinct from no query",
+			target:   "/api?",
+			routeID:  "enc",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f//base%2f/?",
+		},
+		{
+			name:     "root prefix receiving the root path keeps the encoded base",
+			target:   "/",
+			routeID:  "root",
+			upstream: "https://root.internal/v%2f//base%2f/",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := `{"method":"GET","target":"` + tc.target + `"}`
+			success := assertResolveSuccess(t, runResolveCLI(t, config, request))
+			if success.RouteID != tc.routeID {
+				t.Errorf("routeId = %q, want %q", success.RouteID, tc.routeID)
+			}
+			if success.UpstreamURL != tc.upstream {
+				t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, tc.upstream)
+			}
+		})
+	}
+}
+
+// TestResolveCLIInvalidUpstreamEscapeRejectsConfig rejects a config whose
+// second route carries an invalid percent escape in its upstream path, even
+// though the request would hit the valid first route: the exit status is
+// non-zero, stdout stays completely empty and stderr holds one JSON error
+// whose reason locates the offending route by position and id.
+func TestResolveCLIInvalidUpstreamEscapeRejectsConfig(t *testing.T) {
+	config := `{
+	  "routes": [
+	    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+	    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "http://admin.internal/base%zz"}
+	  ]
+	}`
+	res := runResolveCLI(t, config, cliSuccessRequest)
+
+	if res.exitCode == 0 {
+		t.Fatalf("exit code = 0, want non-zero")
+	}
+	if len(res.stdout) != 0 {
+		t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+	}
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Errorf("code = %q, want invalid_config", fail.Code)
+	}
+	for _, want := range []string{"route 2", `"admin"`, "upstream"} {
+		if !strings.Contains(fail.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+		}
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not
