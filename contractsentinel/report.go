@@ -173,13 +173,21 @@ func validateFormalCheckStatuses(strict []byte) error {
 // object in the submission that repeats a member name rejects the whole
 // submission: the decoder keeps only the last value silently, so a repeated
 // invariant key would choose a conclusion by member order instead of giving
-// one trustworthy result. Only the fixed fields under their agreed spelling
-// participate: case variants and whitespace-padded names are extension data
-// and are ignored, so they can neither override a formal value nor supply one
-// when the formal member is missing or unsupported. Invariant names are not
-// fixed fields — they are user-defined, compared case sensitively and never
-// trimmed.
+// one trustworthy result. A character the decoder would silently rewrite — an
+// invalid UTF-8 byte, or an unpaired or wrongly ordered surrogate escape in
+// any member name or string value, including values nested under unknown
+// extension members — rejects the whole submission as an input error before
+// any content is hashed, so evidence and hashes always reflect the submitted
+// bytes rather than a U+FFFD-rewritten copy. Only the fixed fields under their
+// agreed spelling participate: case variants and whitespace-padded names are
+// extension data and are ignored, so they can neither override a formal value
+// nor supply one when the formal member is missing or unsupported. Invariant
+// names are not fixed fields — they are user-defined, compared case
+// sensitively and never trimmed.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
+	if charErr := validateJSONCharacters(data); charErr != nil {
+		return Artifact{}, nil, nil, nil, errInvalid(charErr.Error())
+	}
 	if dup := findDuplicateJSONMember(data); dup != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(duplicateMemberMessage(data, dup))
 	}

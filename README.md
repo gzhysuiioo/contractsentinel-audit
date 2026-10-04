@@ -229,6 +229,20 @@ go run ./cmd/contractsentinel report \
    audit failed: rule reentrancy-guard: both a check record and an invariant value are provided
    ```
 
+4. **提交内容含非法字符。** 出于正确性，程序**不会**删除或替换坏字符后继续处理：
+
+   - JSON 字符串（成员名称或任何字符串值，即使只出现在不参与报告的未知扩展成员及其嵌套内容里）含有**非法 UTF-8 字节**；
+   - JSON 的 `\uXXXX` Unicode 转义里出现**未配对的高/低代理项**，或**配对顺序错误**（低代理项在前）。
+
+   否则这两类字节都会被解码器静默改写成 U+FFFD：缺陷 `note` 的证据会变成与提交原文不符的文字，`source` 等字段被改写还会改变参与产物哈希计算的内容。命中时整份拒绝，stderr 说明是字符编码还是 Unicode 转义问题并给出字节偏移、行列与 JSON 路径，方便修正原始内容：
+
+   ```text
+   audit failed: invalid Unicode escape: unpaired high surrogate escape \uD800 in JSON string value at .checks[0].note (byte offset 535, line 24, column 19)
+   audit failed: invalid character encoding: invalid UTF-8 byte 0xff in JSON string value at .artifact.source (byte offset 135, line 6, column 31)
+   ```
+
+   合法字符不受影响：中文、换行、前后空格、正确成对的代理转义（如 `😀`）与直接书写的同一字符都可使用，`note`/证据保留解码后的原文，两种写法的产物哈希与报告标识一致；原文中本就存在的 U+FFFD 只是普通字符，`"\\uD800"`（转义反斜线后跟 `uD800`）也只是普通文本，不会被误判。
+
 此外，记录引用了 `rules` 中不存在的规则、同一规则出现多条 checks 记录、`status` 写成 `未检查` 等未知值（`unknown status …`）、或三种需要说明的状态给了空白说明（`note is required for status …`），同样整份拒绝。
 
 ## 比较两份已保存的报告（diff）
