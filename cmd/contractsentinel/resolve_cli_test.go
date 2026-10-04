@@ -997,3 +997,150 @@ func TestResolveCLIRouteConflict(t *testing.T) {
 		t.Errorf("candidates = %v, want %v (sorted, wildcard excluded)", fail.Candidates, wantCandidates)
 	}
 }
+
+// specialNameSetConfig is a single root route carrying one set rule; the
+// rule's name and value are supplied as literal JSON so they may contain
+// '&', '=', '%' and '+' directly.
+func specialNameSetConfig(rule string) string {
+	return `{"routes":[{"id":"root","methods":["*"],"pathPrefix":"/",` +
+		`"upstream":"http://h.internal/base","queryTransforms":[` + rule + `]}]}`
+}
+
+// TestResolveCLISetSpecialNameExample drives the headline set behavior at the
+// command boundary, fully offline (the upstream host is never contacted):
+// the configured name "a&b=c" and value "x&y=z" are literals; only raw '&'
+// characters split the request query and the first raw '=' splits a fragment,
+// so the percent-encoded '&' and '=' in a name never create extra parameters.
+// Both source spellings merge at the first hit's position and every other
+// fragment (including the empty one) keeps its bytes and order.
+func TestResolveCLISetSpecialNameExample(t *testing.T) {
+	config := specialNameSetConfig(`{"op":"set","name":"a&b=c","value":"x&y=z"}`)
+	request := `{"method":"GET","target":"/p?keep=%2f+&a%26b%3dc=1&&a%26b%3Dc=2&tail="}`
+
+	success := assertResolveSuccess(t, runResolveCLI(t, config, request))
+	if success.RouteID != "root" {
+		t.Errorf("routeId = %q, want root", success.RouteID)
+	}
+	wantURL := "http://h.internal/base/p?keep=%2f+&a%26b%3Dc=x%26y%3Dz&&tail="
+	if success.UpstreamURL != wantURL {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, wantURL)
+	}
+}
+
+// TestResolveCLISetNameMatchingAndDecoding covers literal name matching and
+// single-pass decoding at the command boundary: encoded '&'/'=' stay inside a
+// name, percent escapes decode exactly once, raw '+' is a space while a
+// decoded '+' stays a literal plus, and an absent special name is appended at
+// the end (trailing empty fragments kept).
+func TestResolveCLISetNameMatchingAndDecoding(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    string
+		target  string
+		wantURL string
+	}{
+		{
+			name:    "encoded ampersand and equals do not split the name",
+			rule:    `{"op":"set","name":"a&b=c","value":"x&y=z"}`,
+			target:  "/p?a%26b%3dc=1&mid=2&a%26b%3Dc=3&end",
+			wantURL: "http://h.internal/base/p?a%26b%3Dc=x%26y%3Dz&mid=2&end",
+		},
+		{
+			name:    "literal percent twenty six matches only the double escaped name",
+			rule:    `{"op":"set","name":"%26","value":"z"}`,
+			target:  "/p?%26=1&%2526=2",
+			wantURL: "http://h.internal/base/p?%26=1&%2526=z",
+		},
+		{
+			name:    "literal ampersand matches only the single escaped name",
+			rule:    `{"op":"set","name":"&","value":"z"}`,
+			target:  "/p?%26=1&%2526=2",
+			wantURL: "http://h.internal/base/p?%26=z&%2526=2",
+		},
+		{
+			name:    "literal plus matches encoded plus only, not space spellings",
+			rule:    `{"op":"set","name":"a+b","value":"z"}`,
+			target:  "/p?a%2Bb=1&a+b=2&a%20b=3",
+			wantURL: "http://h.internal/base/p?a%2Bb=z&a+b=2&a%20b=3",
+		},
+		{
+			name:    "raw plus is a space and merges with the percent space spelling",
+			rule:    `{"op":"set","name":"a b","value":"z"}`,
+			target:  "/p?a+b=1&a%20b=2&a%2Bb=3",
+			wantURL: "http://h.internal/base/p?a%20b=z&a%2Bb=3",
+		},
+		{
+			name:    "absent special name appends after a trailing empty fragment",
+			rule:    `{"op":"set","name":"a&b","value":"z"}`,
+			target:  "/p?keep=1&",
+			wantURL: "http://h.internal/base/p?keep=1&&a%26b=z",
+		},
+		{
+			name:    "raw empty fragment never matches a special name",
+			rule:    `{"op":"set","name":"&","value":"z"}`,
+			target:  "/p?x=1&&y=2",
+			wantURL: "http://h.internal/base/p?x=1&&y=2&%26=z",
+		},
+		{
+			name:    "special name absent with no query creates the query",
+			rule:    `{"op":"set","name":"a&b=c","value":"x&y=z"}`,
+			target:  "/p",
+			wantURL: "http://h.internal/base/p?a%26b%3Dc=x%26y%3Dz",
+		},
+		{
+			name:    "value containing plus encodes the literal plus",
+			rule:    `{"op":"set","name":"a&b","value":"p+q=r"}`,
+			target:  "/p?a%26b=1",
+			wantURL: "http://h.internal/base/p?a%26b=p%2Bq%3Dr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := `{"method":"GET","target":"` + tc.target + `"}`
+			success := assertResolveSuccess(t, runResolveCLI(t, specialNameSetConfig(tc.rule), request))
+			if success.RouteID != "root" {
+				t.Errorf("routeId = %q, want root", success.RouteID)
+			}
+			if success.UpstreamURL != tc.wantURL {
+				t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, tc.wantURL)
+			}
+		})
+	}
+}
+
+// TestResolveCLISetInvalidEscapeIsInvalidRequest guarantees at the command
+// boundary that a malformed percent escape in the request fails the whole
+// resolution even when the bad fragment is the very parameter the set rule
+// would replace. The command exits non-zero, leaves stdout empty (no partial
+// upstreamURL) and emits one invalid_request error on stderr.
+func TestResolveCLISetInvalidEscapeIsInvalidRequest(t *testing.T) {
+	config := specialNameSetConfig(`{"op":"set","name":"a&b=c","value":"x&y=z"}`)
+	for _, target := range []string{
+		"/p?a%26b%3dc=1%zz",        // bad escape in the hit parameter's value
+		"/p?a%26b%3d%zz=1",         // bad escape inside the hit parameter's name
+		"/p?a%26b%3dc=1&tail=%",    // lone percent after the hit
+		"/p?keep=%2f+&a%zz=1&x=2",  // bad escape in an unrelated parameter
+	} {
+		t.Run(target, func(t *testing.T) {
+			request := `{"method":"GET","target":"` + target + `"}`
+			res := runResolveCLI(t, config, request)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", fail.Code)
+			}
+			if !strings.Contains(fail.Reason, "percent escape") {
+				t.Fatalf("reason = %q, want an invalid percent escape reason", fail.Reason)
+			}
+		})
+	}
+}
