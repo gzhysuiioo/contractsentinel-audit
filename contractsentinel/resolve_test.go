@@ -1214,3 +1214,120 @@ func TestFailureJSONShape(t *testing.T) {
 		t.Fatalf("unexpected json: %s", out)
 	}
 }
+
+func TestInvalidConfigBracketedUpstreamHost(t *testing.T) {
+	// Square brackets delimit an IP literal, so their content must be a legal
+	// IPv6 address: an ordinary name, a bare IPv4 address, empty brackets or a
+	// malformed address all reject the whole configuration as invalid_config.
+	// The reason names the route position, the id and the upstream field and
+	// states the bracket content is not a valid IPv6 address; it is never
+	// reported as broken JSON syntax.
+	cases := []struct {
+		name     string
+		upstream string
+		literal  string
+	}{
+		{"ordinary name in brackets", "http://[not-an-ip]/v1", "not-an-ip"},
+		{"bare ipv4 address in brackets", "http://[127.0.0.1]:8080/v1", "127.0.0.1"},
+		{"empty brackets", "http://[]/v1", ""},
+		{"non hex group", "http://[2001:db8::g]/v1", "2001:db8::g"},
+		{"too many groups", "http://[1:2:3:4:5:6:7:8:9]/v1", "1:2:3:4:5:6:7:8:9"},
+		{"malformed percent escape inside brackets", "http://[fe80::1%zz]/v1", "fe80::1%zz"},
+		{"unterminated bracket around a name", "http://[not-ip/v1", "not-ip"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"v6","methods":["GET"],"pathPrefix":"/api","upstream":"` + tc.upstream + `"}]}`
+			_, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 1", `"v6"`, "upstream", "is not a valid IPv6 address", `"` + tc.literal + `"`} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("bad IPv6 content must not be reported as broken JSON: %q", f.Reason)
+			}
+		})
+	}
+
+	// A bracket payload on a later route rejects the whole configuration even
+	// when the request would only ever hit the valid first route, and the
+	// reason locates that later route by position and id.
+	src := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"bad","methods":["GET"],"pathPrefix":"/admin","upstream":"http://[127.0.0.1]:8080/v1"}
+	]}`
+	_, f := ParseConfig([]byte(src))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got %+v, want invalid_config for the later route", f)
+	}
+	for _, want := range []string{"route 2", `"bad"`, "upstream", "is not a valid IPv6 address"} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+}
+
+func TestResolveValidIPv6Upstreams(t *testing.T) {
+	// Legal IPv6 hosts must keep working through the stricter check: full and
+	// compressed spellings, an IPv4 tail, a port, percent-encoded userinfo
+	// and an encoded zone id are all accepted, and the configured spelling is
+	// carried into upstreamURL byte for byte (joining and the raw query work
+	// exactly as for any other host).
+	cases := []struct {
+		name     string
+		upstream string
+		want     string
+	}{
+		{"full spelling", "http://[2001:0db8:0000:0000:0000:0000:0000:0001]/v1",
+			"http://[2001:0db8:0000:0000:0000:0000:0000:0001]/v1/orders?a=1&a="},
+		{"compressed spelling", "http://[2001:db8::1]/v1",
+			"http://[2001:db8::1]/v1/orders?a=1&a="},
+		{"ipv4 tail", "http://[2001:db8::192.0.2.1]/v1",
+			"http://[2001:db8::192.0.2.1]/v1/orders?a=1&a="},
+		{"ipv4 mapped tail", "http://[::ffff:192.0.2.1]/v1",
+			"http://[::ffff:192.0.2.1]/v1/orders?a=1&a="},
+		{"port and encoded userinfo", "https://user:p%40ss@[2001:db8::1]:8443/v%2f",
+			"https://user:p%40ss@[2001:db8::1]:8443/v%2f/orders?a=1&a="},
+		{"encoded zone id keeps original spelling", "https://[fe80::1%25eth0]/base",
+			"https://[fe80::1%25eth0]/base/orders?a=1&a="},
+		{"zone id and port", "http://[fe80::1%25eth0]:8080/base",
+			"http://[fe80::1%25eth0]:8080/base/orders?a=1&a="},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"v6","methods":["GET"],"pathPrefix":"/api","upstream":"` + tc.upstream + `"}]}`
+			cfg := mustConfig(t, src)
+			res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/orders?a=1&a="}`)
+			if res.RouteID != "v6" {
+				t.Errorf("routeId = %q, want v6", res.RouteID)
+			}
+			if res.UpstreamURL != tc.want {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveUnbracketedHostsUnaffected(t *testing.T) {
+	// Ordinary registered names and bare IPv4 upstreams carry no brackets, so
+	// the IPv6-literal rule leaves their existing behavior entirely intact.
+	cfg := mustConfig(t, `{"routes":[
+	  {"id":"name","methods":["GET"],"pathPrefix":"/d","upstream":"http://api.example.com/v1"},
+	  {"id":"ipv4","methods":["GET"],"pathPrefix":"/v","upstream":"http://127.0.0.1:8080/v1"}
+	]}`)
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/d/orders"}`)
+	if res.RouteID != "name" || res.UpstreamURL != "http://api.example.com/v1/orders" {
+		t.Fatalf("name upstream got %+v", res)
+	}
+	res = resolveJSON(t, cfg, `{"method":"GET","target":"/v/orders"}`)
+	if res.RouteID != "ipv4" || res.UpstreamURL != "http://127.0.0.1:8080/v1/orders" {
+		t.Fatalf("bare ipv4 upstream got %+v", res)
+	}
+}

@@ -820,6 +820,99 @@ func TestResolveCLIInvalidUpstreamEscapeRejectsConfig(t *testing.T) {
 	}
 }
 
+// TestResolveCLIBracketedHostRequiresIPv6 drives the IPv6-literal rule at the
+// command boundary: a bracket-delimited upstream host that is not a legal
+// IPv6 address rejects the whole configuration even when the request would
+// hit the valid first route. The run exits non-zero, stdout stays empty and
+// stderr holds one JSON error whose reason names the later route by position,
+// id and upstream field and states the bracket content is not a valid IPv6
+// address, never that the JSON document was broken. A legal IPv6 upstream
+// (encoded userinfo, brackets, port and zone id) still resolves with the
+// configured spelling preserved.
+func TestResolveCLIBracketedHostRequiresIPv6(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bad     string
+		literal string
+	}{
+		{"ordinary name", "http://[not-an-ip]/v1", "not-an-ip"},
+		{"bare ipv4", "http://[127.0.0.1]:8080/v1", "127.0.0.1"},
+		{"empty brackets", "http://[]/v1", ""},
+		{"malformed ipv6", "http://[2001:db8::g]/v1", "2001:db8::g"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.bad + `"}
+			  ]
+			}`
+			// The request hits the valid first route; the bad second route
+			// must still invalidate the configuration up front.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "is not a valid IPv6 address", `"` + tc.literal + `"`} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			if strings.Contains(fail.Reason, "not valid JSON") {
+				t.Errorf("bad IPv6 content must not read as broken JSON: %q", fail.Reason)
+			}
+		})
+	}
+
+	// Config errors take priority over request errors: a bad bracket host
+	// paired with broken-JSON request still reports invalid_config.
+	config := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://[not-an-ip]/v1"}]}`
+	res := runResolveCLI(t, config, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+
+	// A legal IPv6 upstream with userinfo, brackets, port and encoded path
+	// resolves and keeps the configured spelling byte for byte.
+	good := `{"routes":[{"id":"v6","methods":["GET"],"pathPrefix":"/api",
+	  "upstream":"https://user:p%40ss@[2001:db8::1]:8443/v%2f"}]}`
+	success := assertResolveSuccess(t, runResolveCLI(t, good,
+		`{"method":"GET","target":"/api/orders?a=1&a="}`))
+	if success.RouteID != "v6" {
+		t.Errorf("routeId = %q, want v6", success.RouteID)
+	}
+	if want := "https://user:p%40ss@[2001:db8::1]:8443/v%2f/orders?a=1&a="; success.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, want)
+	}
+
+	// An encoded zone id is accepted and its original encoding preserved.
+	zone := `{"routes":[{"id":"zone","methods":["GET"],"pathPrefix":"/api",
+	  "upstream":"https://[fe80::1%25eth0]/base"}]}`
+	zoneRes := assertResolveSuccess(t, runResolveCLI(t, zone,
+		`{"method":"GET","target":"/api/orders"}`))
+	if zoneRes.RouteID != "zone" || zoneRes.UpstreamURL != "https://[fe80::1%25eth0]/base/orders" {
+		t.Errorf("zone upstream got %+v", zoneRes)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

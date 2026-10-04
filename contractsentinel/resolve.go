@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -417,6 +418,12 @@ func validateUpstream(raw, loc, id string) *Failure {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		// Even when url.Parse itself rejects the authority, report a bad
+		// bracket payload as an IPv6-content error (and not as a generic
+		// parse failure) whenever the raw URL carries one.
+		if f := invalidBracketedHost(raw, loc, id); f != nil {
+			return f
+		}
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
@@ -425,7 +432,55 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if u.Host == "" {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
+	if f := invalidBracketedHost(raw, loc, id); f != nil {
+		return f
+	}
 	return nil
+}
+
+// invalidBracketedHost inspects the raw http(s) authority and, when it uses
+// the square-bracket IP-literal form, requires the bracket payload to be a
+// legal IPv6 address. Square brackets delimit an IP literal, so their content
+// must not be an ordinary registered name or a bare IPv4 address. This is
+// checked on the raw upstream in addition to url.Parse so the failure reason
+// is explicit even on Go versions whose url.Parse accepts non-IP bracket
+// content (and then emits that address on a matched route).
+//
+// The bracket payload is url-unescaped before parsing, so an encoded zone
+// separator (%25) is recognized and the configured spelling is otherwise
+// left untouched; a malformed percent escape, empty brackets or anything
+// netip does not classify as IPv6 fails. Unbracketed hosts (domains and bare
+// IPv4) and non-http(s) URLs return nil, leaving their existing behavior
+// intact.
+func invalidBracketedHost(raw, loc, id string) *Failure {
+	low := strings.ToLower(raw)
+	if !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+		return nil
+	}
+	authority := raw[strings.Index(raw, "://")+3:]
+	if i := strings.IndexByte(authority, '/'); i >= 0 {
+		authority = authority[:i]
+	}
+	open := strings.IndexByte(authority, '[')
+	if open < 0 {
+		return nil
+	}
+	// The IP-literal bracket belongs to the host, so it must open the
+	// authority or immediately follow a "userinfo@" prefix; a '[' anywhere
+	// earlier (inside userinfo) is a different malformed-URL error left to
+	// url.Parse.
+	if prefix := authority[:open]; prefix != "" && !strings.HasSuffix(prefix, "@") {
+		return nil
+	}
+	literal, _, _ := strings.Cut(authority[open+1:], "]")
+	addr, unescapeErr := url.PathUnescape(literal)
+	if unescapeErr == nil {
+		if parsed, parseErr := netip.ParseAddr(addr); parseErr == nil && parsed.Is6() {
+			return nil
+		}
+	}
+	return failuref("invalid_config",
+		"%s (id %q): upstream bracketed host %q is not a valid IPv6 address", loc, id, literal)
 }
 
 // requestJSON mirrors Request but keeps method and target raw, so a valid
