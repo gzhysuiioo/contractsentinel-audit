@@ -16,17 +16,52 @@ import (
 // the upstream URL requests on that route are forwarded to. An optional
 // queryTransforms list rewrites the request query string after the route has
 // been selected.
+//
+// QueryTransforms stays tag-less in the default (un)marshal sense: reading
+// goes through Config.UnmarshalJSON via the routeJSON raw mirror, and writing
+// goes through Route.MarshalJSON, so the rules round-trip instead of being
+// silently dropped (a plain json:"-" tag only omitted them on save).
 type Route struct {
-	ID              string            `json:"id"`
-	Methods         []string          `json:"methods"`
-	PathPrefix      string            `json:"pathPrefix"`
-	Upstream        string            `json:"upstream"`
-	QueryTransforms []*QueryTransform `json:"-"`
+	ID         string
+	Methods    []string
+	PathPrefix string
+	Upstream   string
+
+	// QueryTransforms holds the parsed rules. When it carries no rules the
+	// field is omitted on save, whether the source named no field or an
+	// explicit queryTransforms: [] — both are valid ways to write a route
+	// without rules, and ParseConfig accepts either.
+	QueryTransforms []*QueryTransform
 
 	// queryTransformsRaw holds the undecoded queryTransforms value until
 	// Config.UnmarshalJSON validates it once the route's position in its own
-	// config is known.
+	// config is known. It is nil in every successfully parsed config.
 	queryTransformsRaw json.RawMessage
+}
+
+// MarshalJSON writes routes back in the shape ParseConfig accepts: the four
+// basic fields in their canonical order, followed by queryTransforms when the
+// route carries rules. A route without rules — whether the source omitted the
+// field or named queryTransforms: [] — omits it, and ParseConfig accepts
+// either spelling; the field is never written as null. The rules' order and
+// literal strings are preserved byte for byte apart from JSON string
+// escaping, so re-parsing the output and resolving yields the same routeId
+// and upstreamURL. Unexported fields never appear in the output.
+func (r Route) MarshalJSON() ([]byte, error) {
+	type routeOut struct {
+		ID              string            `json:"id"`
+		Methods         []string          `json:"methods"`
+		PathPrefix      string            `json:"pathPrefix"`
+		Upstream        string            `json:"upstream"`
+		QueryTransforms []*QueryTransform `json:"queryTransforms,omitempty"`
+	}
+	return json.Marshal(routeOut{
+		ID:              r.ID,
+		Methods:         r.Methods,
+		PathPrefix:      r.PathPrefix,
+		Upstream:        r.Upstream,
+		QueryTransforms: r.QueryTransforms,
+	})
 }
 
 // QueryTransform is one rule in a route's queryTransforms array: op is
@@ -38,6 +73,41 @@ type QueryTransform struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 	To    string `json:"to"`
+}
+
+// MarshalJSON renders each rule so the output satisfies the same constraints
+// parseQueryTransforms enforces on input:
+//   - set keeps "value" as a JSON string, including the empty string;
+//   - remove emits only op and name (never value or to);
+//   - rename keeps a non-empty "to" and never emits value.
+//
+// name, value and to are written as the literal strings read in — spaces,
+// non-ASCII letters, '+' and '%' included — with only JSON string escaping,
+// never query-string percent-encoding or decoding, so a re-read matches the
+// same parameter names and applies the same literal values.
+func (q *QueryTransform) MarshalJSON() ([]byte, error) {
+	switch q.Op {
+	case "set":
+		return json.Marshal(struct {
+			Op    string `json:"op"`
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}{q.Op, q.Name, q.Value})
+	case "rename":
+		return json.Marshal(struct {
+			Op   string `json:"op"`
+			Name string `json:"name"`
+			To   string `json:"to"`
+		}{q.Op, q.Name, q.To})
+	default:
+		// remove (and any op a validated config could never carry) writes
+		// neither value nor to, so the output cannot gain fields the reader
+		// rejects.
+		return json.Marshal(struct {
+			Op   string `json:"op"`
+			Name string `json:"name"`
+		}{q.Op, q.Name})
+	}
 }
 
 // routeJSON mirrors Route but keeps every field raw: the basic fields are
@@ -255,6 +325,21 @@ func routeLabel(loc, id string) string {
 // Config is the resolve configuration: a flat array of routes.
 type Config struct {
 	Routes []Route `json:"routes"`
+}
+
+// MarshalJSON writes the config back in the shape ParseConfig accepts. A
+// non-nil empty (or nil) routes slice is emitted as "routes": [] rather than
+// "routes": null, which ParseConfig would reject with invalid_config; the
+// routes keep their parsed order and each route marshals through
+// Route.MarshalJSON so its queryTransforms survive the save.
+func (cfg *Config) MarshalJSON() ([]byte, error) {
+	routes := cfg.Routes
+	if routes == nil {
+		routes = []Route{}
+	}
+	return json.Marshal(struct {
+		Routes []Route `json:"routes"`
+	}{Routes: routes})
 }
 
 // UnmarshalJSON first confirms the document is one syntactically valid JSON
