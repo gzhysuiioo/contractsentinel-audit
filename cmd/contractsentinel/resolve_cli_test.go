@@ -820,6 +820,146 @@ func TestResolveCLIInvalidUpstreamEscapeRejectsConfig(t *testing.T) {
 	}
 }
 
+func TestResolveCLIBracketedHostMustBeIPv6(t *testing.T) {
+	// Brackets may enclose only a legal IPv6 literal. A name or an IPv4
+	// address in brackets on a route the request never reaches still rejects
+	// the whole config up front: non-zero exit, empty stdout and one JSON
+	// error on stderr whose reason names the route position, its id and the
+	// upstream field, and says the bracketed host is not a legal IPv6 address
+	// — it must not be reported as broken config JSON.
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"name in brackets", "http://[not-an-ip]/v1"},
+		{"bare ipv4 in brackets", "http://[127.0.0.1]:8080/v1"},
+		{"empty brackets", "http://[]/v1"},
+		{"malformed ipv6", "http://[2001:db8:::1]/v1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.upstream + `"}
+			  ]
+			}`
+			// The request hits the valid first route only.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "IPv6"} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			if strings.Contains(fail.Reason, "not valid JSON") {
+				t.Errorf("a bad bracketed host is a content error, not a JSON syntax failure: %q", fail.Reason)
+			}
+		})
+	}
+
+	// A malformed request paired with a bad bracketed-host config still
+	// reports invalid_config: config validation precedes request parsing.
+	badConfig := `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/x","upstream":"http://[not-an-ip]/v1"}]}`
+	res := runResolveCLI(t, badConfig, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+}
+
+// TestResolveCLIValidIPv6Upstreams drives the legal IPv6 spellings at the
+// command boundary: full, compressed and IPv4-tail literals, a port,
+// percent-encoded userinfo and a percent-encoded zone must resolve and keep
+// the configured bytes verbatim; ordinary domains and bare IPv4 hosts keep
+// their existing behavior.
+func TestResolveCLIValidIPv6Upstreams(t *testing.T) {
+	cases := []struct {
+		name     string
+		prefix   string
+		upstream string
+		target   string
+		wantURL  string
+	}{
+		{
+			name:     "compressed literal with userinfo, port and encoded path",
+			prefix:   "/api",
+			upstream: "https://user:p%40ss@[2001:db8::1]:8443/v%2f",
+			target:   "/api/orders?a=1&a=",
+			wantURL:  "https://user:p%40ss@[2001:db8::1]:8443/v%2f/orders?a=1&a=",
+		},
+		{
+			name:     "encoded zone keeps its original spelling",
+			prefix:   "/",
+			upstream: "https://[fe80::1%25eth0]/base",
+			target:   "/x",
+			wantURL:  "https://[fe80::1%25eth0]/base/x",
+		},
+		{
+			name:     "full form literal",
+			prefix:   "/",
+			upstream: "http://[2001:0db8:0000:0000:0000:0000:0000:0001]/b",
+			target:   "/x",
+			wantURL:  "http://[2001:0db8:0000:0000:0000:0000:0000:0001]/b/x",
+		},
+		{
+			name:     "ipv4 tail and port",
+			prefix:   "/",
+			upstream: "http://[::ffff:192.168.0.1]:8080/b",
+			target:   "/x",
+			wantURL:  "http://[::ffff:192.168.0.1]:8080/b/x",
+		},
+		{
+			name:     "ordinary domain is unaffected",
+			prefix:   "/api",
+			upstream: "http://api.internal/v1",
+			target:   "/api/x?y=1",
+			wantURL:  "http://api.internal/v1/x?y=1",
+		},
+		{
+			name:     "bare ipv4 host without brackets is unaffected",
+			prefix:   "/api",
+			upstream: "http://127.0.0.1:8080/v1",
+			target:   "/api/x",
+			wantURL:  "http://127.0.0.1:8080/v1/x",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"` + tc.prefix +
+				`","upstream":"` + tc.upstream + `"}]}`
+			request := `{"method":"GET","target":"` + tc.target + `"}`
+			success := assertResolveSuccess(t, runResolveCLI(t, config, request))
+			if success.RouteID != "r" {
+				t.Errorf("routeId = %q, want r", success.RouteID)
+			}
+			if success.UpstreamURL != tc.wantURL {
+				t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, tc.wantURL)
+			}
+		})
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

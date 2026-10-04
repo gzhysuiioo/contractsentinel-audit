@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -415,6 +416,15 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
 	}
+	// Validate any bracketed host against the raw string before url.Parse:
+	// square brackets are the IP-literal marker, so whatever they enclose
+	// must be a legal IPv6 address (zone included) rather than a name or an
+	// IPv4 address. Doing this explicitly keeps the rule independent of
+	// url.Parse's parser strictness and lets the reason name the field and
+	// the actual problem instead of surfacing a generic URL parse error.
+	if f := validateBracketedUpstreamHost(raw, loc, id); f != nil {
+		return f
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
@@ -426,6 +436,70 @@ func validateUpstream(raw, loc, id string) *Failure {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
 	return nil
+}
+
+// validateBracketedUpstreamHost checks the raw upstream's authority for an
+// IP literal in square brackets: brackets are reserved for an IPv6 (or
+// future IP-version) literal, so their content must parse as an IPv6 address
+// — full form, compressed form or an IPv6 address with an embedded IPv4
+// tail. A port, userinfo and a percent-encoded zone ("%25eth0") are allowed
+// and never alter the literal's bytes; an empty pair of brackets, a plain
+// hostname such as "[not-an-ip]", a bare IPv4 address such as
+// "[127.0.0.1]" and a malformed IPv6 literal are rejected with a reason
+// that names the route, its id and the upstream field. This is a content
+// error in a syntactically valid JSON document, never a JSON parse failure.
+func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
+	// The authority starts after the scheme separator and ends at the first
+	// path slash (query and fragment were rejected by the caller).
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	authority := raw[schemeEnd+3:]
+	if i := strings.IndexByte(authority, '/'); i >= 0 {
+		authority = authority[:i]
+	}
+	// Any userinfo precedes the host and ends at the last '@'.
+	hostPort := authority
+	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
+		hostPort = authority[i+1:]
+	}
+
+	if !strings.ContainsAny(hostPort, "[]") {
+		return nil // ordinary reg-name (domain) or bare IPv4 host stays as-is
+	}
+	label := routeLabel(loc, id)
+	if !strings.HasPrefix(hostPort, "[") {
+		return failuref("invalid_config",
+			"%s: upstream bracketed host must be a valid IPv6 address: '[' may only enclose the host", label)
+	}
+	closeBracket := strings.IndexByte(hostPort, ']')
+	if closeBracket < 0 {
+		return failuref("invalid_config",
+			"%s: upstream bracketed host must be a valid IPv6 address but the closing ']' is missing", label)
+	}
+	literal := hostPort[1:closeBracket]
+	// The zone delimiter is percent-encoded in the URL ("%25"); decode the
+	// literal's escapes once so netip sees "fe80::1%eth0" while every other
+	// byte keeps its original spelling.
+	decoded, err := url.PathUnescape(literal)
+	if err != nil {
+		return invalidBracketedHost(label, literal)
+	}
+	addr, err := netip.ParseAddr(decoded)
+	if err != nil || !addr.Is6() {
+		// ParseAddr accepts a bare IPv4 address; brackets may only carry
+		// IPv6, so "[127.0.0.1]" is rejected even though it is a valid IP.
+		return invalidBracketedHost(label, literal)
+	}
+	return nil
+}
+
+// invalidBracketedHost builds the content error for a bracketed host whose
+// content is not a legal IPv6 literal.
+func invalidBracketedHost(label, literal string) *Failure {
+	return failuref("invalid_config",
+		"%s: upstream host in brackets must be a valid IPv6 address, but %q is not a legal IPv6 address", label, literal)
 }
 
 // requestJSON mirrors Request but keeps method and target raw, so a valid
