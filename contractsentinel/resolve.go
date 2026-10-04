@@ -82,9 +82,9 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 	// later field regardless of object order. Only a valid non-empty JSON
 	// string becomes the label; a wrong-typed id is reported against the id
 	// field and never rendered (e.g. as a number or object) as the route's
-	// identity.
-	if f := decodeStringField(rj.ID, loc, "id", &route.ID); f != nil {
-		return Route{}, f
+	// identity, so that error is located by position alone.
+	if !decodeStringField(rj.ID, &route.ID) {
+		return Route{}, failuref("invalid_config", "%s: id must be a string", loc)
 	}
 	label := loc
 	if route.ID != "" {
@@ -94,27 +94,40 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 	if f := decodeMethodsField(rj.Methods, label, &route.Methods); f != nil {
 		return Route{}, f
 	}
-	if f := decodeStringField(rj.PathPrefix, label, "pathPrefix", &route.PathPrefix); f != nil {
+	if f := decodeRouteStringField(rj.PathPrefix, label, "pathPrefix", &route.PathPrefix); f != nil {
 		return Route{}, f
 	}
-	if f := decodeStringField(rj.Upstream, label, "upstream", &route.Upstream); f != nil {
+	if f := decodeRouteStringField(rj.Upstream, label, "upstream", &route.Upstream); f != nil {
 		return Route{}, f
 	}
 	route.queryTransformsRaw = rj.QueryTransforms
 	return route, nil
 }
 
-// decodeStringField type-checks a raw route field that must hold a string.
-// An absent field is left as the zero value for later required-field
-// validation; null or any non-string JSON value fails here.
-func decodeStringField(raw json.RawMessage, label, field string, dst *string) *Failure {
-	if len(raw) == 0 {
-		return nil
-	}
-	if !jsonString(raw, dst) {
+// decodeRouteStringField renders a route field's string type error with the
+// route's position (and, when available, its id); the type decision itself is
+// the shared decodeStringField. An absent field stays silent for the later
+// required-field validation.
+func decodeRouteStringField(raw json.RawMessage, label, field string, dst *string) *Failure {
+	if !decodeStringField(raw, dst) {
 		return failuref("invalid_config", "%s: %s must be a string", label, field)
 	}
 	return nil
+}
+
+// decodeStringField type-checks a raw field that must hold a string. It is
+// the one shared string-field decision used by both config and request
+// decoding, so the absent / null / non-string / empty-string distinctions
+// live in one place. It returns false only when the key is present with a
+// non-string value (null included), which is always a field type error. An
+// absent key leaves dst untouched, and a present string — the empty string
+// included — is decoded into dst, so both reach the existing content checks
+// unchanged.
+func decodeStringField(raw json.RawMessage, dst *string) (isString bool) {
+	if len(raw) == 0 {
+		return true
+	}
+	return jsonString(raw, dst)
 }
 
 // decodeMethodsField type-checks methods: it must be an array of strings
@@ -261,17 +274,15 @@ type Config struct {
 // still fails the outer decode and is reported as a parse failure, without a
 // guessed route position or field.
 func (cfg *Config) UnmarshalJSON(data []byte) error {
-	// First confirm the document is one syntactically valid JSON value: only
-	// then is a wrong shape a structural error rather than a parse failure.
-	// This mirrors ParseRequest: broken syntax (including an empty file and a
-	// corrupt first route) stays a parse error with no guessed position.
-	var doc json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	// Syntax first, then the top-level shape; both basic checks are shared
+	// with ParseRequest (see unmarshalJSONValue / requireJSONObject), only
+	// the code and wording differ.
+	body, err := unmarshalJSONValue(data)
+	if err != nil {
 		return err
 	}
-	body := bytes.TrimSpace(doc)
-	if body[0] != '{' {
-		return failuref("invalid_config", "config must be a JSON object, got %s", jsonTypeName(body))
+	if f := requireJSONObject(body, "invalid_config", "config", true); f != nil {
+		return f
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
@@ -316,6 +327,34 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 		}
 		route.QueryTransforms = transforms
 		route.queryTransformsRaw = nil
+	}
+	return nil
+}
+
+// unmarshalJSONValue is the shared first step of parsing either input: it
+// confirms the document is one syntactically valid JSON value, without
+// judging its shape. It returns encoding/json's own error verbatim, so each
+// caller keeps its existing handling (ParseConfig wraps a returned error just
+// as Config.UnmarshalJSON returning it directly always has).
+func unmarshalJSONValue(data []byte) (json.RawMessage, error) {
+	var doc json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSpace(doc), nil
+}
+
+// requireJSONObject is the shared top-level shape check: a syntactically
+// legal value that is not a JSON object is a structural error in the caller's
+// code saying "<what> must be a JSON object", never a parse failure and never
+// a guessed field or route position. Config errors additionally name the type
+// actually received ("got <type>"); the request wording omits it.
+func requireJSONObject(doc json.RawMessage, code, what string, nameType bool) *Failure {
+	if len(doc) == 0 || doc[0] != '{' {
+		if nameType {
+			return failuref(code, "%s must be a JSON object, got %s", what, jsonTypeName(doc))
+		}
+		return failuref(code, "%s must be a JSON object", what)
 	}
 	return nil
 }
@@ -561,13 +600,12 @@ type requestJSON struct {
 // (required method, legal token, absolute target without a fragment or a bad
 // percent escape) validated, so an empty string stays a content error.
 func ParseRequest(data []byte) (*Request, *Failure) {
-	var doc json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	body, err := unmarshalJSONValue(data)
+	if err != nil {
 		return nil, failuref("invalid_request", "request is not valid JSON: %v", err)
 	}
-	body := bytes.TrimSpace(doc)
-	if len(body) == 0 || body[0] != '{' {
-		return nil, failuref("invalid_request", "request must be a JSON object")
+	if f := requireJSONObject(body, "invalid_request", "request", false); f != nil {
+		return nil, f
 	}
 
 	var rj requestJSON
@@ -579,6 +617,9 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 	}
 
 	var req Request
+	// method is always checked before target, regardless of the key order in
+	// the object; the absent/null/non-string distinction is the shared
+	// decodeStringField, so only the request wording is added here.
 	if f := decodeRequestStringField(rj.Method, "method", &req.Method); f != nil {
 		return nil, f
 	}
@@ -603,19 +644,17 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 	return &req, nil
 }
 
-// decodeRequestStringField type-checks one request field that must hold a
-// string. An absent field (no such key) is left as the zero value so the
-// later content checks keep their "field is required" behavior; null or any
-// non-string JSON value is a type error that names the field and the JSON
-// type that was actually supplied.
+// decodeRequestStringField renders the request wording for one string field;
+// the absent/null/non-string decision itself is the shared
+// decodeStringField. An absent field (no such key) is left as the zero value
+// so the later content checks keep their "field is required" behavior; null
+// or any non-string JSON value is a type error that names the field and the
+// JSON type that was actually supplied.
 func decodeRequestStringField(raw json.RawMessage, field string, dst *string) *Failure {
-	if len(raw) == 0 {
-		return nil
+	if !decodeStringField(raw, dst) {
+		return failuref("invalid_request", "%s must be a string, got %s", field, jsonTypeName(raw))
 	}
-	if jsonString(raw, dst) {
-		return nil
-	}
-	return failuref("invalid_request", "%s must be a string, got %s", field, jsonTypeName(raw))
+	return nil
 }
 
 // jsonTypeName names the JSON type of a syntactically valid raw value, in the
