@@ -540,13 +540,19 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
 	}
-	// Validate any bracketed host against the raw string before url.Parse:
-	// square brackets are the IP-literal marker, so whatever they enclose
-	// must be a legal IPv6 address (zone included) rather than a name or an
-	// IPv4 address. Doing this explicitly keeps the rule independent of
-	// url.Parse's parser strictness and lets the reason name the field and
-	// the actual problem instead of surfacing a generic URL parse error.
+	// Validate the host's IP-literal spelling against the raw string before
+	// url.Parse: square brackets are the IP-literal marker, so whatever they
+	// enclose must be a legal IPv6 address (full, compressed or IPv4-tail,
+	// zone included) rather than a name or an IPv4 address, and an IPv6
+	// literal may never appear without that pair of brackets. Doing both
+	// explicitly keeps the rules independent of url.Parse's parser strictness
+	// and lets the reason name the field and the actual problem instead of
+	// surfacing a generic URL parse error (an unbracketed literal otherwise
+	// reaches the user as a misleading "invalid port" complaint).
 	if f := validateBracketedUpstreamHost(raw, loc, id); f != nil {
+		return f
+	}
+	if f := validateUnbracketedUpstreamHost(raw, loc, id); f != nil {
 		return f
 	}
 	u, err := url.Parse(raw)
@@ -655,6 +661,95 @@ func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
 func invalidBracketedHost(label, literal string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream host in brackets must be a valid IPv6 address, but %q is not a legal IPv6 address", label, literal)
+}
+
+// validateUnbracketedUpstreamHost rejects an IPv6 literal written without the
+// square brackets an IP literal requires in a URL's authority:
+//
+//	host = IP-literal / IPv4address / reg-name
+//	IP-literal = "[" ( IPv6address / ... ) "]"
+//
+// A bare "2001:db8::1" leaves the host/port boundary undefined (the reader
+// cannot tell "::1" from "::1:8080" with a port), so the literal must be
+// wrapped as "[2001:db8::1]" rather than guessed at: brackets are never
+// inserted and a trailing run of digits is never promoted to a port. The
+// check fires for every IPv6 spelling — the full form, the compressed form
+// ("::1"), an IPv6 address with an embedded IPv4 tail ("::ffff:192.0.2.1")
+// and a percent-encoded zone ("%25eth0") — whether or not a ":<digits>"
+// port is also present and whether userinfo precedes the host.
+//
+// Ordinary domains and bare IPv4 hosts (with or without a port) stay
+// untouched, and the colons in userinfo or the base path are never
+// inspected: only the host segment between the last '@' and the first '/'
+// is considered. Like the bracketed-host rule this is a content error in a
+// syntactically valid JSON document, never a JSON parse failure, and it is
+// decided on the raw bytes before url.Parse so the wording cannot regress to
+// that parser's generic "invalid port" error.
+func validateUnbracketedUpstreamHost(raw, loc, id string) *Failure {
+	// Isolate the authority exactly the way the bracketed check does: after
+	// the scheme separator, before the first path slash, with any userinfo
+	// (whose colons must not count) stripped at the last '@'.
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	hostPort := raw[schemeEnd+3:]
+	if i := strings.IndexByte(hostPort, '/'); i >= 0 {
+		hostPort = hostPort[:i]
+	}
+	if i := strings.LastIndexByte(hostPort, '@'); i >= 0 {
+		hostPort = hostPort[i+1:]
+	}
+	if hostPort == "" || strings.ContainsAny(hostPort, "[]") {
+		// No host (the generic check reports it) or a bracketed literal,
+		// which the bracketed-host validator owns.
+		return nil
+	}
+
+	// A bare IPv6 literal carries at least two colons; a reg-name may contain
+	// a single colon only in the port separator, so skip the parse for those.
+	host := hostPort
+	if strings.Count(host, ":") < 2 {
+		return nil
+	}
+	// A trailing ":<digits>" might be a port; test the address without it as
+	// well, since an unbracketed address with a port ("fe80::1:8080") is
+	// exactly the ambiguous spelling that must be refused rather than parsed
+	// as host plus port. The suffix is only stripped once: a real bare IPv6
+	// literal without a port is tested first and rejected anyway.
+	candidates := []string{host}
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		port := host[i+1:]
+		if port != "" && isDigits(port) {
+			candidates = append(candidates, host[:i])
+		}
+	}
+	for _, cand := range candidates {
+		decoded, err := url.PathUnescape(cand)
+		if err != nil {
+			continue
+		}
+		addr, err := netip.ParseAddr(decoded)
+		if err == nil && addr.Is6() {
+			return failuref("invalid_config",
+				"%s: upstream IPv6 host %q is missing its square brackets: an IPv6 literal must be enclosed in a pair of brackets with any port outside them (e.g. \"[2001:db8::1]:8080\"); brackets are never added and a trailing number is not guessed as a port",
+				routeLabel(loc, id), host)
+		}
+	}
+	return nil
+}
+
+// isDigits reports whether s is a non-empty run of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // invalidBracketedHostShape builds the content error for a bracketed host

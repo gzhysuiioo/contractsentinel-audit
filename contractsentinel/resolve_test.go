@@ -516,6 +516,108 @@ func TestResolveValidIPv6Upstreams(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigUnbracketedIPv6Host(t *testing.T) {
+	// An IPv6 literal is an IP-literal and must be wrapped in one pair of
+	// square brackets; a bare literal leaves the host/port boundary undefined
+	// (with "::1:8080" the reader cannot tell the host from a port) and the
+	// reader never inserts brackets or guesses a port. Every IPv6 spelling
+	// rejects the whole configuration as invalid_config with a content reason
+	// naming the route's 1-based position, its id and the upstream field — a
+	// digit at the end never makes the spelling legal, and this is never a
+	// broken-JSON failure.
+	badUpstreams := []struct {
+		name     string
+		upstream string
+	}{
+		{"compressed address under base path", "http://2001:db8::1/base"},
+		{"compressed address with trailing digits", "http://::1:8080/base"},
+		{"embedded ipv4 tail", "http://::ffff:192.0.2.1/base"},
+		{"full form", "http://2001:0db8:0000:0000:0000:0000:0000:0001/base"},
+		{"loopback with no base path", "http://::1"},
+		{"address and trailing digits, no base path", "http://fe80::1:8080"},
+		{"percent encoded zone without brackets", "http://fe80::1%25eth0/base"},
+		{"userinfo before a bare literal", "http://user:pw@2001:db8::1/base"},
+		{"encoded userinfo and a port-like suffix", "https://user:p%40ss@2001:db8::1:8443/base"},
+	}
+	for _, tc := range badUpstreams {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+			  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + tc.upstream + `"}
+			]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "IPv6", "bracket"} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("an unbracketed IPv6 host is a content error, not a JSON syntax failure: %q", f.Reason)
+			}
+			if cfg != nil {
+				t.Fatalf("a rejected config must not be returned, got %+v", cfg)
+			}
+		})
+	}
+
+	// The offending route may be one the request never hits: config
+	// validation still fails up front (and hands back no config at all)
+	// instead of letting the first, valid route resolve the request.
+	for _, up := range []string{"http://2001:db8::1/base", "http://::1:8080/base", "http://::ffff:192.0.2.1/base"} {
+		src := `{"routes":[
+		  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+		  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + up + `"}
+		]}`
+		cfg, f := ParseConfig([]byte(src))
+		if f == nil || f.Code != "invalid_config" {
+			t.Fatalf("upstream %q: got %+v, want invalid_config", up, f)
+		}
+		if cfg != nil {
+			t.Fatalf("upstream %q: a rejected config must not be returned", up)
+		}
+	}
+}
+
+func TestUnbracketedNonIPv6AuthoritiesUnaffected(t *testing.T) {
+	// Ordinary domains and bare IPv4 hosts keep their existing behavior with
+	// or without a port, and colons inside userinfo or the base path must not
+	// turn a legal host into a flagged IPv6 literal. Each upstream must both
+	// parse and join the remainder byte for byte.
+	cases := []struct {
+		name     string
+		upstream string
+		target   string
+		want     string
+	}{
+		{"plain domain", "http://api.internal/v1", "/x", "http://api.internal/v1/x"},
+		{"domain with port", "http://api.internal:8080/v1", "/x", "http://api.internal:8080/v1/x"},
+		{"bare ipv4", "http://192.0.2.1/base", "/x", "http://192.0.2.1/base/x"},
+		{"bare ipv4 with port", "http://192.0.2.1:8080/base", "/x", "http://192.0.2.1:8080/base/x"},
+		{"colon in userinfo", "http://user:pa:ss@h.internal:8080/base", "/x", "http://user:pa:ss@h.internal:8080/base/x"},
+		{"colon in base path", "http://h.internal/base/a:b/c", "/x", "http://h.internal/base/a:b/c/x"},
+		{"localhost without port", "http://localhost/base", "/x", "http://localhost/base/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/","upstream":"` + tc.upstream + `"}]}`
+			cfg := mustConfig(t, src)
+			res := resolveJSON(t, cfg, `{"method":"GET","target":"`+tc.target+`"}`)
+			if res.RouteID != "r" {
+				t.Errorf("routeId = %q, want r", res.RouteID)
+			}
+			if res.UpstreamURL != tc.want {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.want)
+			}
+		})
+	}
+}
+
 func TestInvalidConfigUpstreamPercentEscape(t *testing.T) {
 	// A malformed percent escape anywhere in the upstream URL rejects the
 	// whole configuration as invalid_config, and the reason locates the
