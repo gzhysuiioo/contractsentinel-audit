@@ -494,6 +494,269 @@ func TestQueryTransformRename(t *testing.T) {
 	}
 }
 
+// TestQueryTransformRenameChain covers consecutive rename rules: every rule
+// matches the parameter names that exist when that rule runs — the previous
+// rename's result — never the request's original names and never a single
+// simultaneous substitution. Renames also never merge or overwrite colliding
+// names the way set does.
+func TestQueryTransformRenameChain(t *testing.T) {
+	cases := []struct {
+		name      string
+		rules     string
+		target    string
+		wantQuery string // expected suffix after http://h.internal/base/p
+	}{
+		{
+			// a=1&b=2&a=3&c=4, a -> b then b -> c: after the first rule the
+			// two former a's are b's, so the second rule renames them together
+			// with the request's original b; its original c keeps its place.
+			name:      "second rename follows the first rename result",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?a=1&b=2&a=3&c=4",
+			wantQuery: "?c=1&c=2&c=3&c=4",
+		},
+		{
+			// Same two rules in the opposite order: b -> c runs before a ever
+			// becomes b, so the original b alone moves to c and the a's only
+			// move as far as b. Rule order is observable in the output.
+			name:      "swapping the rules changes which names each rule sees",
+			rules:     `[{"op":"rename","name":"b","to":"c"},{"op":"rename","name":"a","to":"b"}]`,
+			target:    "/p?a=1&b=2&a=3&c=4",
+			wantQuery: "?b=1&c=2&b=3&c=4",
+		},
+		{
+			// Three rules forward: every original parameter walks the whole
+			// chain a -> b -> c -> d. A simultaneous rename of the original
+			// names would instead leave three distinct names behind.
+			name:      "three rename rules forward carry every name through",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"},{"op":"rename","name":"c","to":"d"}]`,
+			target:    "/p?a=1&b=2&c=3",
+			wantQuery: "?d=1&d=2&d=3",
+		},
+		{
+			// The same three rules in reverse move each name exactly one
+			// step: c -> d runs before b -> c, which runs before a -> b.
+			name:      "three rename rules in reverse move names one step each",
+			rules:     `[{"op":"rename","name":"c","to":"d"},{"op":"rename","name":"b","to":"c"},{"op":"rename","name":"a","to":"b"}]`,
+			target:    "/p?a=1&b=2&c=3",
+			wantQuery: "?b=1&c=2&d=3",
+		},
+		{
+			// Names collide on both hops, including duplicate target-name
+			// parameters: nothing merges or overwrites. Five parameters enter
+			// and five leave, each keeping its position, value and order.
+			name:      "colliding renames keep every parameter in place without merging",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?b=9&a=1&b=8&a=2&c=0",
+			wantQuery: "?c=9&c=1&c=8&c=2&c=0",
+		},
+		{
+			// Only each hit's name changes: value bytes (lowercase escapes,
+			// '+', extra '='), the valueless form and the empty value's '='
+			// all survive both renames, as do non-hit parameters.
+			name:      "chained renames keep value bytes and both empty forms",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?a=%2f+%2F+a=b&a&a=&x=1",
+			wantQuery: "?c=%2f+%2F+a=b&c&c=&x=1",
+		},
+		{
+			// Empty fragments and non-hit parameters keep their bytes and
+			// positions while the hits walk both rules.
+			name:      "chained renames leave empty fragments and misses as is",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?z=0&&a=1&&b=2&",
+			wantQuery: "?z=0&&c=1&&c=2&",
+		},
+		{
+			// A first rule with no source changes nothing and must not
+			// re-encode existing names (the raw '+' stays a '+'), and later
+			// rules still run: a walks to b and then c while "a b" never
+			// matches a rule looking for "a".
+			name:      "a no-hit rule neither re-encodes nor stops later rules",
+			rules:     `[{"op":"rename","name":"z","to":"q"},{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?a=1&a+b=2&a%20b=3",
+			wantQuery: "?c=1&a+b=2&a%20b=3",
+		},
+		{
+			// A rule renaming a name to itself is a byte-for-byte no-op (no
+			// re-encoding of either space spelling) and must not break the
+			// chain: the later rules still run on their results.
+			name:      "a self-rename step neither re-encodes nor stops later rules",
+			rules:     `[{"op":"rename","name":"a b","to":"a b"},{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?a=1&a+b=2&a%20b=3",
+			wantQuery: "?c=1&a+b=2&a%20b=3",
+		},
+		{
+			name:      "chained renames with no query string do not create a mark",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p",
+			wantQuery: "",
+		},
+		{
+			name:      "chained renames with an empty question mark keep it",
+			rules:     `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?",
+			wantQuery: "?",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformResult(t, tc.rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestQueryTransformRenameChainEncodedIntermediateNames covers chains whose
+// intermediate name needs encoding: the next rule uses that name as a literal
+// and must still hit the renamed parameters. It also pins the name-comparison
+// rules across a chain boundary: '+' and "%20" in a request name both denote a
+// space, a literal '+' is a different name, and matching stays case-sensitive.
+func TestQueryTransformRenameChainEncodedIntermediateNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		rules     string
+		target    string
+		wantQuery string
+	}{
+		{
+			// a becomes the space-bearing name "x y" (encoded x%20y by rule
+			// one); rule two names "x y" as a literal and matches the decoded
+			// intermediate, moving it on to z.
+			name:      "space intermediate name is matched as a literal by the next rule",
+			rules:     `[{"op":"rename","name":"a","to":"x y"},{"op":"rename","name":"x y","to":"z"}]`,
+			target:    "/p?a=1",
+			wantQuery: "?z=1",
+		},
+		{
+			// '+' and "%20" in the request both decode to a space, so the
+			// m+n and m%20n parameters join the renamed a under the literal
+			// intermediate name "m n" and all move to z. A literal '+' name
+			// (m%2Bn) is a different parameter and is left untouched.
+			name:      "plus and percent-space request names both reach the space intermediate",
+			rules:     `[{"op":"rename","name":"a","to":"m n"},{"op":"rename","name":"m n","to":"z"}]`,
+			target:    "/p?a=1&m%20n=9&m+n=8&m%2Bn=7",
+			wantQuery: "?z=1&z=9&z=8&m%2Bn=7",
+		},
+		{
+			// The intermediate name contains a literal '+', encoded as %2B by
+			// rule one. Rule two's literal "p+q" hits the renamed a and the
+			// request's p%2Bq; the request's raw p+q (a space name) does not
+			// match and stays written with its '+'.
+			name:      "literal-plus intermediate matches encoded plus, not a space spelling",
+			rules:     `[{"op":"rename","name":"a","to":"p+q"},{"op":"rename","name":"p+q","to":"z"}]`,
+			target:    "/p?a=1&p%2Bq=2&p+q=3",
+			wantQuery: "?z=1&z=2&p+q=3",
+		},
+		{
+			// A non-ASCII intermediate name with a space: the request's
+			// percent-encoded same-name parameter joins the renamed a at rule
+			// one and both move on at rule two.
+			name:      "chinese intermediate name continues the chain",
+			rules:     `[{"op":"rename","name":"a","to":"中 文"},{"op":"rename","name":"中 文","to":"z"}]`,
+			target:    "/p?a=1&%E4%B8%AD%20%E6%96%87=2",
+			wantQuery: "?z=1&z=2",
+		},
+		{
+			// Case sensitivity holds at every hop: a -> B creates uppercase B,
+			// so b -> c only moves the lowercase original; both uppercase B's
+			// remain.
+			name:      "name comparison stays case sensitive along the chain",
+			rules:     `[{"op":"rename","name":"a","to":"B"},{"op":"rename","name":"b","to":"c"}]`,
+			target:    "/p?a=1&b=2&B=3",
+			wantQuery: "?B=1&c=2&B=3",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transformResult(t, tc.rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestQueryTransformRenameChainInvalidEscapeStillRejected pins that a rename
+// chain can never launder a malformed percent escape into an accepted request:
+// all names are decoded before any rule runs, so renaming the carrying
+// parameter later cannot make the request valid, and no partially chained query
+// may come back as a success.
+func TestQueryTransformRenameChainInvalidEscapeStillRejected(t *testing.T) {
+	cfg := transformConfig(t, `[{"op":"rename","name":"a","to":"b"},{"op":"rename","name":"b","to":"c"}]`)
+	targets := []string{
+		"/p?a=1&b%zz=2",     // rule two would rename the bad name away
+		"/p?b%zz=2&a=1",     // bad name before a parameter rule one renames
+		"/p?a%zz=1",         // rule one would rename the bad name itself
+		"/p?a=1&b%zz=2&c=4", // bad name among parameters that rename fine
+		"/p?a=1&b=2%2",      // truncated escape in a value the chain carries
+	}
+	for _, target := range targets {
+		// The front door: ParseRequest rejects the target outright no matter
+		// what the chain would have done with it.
+		_, rf := ParseRequest([]byte(`{"method":"GET","target":"` + target + `"}`))
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("ParseRequest(%q): got %+v, want invalid_request", target, rf)
+		}
+	}
+
+	// A caller that bypasses ParseRequest still gets invalid_request from
+	// Resolve whenever the malformed escape sits in a decoded name — names
+	// are all decoded up front, before the first rename — and never a partial
+	// Resolution.
+	for _, target := range []string{
+		"/p?a=1&b%zz=2",
+		"/p?b%zz=2&a=1",
+		"/p?a%zz=1",
+		"/p?a=1&b%zz=2&c=4",
+	} {
+		res, rf := Resolve(cfg, &Request{Method: "GET", Target: target})
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("Resolve(%q): got %+v, want invalid_request", target, rf)
+		}
+		if res != nil {
+			t.Fatalf("Resolve(%q): got partial success %+v, want no resolution", target, res)
+		}
+	}
+}
+
+// TestQueryTransformRenameChainKeepsRoutingAndJoin asserts on the full
+// Resolution: chained renames are query content only, so route selection and
+// upstream path joining are exactly what they are without rules, and a route
+// without transforms keeps the identical query byte for byte.
+func TestQueryTransformRenameChainKeepsRoutingAndJoin(t *testing.T) {
+	cfg := mustConfig(t, `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1",
+	   "queryTransforms":[
+	     {"op":"rename","name":"a","to":"b"},
+	     {"op":"rename","name":"b","to":"c"}
+	   ]},
+	  {"id":"root","methods":["*"],"pathPrefix":"/","upstream":"http://root.internal"}
+	]}`)
+
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/x/y?a=1&b=2&a=3&c=4"}`)
+	if res.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", res.RouteID)
+	}
+	if want := "http://api.internal/v1/x/y?c=1&c=2&c=3&c=4"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	// The same query on a path only the transform-free root route matches is
+	// preserved byte for byte.
+	res = resolveJSON(t, cfg, `{"method":"GET","target":"/other?a=1&b=2&a=3&c=4"}`)
+	if res.RouteID != "root" {
+		t.Errorf("routeId = %q, want root", res.RouteID)
+	}
+	if want := "http://root.internal/other?a=1&b=2&a=3&c=4"; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+}
+
 // encodeJSONString renders s as a JSON string literal for embedding in config JSON.
 func encodeJSONString(s string) string {
 	b, _ := json.Marshal(s)
