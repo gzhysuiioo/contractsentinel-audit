@@ -536,6 +536,52 @@ func validatePrefix(prefix, loc, id string) *Failure {
 	return nil
 }
 
+// upstreamParts is the one shared reading of a raw upstream URL's address
+// boundaries. Every field is a slice of the original bytes (nothing is
+// copied, decoded or normalized), so validation and joining cannot disagree
+// about where one part ends and the next begins:
+//
+//	scheme "://" [userinfo "@"] hostPort basePath
+//
+// authority runs from after "://" to the first path slash, and hostPort is
+// the authority after its last '@', so colons in userinfo or the base path
+// can never be read as part of an IPv6 host, while brackets, a port and a
+// zone stay inside hostPort.
+type upstreamParts struct {
+	schemeEnd int    // index of the ':' in "://", or -1 when the scheme is absent
+	authority string // bytes between "://" and the first path slash (userinfo included)
+	hostPort  string // authority after the last '@' (host plus optional port)
+	basePath  string // from the first path slash to the end, or ""
+}
+
+// splitUpstream applies the single boundary rule shared by the bracketed-host
+// check, the unbracketed-IPv6 check and the final join. It never rejects
+// anything on its own: a raw value without "://" comes back with schemeEnd
+// set to -1 and empty parts, leaving the generic absolute-URL check to
+// report it, exactly as the per-caller preamble used to.
+func splitUpstream(raw string) upstreamParts {
+	p := upstreamParts{schemeEnd: -1}
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return p
+	}
+	p.schemeEnd = i
+	tail := raw[i+3:]
+	if j := strings.IndexByte(tail, '/'); j >= 0 {
+		p.authority = tail[:j]
+		p.basePath = tail[j:]
+	} else {
+		p.authority = tail
+	}
+	// Any userinfo precedes the host and ends at the last '@'; that boundary
+	// is what keeps a userinfo colon out of the IPv6-host checks.
+	p.hostPort = p.authority
+	if k := strings.LastIndexByte(p.authority, '@'); k >= 0 {
+		p.hostPort = p.authority[k+1:]
+	}
+	return p
+}
+
 func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
@@ -544,15 +590,17 @@ func validateUpstream(raw, loc, id string) *Failure {
 	// url.Parse: square brackets are the IP-literal marker, so whatever they
 	// enclose must be a legal IPv6 address (full, compressed or IPv4-tail,
 	// zone included) rather than a name or an IPv4 address, and an IPv6
-	// literal may never appear without that pair of brackets. Doing both
-	// explicitly keeps the rules independent of url.Parse's parser strictness
-	// and lets the reason name the field and the actual problem instead of
-	// surfacing a generic URL parse error (an unbracketed literal otherwise
-	// reaches the user as a misleading "invalid port" complaint).
-	if f := validateBracketedUpstreamHost(raw, loc, id); f != nil {
+	// literal may never appear without that pair of brackets. Both checks and
+	// the later join read the same splitUpstream boundaries, which keeps the
+	// rules independent of url.Parse's parser strictness and lets the reason
+	// name the field and the actual problem instead of surfacing a generic URL
+	// parse error (an unbracketed literal otherwise reaches the user as a
+	// misleading "invalid port" complaint).
+	p := splitUpstream(raw)
+	if f := validateBracketedUpstreamHost(p, loc, id); f != nil {
 		return f
 	}
-	if f := validateUnbracketedUpstreamHost(raw, loc, id); f != nil {
+	if f := validateUnbracketedUpstreamHost(p, loc, id); f != nil {
 		return f
 	}
 	u, err := url.Parse(raw)
@@ -568,8 +616,8 @@ func validateUpstream(raw, loc, id string) *Failure {
 	return nil
 }
 
-// validateBracketedUpstreamHost checks the raw upstream's authority for an
-// IP literal in square brackets: brackets are reserved for an IPv6 (or
+// validateBracketedUpstreamHost checks the split raw upstream's authority for
+// an IP literal in square brackets: brackets are reserved for an IPv6 (or
 // future IP-version) literal, so their content must parse as an IPv6 address
 // — full form, compressed form or an IPv6 address with an embedded IPv4
 // tail — and the brackets must wrap the whole host exactly once:
@@ -588,22 +636,11 @@ func validateUpstream(raw, loc, id string) *Failure {
 // error in a syntactically valid JSON document, never a JSON parse failure,
 // and the rule is enforced here on the raw bytes rather than left to
 // url.Parse's parser strictness.
-func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
-	// The authority starts after the scheme separator and ends at the first
-	// path slash (query and fragment were rejected by the caller).
-	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd < 0 {
+func validateBracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
 	}
-	authority := raw[schemeEnd+3:]
-	if i := strings.IndexByte(authority, '/'); i >= 0 {
-		authority = authority[:i]
-	}
-	// Any userinfo precedes the host and ends at the last '@'.
-	hostPort := authority
-	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
-		hostPort = authority[i+1:]
-	}
+	hostPort := p.hostPort
 
 	if !strings.ContainsAny(hostPort, "[]") {
 		return nil // ordinary reg-name (domain) or bare IPv4 host stays as-is
@@ -680,26 +717,17 @@ func invalidBracketedHost(label, literal string) *Failure {
 //
 // Ordinary domains and bare IPv4 hosts (with or without a port) stay
 // untouched, and the colons in userinfo or the base path are never
-// inspected: only the host segment between the last '@' and the first '/'
-// is considered. Like the bracketed-host rule this is a content error in a
+// inspected: only hostPort — the authority after the last '@' and before
+// the first '/' according to the shared splitUpstream boundaries — is
+// considered. Like the bracketed-host rule this is a content error in a
 // syntactically valid JSON document, never a JSON parse failure, and it is
 // decided on the raw bytes before url.Parse so the wording cannot regress to
 // that parser's generic "invalid port" error.
-func validateUnbracketedUpstreamHost(raw, loc, id string) *Failure {
-	// Isolate the authority exactly the way the bracketed check does: after
-	// the scheme separator, before the first path slash, with any userinfo
-	// (whose colons must not count) stripped at the last '@'.
-	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd < 0 {
+func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
 	}
-	hostPort := raw[schemeEnd+3:]
-	if i := strings.IndexByte(hostPort, '/'); i >= 0 {
-		hostPort = hostPort[:i]
-	}
-	if i := strings.LastIndexByte(hostPort, '@'); i >= 0 {
-		hostPort = hostPort[i+1:]
-	}
+	hostPort := p.hostPort
 	if hostPort == "" || strings.ContainsAny(hostPort, "[]") {
 		// No host (the generic check reports it) or a bracketed literal,
 		// which the bracketed-host validator owns.
@@ -985,13 +1013,12 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	}
 
 	// Slice the validated upstream raw so nothing outside the junction is
-	// normalized or re-escaped (scheme://[userinfo@]host[/base-path]).
-	schemeEnd := strings.Index(route.Upstream, "://")
-	tail := route.Upstream[schemeEnd+3:]
-	hostPart, basePath := tail, ""
-	if i := strings.IndexByte(tail, '/'); i >= 0 {
-		hostPart, basePath = tail[:i], tail[i:]
-	}
+	// normalized or re-escaped. The address boundaries come from the same
+	// splitUpstream reading the host validators used (scheme://authority
+	// followed by the base path), so joining can never split userinfo, the
+	// IPv6 brackets, the port or the base path differently than validation.
+	parts := splitUpstream(route.Upstream)
+	basePath := parts.basePath
 
 	// Collapse only the junction run: all trailing slashes of the base
 	// path meet all leading slashes of the remainder, and the junction
@@ -1002,7 +1029,7 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	rest := strings.TrimLeft(remainder, "/")
 	joined := baseTrimmed + "/" + rest
 
-	result := route.Upstream[:schemeEnd+3] + hostPart + joined
+	result := route.Upstream[:parts.schemeEnd+3] + parts.authority + joined
 	query, f := applyQueryTransforms(route.QueryTransforms, target)
 	if f != nil {
 		return "", f
