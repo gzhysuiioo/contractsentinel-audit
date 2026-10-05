@@ -17,17 +17,9 @@ package contractsentinel
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"unicode/utf8"
 )
-
-// charPathStep locates one JSON value, the same schema-free convention as
-// dupPathStep: a member step or an array-index step.
-type charPathStep struct {
-	key   string // member name for an object step; "" for an array step
-	index int    // 0-based array index for an array step; -1 for a member step
-}
 
 const (
 	// charKindEncoding classifies an invalid UTF-8 byte.
@@ -44,7 +36,7 @@ type charEncodingError struct {
 	kind    string
 	problem string // e.g. `unpaired high surrogate escape \uD800`
 	where   string // "member name", "string value" or "input"
-	path    []charPathStep
+	path    []jsonPathStep
 	offset  int
 	line    int
 	column  int
@@ -67,20 +59,11 @@ func (e *charEncodingError) Error() string {
 
 // renderCharPath renders the location as ".key[index].key"; an empty path is
 // the document root.
-func renderCharPath(path []charPathStep) string {
+func renderCharPath(path []jsonPathStep) string {
 	if len(path) == 0 {
 		return "the top-level value"
 	}
-	var b bytes.Buffer
-	for _, step := range path {
-		if step.index >= 0 {
-			fmt.Fprintf(&b, "[%d]", step.index)
-		} else {
-			b.WriteByte('.')
-			b.WriteString(step.key)
-		}
-	}
-	return b.String()
+	return renderJSONPath(path)
 }
 
 // validateJSONCharacters scans data and returns the first character-legality
@@ -128,115 +111,42 @@ func firstInvalidUTF8Byte(data []byte) *charEncodingError {
 	return nil
 }
 
-// scanJSONStringEscapes walks the document token by token and validates every
-// JSON string literal it reaches, checking both raw UTF-8 validity and
-// surrogate pairing. It is best-effort over syntax: any decoder error stops
-// the walk and returns nil, because json.Unmarshal owns syntax errors. String
-// tokens returned successfully have precise bounds even if a later part of
-// the document is malformed.
+// scanJSONStringEscapes validates every JSON string literal in the document,
+// checking both raw UTF-8 validity and surrogate pairing. The structural walk
+// — which values are objects or arrays, how deep they nest and which path
+// locates each of them — is shared with the duplicate-member check in
+// walkJSONTokens, so both checks reach exactly the same member names and
+// string values at every depth, including unknown extension members; this
+// check only adds the per-literal character validation. The walk is
+// best-effort over syntax: a decoder error stops it quietly, because
+// json.Unmarshal owns syntax errors. String tokens returned successfully have
+// precise bounds even if a later part of the document is malformed.
 func scanJSONStringEscapes(data []byte) *charEncodingError {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	// Keep number literals as text; their bytes are never string content.
-	dec.UseNumber()
-
-	start := 0
-	tok, err := dec.Token()
-	if err != nil {
-		return nil // malformed JSON: defer to json.Unmarshal
-	}
-	end := int(dec.InputOffset())
-	switch v := tok.(type) {
-	case string:
-		return checkStringToken(data, start, end, nil, false)
-	case json.Delim:
-		if v == '{' {
-			return scanCharObject(dec, data, nil)
-		}
-		if v == '[' {
-			return scanCharArray(dec, data, nil)
-		}
-	}
-	return nil
+	var result *charEncodingError
+	walkJSONTokens(data, jsonWalkHooks{
+		memberName: func(path []jsonPathStep, name string, start, end int) bool {
+			// The member name itself is a JSON string and must be legal even
+			// when the member is an unknown extension that never reaches the
+			// decoder. Its location is the containing object: an unpaired
+			// escape in the name cannot render the name itself, so the path
+			// stops at the parent.
+			return recordFirst(&result, checkStringToken(data, start, end, path, true))
+		},
+		stringValue: func(path []jsonPathStep, start, end int) bool {
+			return recordFirst(&result, checkStringToken(data, start, end, path, false))
+		},
+	})
+	return result
 }
 
-// scanCharObject scans one JSON object whose opening brace was just consumed.
-func scanCharObject(dec *json.Decoder, data []byte, path []charPathStep) *charEncodingError {
-	for dec.More() {
-		keyStart := int(dec.InputOffset())
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		keyEnd := int(dec.InputOffset())
-		key, _ := keyTok.(string)
-		memberPath := append(append([]charPathStep(nil), path...), charPathStep{key: key, index: -1})
-		// The member name itself is a JSON string and must be legal even when
-		// the member is an unknown extension that never reaches the decoder.
-		// Its location is the containing object: an unpaired escape in the
-		// name cannot render the name itself, so the path stops at the parent.
-		if e := checkStringToken(data, keyStart, keyEnd, path, true); e != nil {
-			return e
-		}
-		valStart := int(dec.InputOffset())
-		valTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		valEnd := int(dec.InputOffset())
-		switch v := valTok.(type) {
-		case string:
-			if e := checkStringToken(data, valStart, valEnd, memberPath, false); e != nil {
-				return e
-			}
-		case json.Delim:
-			if v == '{' {
-				if e := scanCharObject(dec, data, memberPath); e != nil {
-					return e
-				}
-			} else if v == '[' {
-				if e := scanCharArray(dec, data, memberPath); e != nil {
-					return e
-				}
-			}
-		}
+// recordFirst stores e when it is the first violation found and reports
+// whether the walk should stop.
+func recordFirst(result **charEncodingError, e *charEncodingError) (stop bool) {
+	if e == nil {
+		return false
 	}
-	if _, err := dec.Token(); err != nil { // consume '}'
-		return nil // malformed JSON: defer
-	}
-	return nil
-}
-
-// scanCharArray scans one JSON array whose opening bracket was just consumed.
-func scanCharArray(dec *json.Decoder, data []byte, path []charPathStep) *charEncodingError {
-	for i := 0; dec.More(); i++ {
-		elemStart := int(dec.InputOffset())
-		elemTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		elemEnd := int(dec.InputOffset())
-		elemPath := append(append([]charPathStep(nil), path...), charPathStep{index: i})
-		switch v := elemTok.(type) {
-		case string:
-			if e := checkStringToken(data, elemStart, elemEnd, elemPath, false); e != nil {
-				return e
-			}
-		case json.Delim:
-			if v == '{' {
-				if e := scanCharObject(dec, data, elemPath); e != nil {
-					return e
-				}
-			} else if v == '[' {
-				if e := scanCharArray(dec, data, elemPath); e != nil {
-					return e
-				}
-			}
-		}
-	}
-	if _, err := dec.Token(); err != nil { // consume ']'
-		return nil // malformed JSON: defer
-	}
-	return nil
+	*result = e
+	return true
 }
 
 // checkStringToken validates one raw token slice data[start:end] holding a
@@ -245,7 +155,7 @@ func scanCharArray(dec *json.Decoder, data []byte, path []charPathStep) *charEnc
 // ends on the token's closing quote and JSON grammar permits no quote in that
 // prefix, so the first quote byte is the opening quote. isMemberName selects
 // how the location is described.
-func checkStringToken(data []byte, start, end int, path []charPathStep, isMemberName bool) *charEncodingError {
+func checkStringToken(data []byte, start, end int, path []jsonPathStep, isMemberName bool) *charEncodingError {
 	raw := data[start:end]
 	q := bytes.IndexByte(raw, '"')
 	if q < 0 || raw[len(raw)-1] != '"' {
@@ -360,13 +270,13 @@ func isHighSurrogate(r rune) bool { return 0xD800 <= r && r <= 0xDBFF }
 func isLowSurrogate(r rune) bool  { return 0xDC00 <= r && r <= 0xDFFF }
 
 // charError builds a charEncodingError, deriving line and column once.
-func charError(kind, problem, where string, path []charPathStep, offset int, data []byte) *charEncodingError {
+func charError(kind, problem, where string, path []jsonPathStep, offset int, data []byte) *charEncodingError {
 	line, column := lineColumn(data, offset)
 	return &charEncodingError{
 		kind:    kind,
 		problem: problem,
 		where:   where,
-		path:    append([]charPathStep(nil), path...),
+		path:    append([]jsonPathStep(nil), path...),
 		offset:  offset,
 		line:    line,
 		column:  column,
