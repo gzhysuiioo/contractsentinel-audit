@@ -848,7 +848,12 @@ type requestJSON struct {
 // method is always checked before target, regardless of the key order in the
 // object. Only after both fields are present strings are their contents
 // (required method, legal token, absolute target without a fragment or a bad
-// percent escape) validated, so an empty string stays a content error.
+// percent escape) validated, so an empty string stays a content error. Once
+// those checks pass, the target is rejected when it carries a character that
+// may never appear directly — the ASCII space, the C0 control characters or
+// DEL — no matter whether it sits in the path, a parameter name or a
+// parameter value; the rejection happens here, before route selection and
+// query rewriting, so no route match, conflict or transform can hide it.
 func ParseRequest(data []byte) (*Request, *Failure) {
 	body, err := unmarshalJSONValue(data)
 	if err != nil {
@@ -891,7 +896,28 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 	case !validPercentEscapes(req.Target):
 		return nil, failuref("invalid_request", "target contains an invalid percent escape")
 	}
+	if c, ok := firstBareTargetByte(req.Target); ok {
+		return nil, failuref("invalid_request",
+			"target contains a character that must not appear directly: U+%04X (the ASCII space, the control characters U+0000-U+001F and U+007F must be percent-encoded instead)",
+			c)
+	}
 	return &req, nil
+}
+
+// firstBareTargetByte reports the first byte of s that may never appear
+// directly in a request target: the ASCII space, the C0 control characters
+// (U+0000-U+001F) and DEL (U+007F). The check runs on the raw target bytes,
+// so a percent escape such as "%20" or "%0A" is three ordinary bytes and
+// stays legal — only a character the JSON document decoded into the string
+// itself (a literal space, or a "\n" escape that became a real newline) is
+// rejected, whether it sits in the path, a parameter name or a value.
+func firstBareTargetByte(s string) (byte, bool) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == ' ' || c < 0x20 || c == 0x7f {
+			return c, true
+		}
+	}
+	return 0, false
 }
 
 // decodeRequestStringField renders the request wording for one string field;
