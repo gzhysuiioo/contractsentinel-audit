@@ -600,7 +600,7 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateBracketedUpstreamHost(p, loc, id); f != nil {
 		return f
 	}
-	if f := validateUnbracketedUpstreamHost(p, loc, id); f != nil {
+	if f := validateUnbracketedUpstreamHost(p, raw, loc, id); f != nil {
 		return f
 	}
 	u, err := url.Parse(raw)
@@ -723,7 +723,16 @@ func invalidBracketedHost(label, literal string) *Failure {
 // syntactically valid JSON document, never a JSON parse failure, and it is
 // decided on the raw bytes before url.Parse so the wording cannot regress to
 // that parser's generic "invalid port" error.
-func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
+//
+// The same boundary also bounds the colon count: an unbracketed host part
+// may carry at most one colon, separating the host from its port. Two or
+// more colons in hostPort always fail — even when the bytes do not parse as
+// a legal IPv6 literal ("api:internal:8080", "name:part:80" or
+// "2001:db8:::1") — because the host/port boundary is just as undefined
+// there, and whether the tail happens to be digits or a base path follows
+// changes nothing. The address is never repaired: no brackets are inserted,
+// no colon is dropped and neither host nor port is guessed.
+func validateUnbracketedUpstreamHost(p upstreamParts, raw, loc, id string) *Failure {
 	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
 	}
@@ -735,7 +744,8 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	}
 
 	// A bare IPv6 literal carries at least two colons; a reg-name may contain
-	// a single colon only in the port separator, so skip the parse for those.
+	// a single colon only in the port separator, so anything below that is
+	// left to the generic checks.
 	host := hostPort
 	if strings.Count(host, ":") < 2 {
 		return nil
@@ -764,7 +774,13 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 				routeLabel(loc, id), host)
 		}
 	}
-	return nil
+	// Not a legal IPv6 literal either, but the extra colons still leave the
+	// host/port boundary undefined: an unbracketed host may carry at most
+	// one colon, for the port separator. The address is reported as
+	// configured and never rewritten.
+	return failuref("invalid_config",
+		"%s: upstream %q has an unbracketed host part with more than one colon: %q may contain at most one colon, separating the host from its port; the host and port are never guessed and brackets are never added",
+		routeLabel(loc, id), raw, host)
 }
 
 // isDigits reports whether s is a non-empty run of ASCII digits.
