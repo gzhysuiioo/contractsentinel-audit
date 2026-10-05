@@ -399,8 +399,8 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 		if check, ok := checkByRule[rule.ID]; ok {
 			status = check.Status
 			note = check.Note
-		} else if holds, checked := invariants[rule.Invariant]; checked {
-			if holds {
+		} else if verdict := judgeInvariant(rule, invariants); verdict.checked {
+			if verdict.holds {
 				status = StatusPass
 			} else {
 				status = StatusDefect
@@ -419,7 +419,7 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 		if status == StatusDefect {
 			evidence := note
 			if evidence == "" {
-				evidence = "invariant " + rule.Invariant + " does not hold"
+				evidence = defectEvidence(rule.Invariant)
 			}
 			report.Findings = append(report.Findings, ReportFinding{
 				ArtifactHash: hash,
@@ -581,7 +581,7 @@ func validateReport(r Report, fail func(string) error) error {
 		}
 		wantEvidence := rule.Note
 		if wantEvidence == "" {
-			wantEvidence = "invariant " + rule.Invariant + " does not hold"
+			wantEvidence = defectEvidence(rule.Invariant)
 		}
 		if f.Evidence != wantEvidence {
 			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has evidence " + f.Evidence + ", want " + wantEvidence)
