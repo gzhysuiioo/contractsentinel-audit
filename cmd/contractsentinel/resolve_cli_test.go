@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -492,6 +493,130 @@ func TestResolveCLISetInvalidEscapeNoPartialSuccess(t *testing.T) {
 	}
 	if !strings.Contains(fail.Reason, "percent escape") {
 		t.Errorf("reason = %q, want a percent-escape reason", fail.Reason)
+	}
+}
+
+// TestResolveCLIRemoveSpecialCharNames drives a remove rule whose name
+// contains query-string delimiters the way a user does: the rule comes from
+// the config file as the literal text "a&b=c" (never re-split or decoded),
+// the request from stdin, and the resulting upstreamURL is observed in full.
+// Both lowercase and uppercase hex spellings of that encoded name — with a
+// value, with an empty value and without an equals sign — are one and the
+// same name and must all be deleted wherever they sit, while surviving
+// parameters, their value bytes ('+' and lowercase escapes), empty fragments
+// and their relative order stay byte for byte. Route matching and the path
+// junction are unaffected.
+func TestResolveCLIRemoveSpecialCharNames(t *testing.T) {
+	cases := []struct {
+		name     string
+		ruleName string
+		target   string
+		wantURL  string
+	}{
+		{
+			// The product example verbatim: hits with a value, an empty value
+			// and no equals sign are interspersed with a kept parameter, an
+			// empty fragment and a trailing empty value.
+			name:     "all encodings and forms removed between verbatim survivors",
+			ruleName: "a&b=c",
+			target:   "/api/orders/7?keep=%2f+&a%26b%3Dc=1&&a%26b%3dc&tail=",
+			wantURL:  "http://orders.internal/7?keep=%2f+&&tail=",
+		},
+		{
+			// Removing every parameter with no empty fragment left drops the
+			// question mark entirely.
+			name:     "removing the whole query drops the mark",
+			ruleName: "a&b=c",
+			target:   "/api/orders/7?a%26b%3dc=1&a%26b%3Dc",
+			wantURL:  "http://orders.internal/7",
+		},
+		{
+			// A raw first '=' makes "a=b=c" a parameter named "a": the complex
+			// rule must not delete it, and a value merely containing the
+			// encoded name is data as well.
+			name:     "similar raw name and embedded value stay untouched",
+			ruleName: "a&b=c",
+			target:   "/api/orders/7?a=b=c&z=a%26b%3dc",
+			wantURL:  "http://orders.internal/7?a=b=c&z=a%26b%3dc",
+		},
+		{
+			// A literal '+' in the rule name matches only an encoded plus;
+			// both space spellings survive in place.
+			name:     "literal-plus rule leaves raw-plus and percent-space names",
+			ruleName: "a+b",
+			target:   "/api/orders/7?a%2Bb=1&a+b=2&a%20b=3",
+			wantURL:  "http://orders.internal/7?a+b=2&a%20b=3",
+		},
+		{
+			// No hit at all: the query stays byte for byte, empty question
+			// mark included.
+			name:     "no hit preserves the empty question mark",
+			ruleName: "a&b=c",
+			target:   "/api/orders/7?",
+			wantURL:  "http://orders.internal/7?",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caseConfig := `{
+			  "routes": [
+			    {"id": "orders", "methods": ["GET"], "pathPrefix": "/api/orders",
+			     "upstream": "http://orders.internal",
+			     "queryTransforms": [{"op": "remove", "name": ` + strconv.Quote(tc.ruleName) + `}]}
+			  ]
+			}`
+			request := `{"method":"GET","target":"` + tc.target + `"}`
+			success := assertResolveSuccess(t, runResolveCLI(t, caseConfig, request))
+			if success.RouteID != "orders" {
+				t.Errorf("routeId = %q, want orders", success.RouteID)
+			}
+			if success.UpstreamURL != tc.wantURL {
+				t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, tc.wantURL)
+			}
+		})
+	}
+}
+
+// TestResolveCLIRemoveInvalidEscapeNoPartialSuccess pairs a remove rule with
+// a request whose query holds a malformed percent escape — including one
+// inside the very parameter the rule would delete: the whole request is
+// invalid_request, stdout stays completely empty and no cleaned-up
+// upstreamURL is ever emitted, because request validation precedes route
+// selection and query rewriting.
+func TestResolveCLIRemoveInvalidEscapeNoPartialSuccess(t *testing.T) {
+	config := `{
+	  "routes": [
+	    {"id": "orders", "methods": ["GET"], "pathPrefix": "/api/orders",
+	     "upstream": "http://orders.internal",
+	     "queryTransforms": [{"op": "remove", "name": "a&b=c"}]}
+	  ]
+	}`
+	for _, target := range []string{
+		"/api/orders/7?a%26b%zz=1",       // bad escape inside the removed name itself
+		"/api/orders/7?a%26b%3dc&bad%zz", // bad escape in a valueless neighbor
+		"/api/orders/7?a%26b%3dc=1%2",    // truncated escape in a removed value
+	} {
+		t.Run(target, func(t *testing.T) {
+			request := `{"method":"GET","target":"` + target + `"}`
+			res := runResolveCLI(t, config, request)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_request" {
+				t.Errorf("code = %q, want invalid_request", fail.Code)
+			}
+			if !strings.Contains(fail.Reason, "percent escape") {
+				t.Errorf("reason = %q, want a percent-escape reason", fail.Reason)
+			}
+		})
 	}
 }
 

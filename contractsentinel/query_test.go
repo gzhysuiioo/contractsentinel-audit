@@ -351,6 +351,257 @@ func TestQueryTransformRemove(t *testing.T) {
 	}
 }
 
+// TestQueryTransformRemoveSpecialCharNames covers remove with a rule name
+// that itself contains query-string delimiters or encoding symbols: '&',
+// '=', '%' and '+'. The rule name is literal text — it is never split as a
+// query string or decoded — while request names are matched on their decoded,
+// case-sensitive form with '+' read as a space. These cases pin that every
+// hit is deleted (the lowercase and uppercase hex spellings, the valueless
+// form and the empty value, at any position) and that nothing else is touched:
+// a literal separator in a configured name cannot erase parameters whose name
+// merely looks similar, and surviving bytes, order and the question mark are
+// guaranteed on the complete output, not just on individual fragments.
+func TestQueryTransformRemoveSpecialCharNames(t *testing.T) {
+	cases := []struct {
+		name      string
+		ruleName  string
+		target    string
+		wantQuery string // expected suffix after http://h.internal/base/p
+	}{
+		{
+			// The exact product example: a%26b%3dc and a%26b%3Dc decode to the
+			// same literal name "a&b=c", so every spelling — the value "1",
+			// the empty value and the valueless parameter — is deleted even
+			// though they are interspersed with other parameters. The
+			// surviving keep/tail parameters, the value bytes '%2f+' and the
+			// empty fragment between them keep their bytes and order.
+			name:      "ampersand and equals name: all encodings and forms removed verbatim surroundings",
+			ruleName:  "a&b=c",
+			target:    "/p?keep=%2f+&a%26b%3Dc=1&&a%26b%3dc&tail=",
+			wantQuery: "?keep=%2f+&&tail=",
+		},
+		{
+			// The same three hit forms with no survivor and no empty
+			// fragment: nothing remains, so the '?' goes too.
+			name:      "ampersand and equals name: removing every fragment drops the mark",
+			ruleName:  "a&b=c",
+			target:    "/p?a%26b%3Dc=1&a%26b%3dc",
+			wantQuery: "",
+		},
+		{
+			// Hits at the start and the end must not drag adjacent separators
+			// or parameters away; survivors compact while keeping order.
+			name:      "ampersand and equals name: hits at both ends",
+			ruleName:  "a&b=c",
+			target:    "/p?a%26b%3dc=1&m=2&a%26b%3Dc",
+			wantQuery: "?m=2",
+		},
+		{
+			// The first raw '=' of a fragment splits name from value:
+			// "a=b=c" has name "a" and value "b=c", never the name "a=b".
+			// A rule named "a=b" must not delete it, and the query therefore
+			// stays byte for byte.
+			name:      "first raw equals splits, so a=b=c is named a not a=b",
+			ruleName:  "a=b",
+			target:    "/p?a=b=c",
+			wantQuery: "?a=b=c",
+		},
+		{
+			// The encoded spelling "a%3Db" does carry the name "a=b"; compare
+			// it with a differently-cased encoded '&'/'=' neighbor to show
+			// only the exact decoded name is deleted.
+			name:      "encoded equals name matches, raw-equals fragment does not",
+			ruleName:  "a=b",
+			target:    "/p?a=b=c&a%3Db=1&a%26b%3dc=2",
+			wantQuery: "?a=b=c&a%26b%3dc=2",
+		},
+		{
+			// The configured literal "%26" is one decode level away from "&":
+			// it matches only the double-encoded request form %2526. The
+			// single-encoded %26 decodes to '&' and survives untouched.
+			name:      "literal percent-escape name matches only the double-encoded form",
+			ruleName:  "%26",
+			target:    "/p?%26=1&%2526=2&%2526&%2526=",
+			wantQuery: "?%26=1",
+		},
+		{
+			// A literal '+' in the rule name is data, not a space: it matches
+			// only a%2Bb. A raw '+' (a space name) and "%20" (also a space)
+			// both stay, in their original spellings and positions.
+			name:      "literal plus name removes encoded-plus only, leaving both space spellings",
+			ruleName:  "a+b",
+			target:    "/p?a%2Bb=1&a+b=2&a%20b=3",
+			wantQuery: "?a+b=2&a%20b=3",
+		},
+		{
+			// Conversely a space in the rule name hits both space spellings
+			// on the wire but never the encoded-plus parameter.
+			name:      "space name removes both space spellings but not encoded plus",
+			ruleName:  "a b",
+			target:    "/p?a%2Bb=1&a+b=2&a%20b=3",
+			wantQuery: "?a%2Bb=1",
+		},
+		{
+			// Name comparison is case sensitive: an uppercase escape variant
+			// decodes to the same bytes (hex case is irrelevant when decoded),
+			// but an actual uppercase letter in the decoded name does not
+			// match a lowercase rule name.
+			name:      "matching is case sensitive for the decoded name",
+			ruleName:  "a&b=c",
+			target:    "/p?A%26B%3Dc=1&a%26b%3dc=2",
+			wantQuery: "?A%26B%3Dc=1",
+		},
+		{
+			// The same encoded text appearing inside a value is data: it is
+			// never read as a parameter name, so its parameter survives even
+			// though the rule name appears byte-for-byte inside the value.
+			name:      "same text inside a value does not mark the parameter for removal",
+			ruleName:  "a&b=c",
+			target:    "/p?x=a%26b%3dc&y=a%26b%3Dc=1&z=a%26b%3dc",
+			wantQuery: "?x=a%26b%3dc&y=a%26b%3Dc=1&z=a%26b%3dc",
+		},
+		{
+			// When the rule name is absent nothing changes at all: the empty
+			// question mark is preserved as an empty query string, not dropped.
+			name:      "no hit leaves a normal query byte for byte",
+			ruleName:  "a&b=c",
+			target:    "/p?x=1&%26=2",
+			wantQuery: "?x=1&%26=2",
+		},
+		{
+			name:      "no hit keeps an empty question mark",
+			ruleName:  "a&b=c",
+			target:    "/p?",
+			wantQuery: "?",
+		},
+		{
+			// A hit plus only empty fragments left: the mark survives because
+			// an empty fragment remains; the separator layout is preserved.
+			name:      "hit leaving only empty fragments keeps the mark and separators",
+			ruleName:  "a&b=c",
+			target:    "/p?a%26b%3dc=1&",
+			wantQuery: "?",
+		},
+		{
+			name:      "hit between empty fragments compacts only the hit",
+			ruleName:  "a&b=c",
+			target:    "/p?&&a%26b%3dc=1&&",
+			wantQuery: "?&&&",
+		},
+		{
+			// The configured name is used literally: a raw '&' in it never
+			// becomes two parameters to delete, and a raw '=' never turns into
+			// a name/value split — here nothing in the request matches, so the
+			// whole query (lowercase escapes in values, extra '=') survives.
+			name:      "configured name is not re-split or decoded when absent",
+			ruleName:  "p&q=r",
+			target:    "/p?%26=h&p%26q%3dr2=v=1",
+			wantQuery: "?%26=h&p%26q%3dr2=v=1",
+		},
+		{
+			// Duplicates of the complex name are all removed, including when
+			// one spelling appears as an empty value and another without '='.
+			name:      "duplicates of the complex name in all forms are all removed",
+			ruleName:  "a&b=c",
+			target:    "/p?a%26b%3dc&k=1&a%26b%3Dc=&a%26b%3dc=3&a%26b%3Dc",
+			wantQuery: "?k=1",
+		},
+		{
+			// Remove without any query string never creates a question mark.
+			name:      "complex-name remove with no query string adds no mark",
+			ruleName:  "a&b=c",
+			target:    "/p",
+			wantQuery: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rules := `[{"op":"remove","name":` + encodeJSONString(tc.ruleName) + `}]`
+			got := transformResult(t, rules, tc.target)
+			want := buildWant(tc.target, tc.wantQuery)
+			if got != want {
+				t.Errorf("upstreamURL = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestQueryTransformRemoveComplexNameKeepsRoutingAndJoin pins the complete
+// Resolution output when a complex-name remove fires: route selection and the
+// upstream path junction are decided before transforms run and must be
+// identical to the rule-free behavior, while only the matching query
+// parameters disappear. A second, transform-free route matching another path
+// preserves the identical query byte for byte.
+func TestQueryTransformRemoveComplexNameKeepsRoutingAndJoin(t *testing.T) {
+	cfg := mustConfig(t, `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1",
+	   "queryTransforms":[{"op":"remove","name":"a&b=c"}]},
+	  {"id":"root","methods":["*"],"pathPrefix":"/","upstream":"http://root.internal"}
+	]}`)
+
+	res := resolveJSON(t, cfg, `{"method":"GET","target":"/api/x/y?keep=%2f+&a%26b%3Dc=1&&a%26b%3dc&tail="}`)
+	if res.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", res.RouteID)
+	}
+	if want := "http://api.internal/v1/x/y?keep=%2f+&&tail="; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+
+	// On a path only the transform-free root route matches, the same query is
+	// preserved byte for byte.
+	res = resolveJSON(t, cfg, `{"method":"GET","target":"/other?keep=%2f+&a%26b%3Dc=1&a%26b%3dc&tail="}`)
+	if res.RouteID != "root" {
+		t.Errorf("routeId = %q, want root", res.RouteID)
+	}
+	if want := "http://root.internal/other?keep=%2f+&a%26b%3Dc=1&a%26b%3dc&tail="; res.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, want)
+	}
+}
+
+// TestQueryTransformRemoveInvalidEscapeNoPartialSuccess pins that remove can
+// never launder a malformed percent escape into an accepted request: request
+// validation runs before route selection and query rewriting, so bad content
+// fails as invalid_request even while sitting inside a parameter the rule
+// would have deleted — no cleaned-up success result may ever be emitted.
+func TestQueryTransformRemoveInvalidEscapeNoPartialSuccess(t *testing.T) {
+	cfg := transformConfig(t, `[{"op":"remove","name":"a&b=c"}]`)
+	targets := []string{
+		"/p?a%26b%zz=1",           // bad escape inside a to-be-removed name itself
+		"/p?a%26b%3dc&bad%zz",     // bad escape in a valueless neighbor
+		"/p?keep=1%2&a%26b%3dc=2", // truncated escape in a surviving value
+		"/p?a%26b%3dc=1%2",        // truncated escape in a removed parameter's value
+	}
+	for _, target := range targets {
+		// The front door: ParseRequest rejects the target outright.
+		_, rf := ParseRequest([]byte(`{"method":"GET","target":"` + target + `"}`))
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("ParseRequest(%q): got %+v, want invalid_request", target, rf)
+		}
+		// A caller that bypasses ParseRequest still gets invalid_request from
+		// Resolve whenever the malformed escape sits in a decoded name, and
+		// never a partial Resolution.
+		res, rf := Resolve(cfg, &Request{Method: "GET", Target: target})
+		if rf != nil && rf.Code != "invalid_request" {
+			t.Fatalf("Resolve(%q): got code %q, want invalid_request", target, rf.Code)
+		}
+		if res != nil && rf != nil {
+			t.Fatalf("Resolve(%q): got both %+v and %+v, want at most one", target, res, rf)
+		}
+	}
+
+	// A bad escape in a name the remove rule would have deleted is always
+	// caught, even via Resolve directly, with no partial success.
+	for _, target := range []string{"/p?a%26b%zz=1", "/p?a%26b%3dc&bad%zz"} {
+		res, rf := Resolve(cfg, &Request{Method: "GET", Target: target})
+		if rf == nil || rf.Code != "invalid_request" {
+			t.Fatalf("Resolve(%q): got %+v, want invalid_request", target, rf)
+		}
+		if res != nil {
+			t.Fatalf("Resolve(%q): got partial success %+v, want no resolution", target, res)
+		}
+	}
+}
+
 func TestQueryTransformRenameSpecExample(t *testing.T) {
 	// old=1&new=9&%6Fld=%2f+&old&x= renamed old -> new
 	rules := `[{"op":"rename","name":"old","to":"new"}]`
