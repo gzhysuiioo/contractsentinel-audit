@@ -80,26 +80,46 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 	return "?" + strings.Join(parts, "&"), nil
 }
 
+// matchesName is the one shared parameter-matching rule: an item is a hit
+// when it is a parameter (not an empty fragment) whose decoded name equals
+// name. Name decoding itself happens once at parse time, so every op compares
+// the same decoded, case-sensitive form.
+func matchesName(it queryItem, name string) bool {
+	return !it.empty && it.name == name
+}
+
+// firstNameHit returns the index of the first parameter matching name, or -1
+// when no parameter carries that name.
+func firstNameHit(items []queryItem, name string) int {
+	for k := range items {
+		if matchesName(items[k], name) {
+			return k
+		}
+	}
+	return -1
+}
+
+// dropName is the one shared keep-the-rest rule: it compacts items in place,
+// removing every parameter matching name while empty fragments and all other
+// parameters keep their relative order and original bytes.
+func dropName(items []queryItem, name string) []queryItem {
+	kept := items[:0]
+	for _, it := range items {
+		if !matchesName(it, name) {
+			kept = append(kept, it)
+		}
+	}
+	return kept
+}
+
 // applyRemove deletes every parameter whose decoded name equals name. With
 // no hit the query is untouched; after a hit the '?' is dropped only when no
 // parameters or empty fragments remain.
 func applyRemove(items []queryItem, present bool, name string) (bool, []queryItem) {
-	first := -1
-	for k := range items {
-		if !items[k].empty && items[k].name == name {
-			first = k
-			break
-		}
-	}
-	if first < 0 {
+	if firstNameHit(items, name) < 0 {
 		return present, items
 	}
-	kept := items[:0]
-	for _, it := range items {
-		if it.empty || it.name != name {
-			kept = append(kept, it)
-		}
-	}
+	kept := dropName(items, name)
 	if len(kept) == 0 {
 		return false, kept
 	}
@@ -111,25 +131,15 @@ func applyRemove(items []queryItem, present bool, name string) (bool, []queryIte
 // appended to the end and creates a query string when none existed.
 func applySet(items []queryItem, present bool, name, value string) (bool, []queryItem) {
 	encoded := encodeQueryComponent(name) + "=" + encodeQueryComponent(value)
-	first := -1
-	for k := range items {
-		if !items[k].empty && items[k].name == name {
-			first = k
-			break
-		}
-	}
+	first := firstNameHit(items, name)
 	if first < 0 {
 		items = append(items, queryItem{name: name, raw: encoded})
 		return true, items
 	}
+	// The merged pair takes the first hit's place; every later duplicate is
+	// dropped by the same keep-the-rest rule remove uses.
 	items[first].raw = encoded
-	kept := items[:first+1]
-	for _, it := range items[first+1:] {
-		if it.empty || it.name != name {
-			kept = append(kept, it)
-		}
-	}
-	return true, kept
+	return true, append(items[:first+1], dropName(items[first+1:], name)...)
 }
 
 // applyRename renames in place every parameter whose decoded name equals
@@ -144,7 +154,7 @@ func applyRename(items []queryItem, name, to string) []queryItem {
 	}
 	encodedTo := encodeQueryComponent(to)
 	for k := range items {
-		if items[k].empty || items[k].name != name {
+		if !matchesName(items[k], name) {
 			continue
 		}
 		frag := items[k].raw
