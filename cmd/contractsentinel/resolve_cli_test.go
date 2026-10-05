@@ -1331,6 +1331,126 @@ func TestResolveCLIValidIPv6Upstreams(t *testing.T) {
 	}
 }
 
+// TestResolveCLIMultiErrorChoiceAndRepair pins, at the command boundary,
+// which single error is reported when one syntactically complete config
+// carries several faults at once, and what happens as they are repaired one
+// at a time:
+//
+//   - stage 1: route 1 has an unknown queryTransforms op while route 2's
+//     methods is written as a string (route 2's valid id written after the
+//     bad field). The field type error must win; stdout stays empty.
+//   - stage 2: after route 2's methods becomes an array, route 1's rule error
+//     is what surfaces, with the 1-based route and rule positions.
+//   - stage 3: with both prior faults fixed, the same document resolves:
+//     route selection, upstream join and the query rewrite all run offline
+//     against an upstream host that never has to exist.
+//
+// Reordering the second route object's distinct keys must not change the
+// reported reason by a single byte.
+func TestResolveCLIMultiErrorChoiceAndRepair(t *testing.T) {
+	// build renders the shared document; the three varying slots let each
+	// stage repair exactly one fault. idAfter controls whether route 2's id
+	// is written after (true) or before (false) the methods field.
+	build := func(adminMethods, apiRule string, idAfter bool) string {
+		var route2Fields string
+		if idAfter {
+			// The valid non-empty id follows the offending field.
+			route2Fields = `"methods":` + adminMethods +
+				`,"pathPrefix":"/admin","upstream":"http://admin.internal","id":"admin"`
+		} else {
+			route2Fields = `"id":"admin","methods":` + adminMethods +
+				`,"pathPrefix":"/admin","upstream":"http://admin.internal"`
+		}
+		return `{
+		  "routes": [
+		    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1",
+		     "queryTransforms": [` + apiRule + `]},
+		    {` + route2Fields + `}
+		  ]
+		}`
+	}
+
+	decodeFailure := func(t *testing.T, res resolveResult) struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	} {
+		t.Helper()
+		if res.exitCode == 0 {
+			t.Fatalf("exit code = 0, want non-zero")
+		}
+		if len(res.stdout) != 0 {
+			t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+		}
+		var fail struct {
+			Code   string `json:"code"`
+			Reason string `json:"reason"`
+		}
+		decodeOneJSON(t, res.stderr, "stderr", &fail)
+		if fail.Code != "invalid_config" {
+			t.Fatalf("code = %q, want invalid_config", fail.Code)
+		}
+		return fail
+	}
+
+	request := `{"method":"GET","target":"/api/items?old=1&keep=2"}`
+
+	// Stage 1: both key orders report route 2's methods type error, byte for
+	// byte identically, and never route 1's unknown op.
+	stage1BadRule := `{"op":"frobnicate","name":"old"}`
+	var reasonKeyAfter string
+	for _, idAfter := range []bool{true, false} {
+		cfg := build(`"GET"`, stage1BadRule, idAfter)
+		fail := decodeFailure(t, runResolveCLI(t, cfg, request))
+		if fail.Reason != `route 2 (id "admin"): methods must be an array of strings` {
+			t.Fatalf("idAfter=%v reason = %q, want the route 2 methods type error",
+				idAfter, fail.Reason)
+		}
+		for _, forbidden := range []string{"route 1", "queryTransforms", "unknown op", "not valid JSON"} {
+			if strings.Contains(fail.Reason, forbidden) {
+				t.Fatalf("idAfter=%v reason must not contain %q: %q", idAfter, forbidden, fail.Reason)
+			}
+		}
+		if idAfter {
+			reasonKeyAfter = fail.Reason
+		} else if fail.Reason != reasonKeyAfter {
+			t.Fatalf("key reorder changed the reason:\n after:  %q\n before: %q",
+				reasonKeyAfter, fail.Reason)
+		}
+	}
+
+	// Stage 2: repair route 2's methods type; route 1's illegal rule surfaces
+	// with 1-based route and rule indices and the route id.
+	stage2 := build(`["GET"]`, stage1BadRule, true)
+	fail := decodeFailure(t, runResolveCLI(t, stage2, request))
+	for _, want := range []string{`route 1 (id "api")`, "queryTransforms rule 1", "unknown op"} {
+		if !strings.Contains(fail.Reason, want) {
+			t.Fatalf("stage 2 reason = %q, want substring %q", fail.Reason, want)
+		}
+	}
+	if strings.Contains(fail.Reason, "route 2") {
+		t.Fatalf("stage 2 must no longer blame the repaired route: %q", fail.Reason)
+	}
+
+	// Stage 3: repair the rule too; the document resolves and the rewrite
+	// runs (old -> new in place, keep untouched), joined onto route 1's base.
+	fixed := build(`["GET"]`, `{"op":"rename","name":"old","to":"new"}`, true)
+	success := assertResolveSuccess(t, runResolveCLI(t, fixed, request))
+	if success.RouteID != "api" {
+		t.Fatalf("routeId = %q, want api", success.RouteID)
+	}
+	if want := "http://api.internal/v1/items?new=1&keep=2"; success.UpstreamURL != want {
+		t.Fatalf("upstreamURL = %q, want %q", success.UpstreamURL, want)
+	}
+
+	// A request for route 2 proves the repaired route also selects and joins
+	// normally, with its raw query preserved.
+	admin := assertResolveSuccess(t, runResolveCLI(t, fixed,
+		`{"method":"GET","target":"/admin/x?a=1&a="}`))
+	if admin.RouteID != "admin" || admin.UpstreamURL != "http://admin.internal/x?a=1&a=" {
+		t.Fatalf("admin route = %+v, want joined URL with verbatim query", admin)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not
