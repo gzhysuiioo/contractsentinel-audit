@@ -427,59 +427,30 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 	return report, nil
 }
 
-// canonicalRule is the order-independent view of a rule used for the id. The
-// note is omitted when empty so reports built only from invariant booleans
-// keep their original ids.
-type canonicalRule struct {
-	ID          string `json:"id"`
-	Kind        string `json:"kind"`
-	Severity    string `json:"severity"`
-	Invariant   string `json:"invariant"`
-	RequiresABI bool   `json:"requiresABI"`
-	Version     string `json:"version"`
-	Status      string `json:"status"`
-	Note        string `json:"note,omitempty"`
-}
-
-// canonicalFinding is the order-independent view of a finding used for the id.
-type canonicalFinding struct {
-	ArtifactHash string `json:"artifactHash"`
-	RuleID       string `json:"ruleId"`
-	Version      string `json:"version"`
-	Severity     string `json:"severity"`
-	Invariant    string `json:"invariant"`
-	Evidence     string `json:"evidence"`
-}
-
 // canonicalReport is the deterministic content a report id is computed from.
+// Rules and findings are the report's own values: ReportRule and
+// ReportFinding already carry exactly the fields the id binds, in id order,
+// with the note omitted when empty so reports built only from invariant
+// booleans keep their original ids. Only the artifact's hash and name are
+// reshaped, and the report id itself never participates.
 type canonicalReport struct {
-	ArtifactHash string             `json:"artifactHash"`
-	Name         string             `json:"name"`
-	Rules        []canonicalRule    `json:"rules"`
-	Findings     []canonicalFinding `json:"findings"`
+	ArtifactHash string          `json:"artifactHash"`
+	Name         string          `json:"name"`
+	Rules        []ReportRule    `json:"rules"`
+	Findings     []ReportFinding `json:"findings"`
 }
 
-// canonicalize renders a report into its order-independent form.
+// canonicalize renders a report into its order-independent form. The rules
+// and findings are copied before sorting so the report's own order is never
+// disturbed.
 func canonicalize(report Report) canonicalReport {
 	cr := canonicalReport{
 		ArtifactHash: report.Artifact.Hash,
 		Name:         report.Artifact.Name,
-	}
-	for _, rule := range report.Rules {
-		cr.Rules = append(cr.Rules, canonicalRule{
-			ID: rule.ID, Kind: rule.Kind, Severity: rule.Severity,
-			Invariant: rule.Invariant, RequiresABI: rule.RequiresABI,
-			Version: rule.Version, Status: rule.Status, Note: rule.Note,
-		})
+		Rules:        append([]ReportRule(nil), report.Rules...),
+		Findings:     append([]ReportFinding(nil), report.Findings...),
 	}
 	sort.Slice(cr.Rules, func(i, j int) bool { return cr.Rules[i].ID < cr.Rules[j].ID })
-	for _, finding := range report.Findings {
-		cr.Findings = append(cr.Findings, canonicalFinding{
-			ArtifactHash: finding.ArtifactHash, RuleID: finding.RuleID,
-			Version: finding.Version, Severity: finding.Severity,
-			Invariant: finding.Invariant, Evidence: finding.Evidence,
-		})
-	}
 	sort.Slice(cr.Findings, func(i, j int) bool { return cr.Findings[i].RuleID < cr.Findings[j].RuleID })
 	return cr
 }
