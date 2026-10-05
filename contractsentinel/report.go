@@ -399,10 +399,13 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 		if check, ok := checkByRule[rule.ID]; ok {
 			status = check.Status
 			note = check.Note
-		} else if holds, checked := invariants[rule.Invariant]; checked {
-			if holds {
+		} else {
+			// No imported check: the invariant booleans decide. The verdict
+			// interpretation is shared with the finding-list path in Run.
+			switch checkInvariant(rule, invariants) {
+			case invariantHolds:
 				status = StatusPass
-			} else {
+			case invariantViolated:
 				status = StatusDefect
 			}
 		}
@@ -419,7 +422,7 @@ func BuildReport(artifact Artifact, rules []Rule, invariants map[string]bool, ch
 		if status == StatusDefect {
 			evidence := note
 			if evidence == "" {
-				evidence = "invariant " + rule.Invariant + " does not hold"
+				evidence = invariantEvidence(rule.Invariant)
 			}
 			report.Findings = append(report.Findings, ReportFinding{
 				ArtifactHash: hash,
@@ -581,7 +584,7 @@ func validateReport(r Report, fail func(string) error) error {
 		}
 		wantEvidence := rule.Note
 		if wantEvidence == "" {
-			wantEvidence = "invariant " + rule.Invariant + " does not hold"
+			wantEvidence = invariantEvidence(rule.Invariant)
 		}
 		if f.Evidence != wantEvidence {
 			return fail("report " + r.ReportID + " finding for rule " + f.RuleID + " has evidence " + f.Evidence + ", want " + wantEvidence)
