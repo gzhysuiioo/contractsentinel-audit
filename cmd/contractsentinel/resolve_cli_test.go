@@ -1022,6 +1022,101 @@ func TestResolveCLIBracketedHostMustBeIPv6(t *testing.T) {
 	}
 }
 
+// TestResolveCLIMissingHostUpstream drives the host-presence rule at the
+// command boundary: an upstream whose authority names no host — a bare port,
+// a lone separator or a bare port behind userinfo — rejects the whole config
+// up front, even when the request would only hit the valid first route and
+// even though the document is legal JSON. Failure keeps the usual contract:
+// non-zero exit, completely empty stdout and one JSON invalid_config error on
+// stderr whose reason names the route position, its id and the upstream field
+// and says the host is missing (never that the config JSON failed to parse or
+// that an IPv6 literal lacks brackets). A config error also wins over an
+// invalid request. An upstream that does name a host with an empty port keeps
+// resolving byte for byte.
+func TestResolveCLIMissingHostUpstream(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"bare port under a base path", "http://:8080/base"},
+		{"bare port without a path", "https://:8443"},
+		{"lone port separator under a base path", "http://:/base"},
+		{"encoded userinfo then a bare port", "https://user:p%40ss@:8443/v1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.upstream + `"}
+			  ]
+			}`
+			// The request hits the valid first route only.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "missing a host"} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, bad := range []string{"not valid JSON", "bracket", "invalid port"} {
+				if strings.Contains(fail.Reason, bad) {
+					t.Errorf("a missing host must read as a missing-host error, reason = %q must not mention %q", fail.Reason, bad)
+				}
+			}
+		})
+	}
+
+	// A missing-host config wins over an invalid request: config validation
+	// precedes request parsing, so even broken request JSON yields
+	// invalid_config.
+	badConfig := `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/x","upstream":"http://:8080/base"}]}`
+	res := runResolveCLI(t, badConfig, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+	for _, want := range []string{"route 1", `"x"`, "upstream", "missing a host"} {
+		if !strings.Contains(fail.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+		}
+	}
+
+	// An upstream that does name a host with an empty port keeps the existing
+	// acceptance and resolves byte for byte.
+	okConfig := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api",
+	  "upstream":"http://api.internal:/base"}]}`
+	success := assertResolveSuccess(t, runResolveCLI(t, okConfig,
+		`{"method":"GET","target":"/api/items?z=1"}`))
+	if success.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", success.RouteID)
+	}
+	if want := "http://api.internal:/base/items?z=1"; success.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, want)
+	}
+}
+
 // TestResolveCLIUnbracketedIPv6Host drives the missing-bracket rule at the
 // command boundary: a full, compressed or IPv4-tail IPv6 literal written
 // without square brackets — with a digit suffix, a zone or userinfo too —

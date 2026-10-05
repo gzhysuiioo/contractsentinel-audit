@@ -604,6 +604,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUnbracketedUpstreamHost(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamHasHost(p, loc, id); f != nil {
+		return f
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
@@ -611,10 +614,57 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return failuref("invalid_config", "%s (id %q): upstream must be an absolute http or https URL", loc, id)
 	}
+	// Backstop for a scheme spelling without an authority at all (e.g.
+	// "http:" or "http:opaque"), which splitUpstream cannot read and so the
+	// raw host checks skip.
 	if u.Host == "" {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
 	return nil
+}
+
+// validateUpstreamHasHost enforces that the authority actually names a host.
+// The decision is made on splitUpstream's raw hostPort — the authority after
+// its last '@' — rather than on url.Parse: Go's parser accepts an authority
+// whose only bytes are a port (http://:8080/base), a lone separator
+// (http://:/base) or a port behind userinfo
+// (https://user:p%40ss@:8443/v1) and reports a non-empty u.Host (":8080"),
+// so the port would masquerade as the host and the joined upstream would be
+// emitted with none. Userinfo and the base path are sliced off by
+// splitUpstream before this check, and the port is the part at or after the
+// first colon outside a bracket, so none of them can fill in for the missing
+// host and no default address is ever substituted. A host spelled with an
+// empty port ("api.internal:") keeps its host and stays accepted, and a
+// bracketed literal starts with '[' (its validity is the bracketed-host
+// validator's responsibility). Like the other host rules this is a content
+// error in a syntactically valid JSON document, never a JSON parse failure or
+// an IPv6-bracket complaint.
+func validateUpstreamHasHost(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	host := p.hostPort
+	// Outside a bracket the first colon is the host/port separator; only the
+	// bytes before it are the host. A bracketed literal starts with '[' and
+	// therefore always names a host here.
+	if !strings.HasPrefix(p.hostPort, "[") {
+		if i := strings.IndexByte(p.hostPort, ':'); i >= 0 {
+			host = p.hostPort[:i]
+		}
+	}
+	if host != "" {
+		return nil
+	}
+	label := routeLabel(loc, id)
+	if p.hostPort == "" {
+		return failuref("invalid_config",
+			"%s: upstream is missing a host: the authority after the scheme is empty (userinfo, a port and the base path cannot take the host's place); write e.g. \"http://example.com/base\"",
+			label)
+	}
+	// hostPort begins with ':': a bare ":port" (or ":") with no host bytes.
+	return failuref("invalid_config",
+		"%s: upstream is missing a host: %q has only %q where the host belongs, and a port cannot serve as the host even when userinfo or a base path is present; write e.g. \"http://example.com:8080/base\"",
+		label, p.raw, p.hostPort)
 }
 
 // validateBracketedUpstreamHost checks the split raw upstream's authority for
@@ -750,8 +800,8 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	}
 	hostPort := p.hostPort
 	if hostPort == "" || strings.ContainsAny(hostPort, "[]") {
-		// No host (the generic check reports it) or a bracketed literal,
-		// which the bracketed-host validator owns.
+		// No host bytes, or a bracketed literal the bracketed-host validator
+		// owns; a missing host is validateUpstreamHasHost's decision.
 		return nil
 	}
 

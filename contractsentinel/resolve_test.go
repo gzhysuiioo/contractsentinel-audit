@@ -732,6 +732,121 @@ func TestUnbracketedExtraColonRuleDoesNotMisfire(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigUpstreamMissingHost(t *testing.T) {
+	// Every upstream must actually name a non-empty host. Go's url.Parse
+	// accepts an authority whose only bytes are a port — "http://:8080/base"
+	// parses with Host ":8080" and an empty Hostname() — so userinfo, the
+	// port and the base path used to slip past the host check and a hit route
+	// emitted an upstream with no host. Each such spelling now rejects the
+	// whole configuration as invalid_config: a content error in legal JSON,
+	// never a JSON syntax failure or an IPv6-bracket complaint, with a reason
+	// naming the route's 1-based position, its id and the upstream field and
+	// saying the host is missing.
+	badUpstreams := []struct {
+		name     string
+		upstream string
+	}{
+		{"bare port under a base path", "http://:8080/base"},
+		{"bare port without a path", "https://:8443"},
+		{"lone port separator under a base path", "http://:/base"},
+		{"lone port separator without a path", "http://:"},
+		{"completely empty authority", "http://"},
+		{"userinfo then a bare port", "https://user:p%40ss@:8443/v1"},
+		{"userinfo and a bare separator", "http://user:pass@:/base"},
+		{"only a user name before the at sign and a port", "http://user@:8080/base"},
+	}
+	for _, tc := range badUpstreams {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+			  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + tc.upstream + `"}
+			]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "missing a host"} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			for _, bad := range []string{"not valid JSON", "bracket", "invalid port"} {
+				if strings.Contains(f.Reason, bad) {
+					t.Fatalf("a missing host is a missing-host content error, reason = %q must not mention %q", f.Reason, bad)
+				}
+			}
+			if cfg != nil {
+				t.Fatalf("a rejected config must not be returned, got %+v", cfg)
+			}
+		})
+	}
+
+	// The offending route may be the only route, and a later bad route
+	// rejects the whole config even when the request would only hit the
+	// valid first route.
+	only := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://:8080/base"}]}`
+	if cfg, f := ParseConfig([]byte(only)); f == nil || f.Code != "invalid_config" {
+		t.Fatalf("single-route bare-port upstream: got cfg=%+v f=%+v, want invalid_config", cfg, f)
+	} else {
+		for _, want := range []string{"route 1", `"api"`, "upstream", "missing a host"} {
+			if !strings.Contains(f.Reason, want) {
+				t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+			}
+		}
+	}
+
+	later := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"https://user:p%40ss@:8443/v1"}
+	]}`
+	cfg, f := ParseConfig([]byte(later))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("later bare-port route must reject the config, got cfg=%+v f=%+v", cfg, f)
+	}
+	if cfg != nil {
+		t.Fatalf("a rejected config must not be returned")
+	}
+}
+
+func TestMissingHostRuleDoesNotMisfire(t *testing.T) {
+	// Addresses that do name a host keep their existing behavior byte for
+	// byte: a domain with an empty port, a bare domain or IPv4 host, a
+	// bracketed IPv6 literal, and colons inside userinfo or the base path
+	// never read as a missing host, and joining preserves userinfo, percent
+	// encoding, port and path exactly as configured.
+	cases := []struct {
+		name     string
+		upstream string
+		target   string
+		want     string
+	}{
+		{"host with an empty port keeps existing acceptance", "http://api.internal:/base", "/x", "http://api.internal:/base/x"},
+		{"plain domain", "http://api.internal/v1", "/x", "http://api.internal/v1/x"},
+		{"domain with port", "http://api.internal:8080/v1", "/x", "http://api.internal:8080/v1/x"},
+		{"bare ipv4", "http://192.0.2.1/base", "/x", "http://192.0.2.1/base/x"},
+		{"ipv4 with port", "http://192.0.2.1:8080/base", "/x", "http://192.0.2.1:8080/base/x"},
+		{"bracketed ipv6 with port", "http://[2001:db8::1]:8080/base", "/x", "http://[2001:db8::1]:8080/base/x"},
+		{"colons in userinfo and base path", "http://user:pa:ss@api.internal:8080/base/a:b", "/x", "http://user:pa:ss@api.internal:8080/base/a:b/x"},
+		{"encoded userinfo and host with an empty port", "https://user:p%40ss@api.internal:/v1", "/x", "https://user:p%40ss@api.internal:/v1/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/","upstream":"` + tc.upstream + `"}]}`
+			cfg := mustConfig(t, src)
+			res := resolveJSON(t, cfg, `{"method":"GET","target":"`+tc.target+`"}`)
+			if res.RouteID != "r" {
+				t.Errorf("routeId = %q, want r", res.RouteID)
+			}
+			if res.UpstreamURL != tc.want {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.want)
+			}
+		})
+	}
+}
+
 func TestInvalidConfigUpstreamPercentEscape(t *testing.T) {
 	// A malformed percent escape anywhere in the upstream URL rejects the
 	// whole configuration as invalid_config, and the reason locates the
@@ -1119,7 +1234,7 @@ func TestInvalidConfig(t *testing.T) {
 		{"prefix bad percent escape", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a%2","upstream":"http://h"}]}`, "percent escape", true},
 		{"upstream relative", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"/path"}]}`, "absolute http or https", true},
 		{"upstream wrong scheme", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"ftp://h"}]}`, "absolute http or https", true},
-		{"upstream missing host", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http:///path"}]}`, "include a host", true},
+		{"upstream missing host", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http:///path"}]}`, "missing a host", true},
 		{"upstream with query", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h?x=1"}]}`, "query string or fragment", true},
 		{"upstream with fragment", `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"http://h#f"}]}`, "query string or fragment", true},
 	}
