@@ -954,6 +954,97 @@ func TestResolveCLIUnbracketedHostExtraColon(t *testing.T) {
 	}
 }
 
+// TestResolveCLIUpstreamMissingHost drives the non-empty-host rule at the
+// command boundary: url.Parse accepts "http://:8080/base" with an empty
+// hostname, so without the explicit check the route resolves to an upstream
+// URL without a host. Every port-only, userinfo-only or empty authority
+// rejects the whole config while it is read — even on a route the request
+// never hits — with non-zero exit, completely empty stdout and one JSON
+// invalid_config error on stderr whose reason names the route position, its
+// id and the upstream field and says the upstream is missing a host. It must
+// neither be reported as broken config JSON nor mislabeled an
+// IPv6-bracket problem, and an invalid request still loses to the config
+// error.
+func TestResolveCLIUpstreamMissingHost(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"bare port under a base path", "http://:8080/base"},
+		{"bare port without a base path", "https://:8443"},
+		{"empty port under a base path", "http://:/base"},
+		{"encoded userinfo before a bare port", "https://user:p%40ss@:8443/v1"},
+		{"plain userinfo before an empty port", "http://user:pass@:/base"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.upstream + `"}
+			  ]
+			}`
+			// The request hits the valid first route only.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "missing a host"} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, forbidden := range []string{"not valid JSON", "bracket"} {
+				if strings.Contains(fail.Reason, forbidden) {
+					t.Errorf("reason = %q must not say %q: an empty host is an address-content error",
+						fail.Reason, forbidden)
+				}
+			}
+		})
+	}
+
+	// Config validation precedes request parsing, so an invalid request still
+	// yields the config error, not invalid_request.
+	badConfig := `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/x","upstream":"https://user:p%40ss@:8443/v1"}]}`
+	res := runResolveCLI(t, badConfig, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+
+	// A host that is present but simply followed by an empty port keeps its
+	// existing behavior end to end, base path and query joined by the usual
+	// rules.
+	config := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api",
+	  "upstream":"http://api.internal:/base"}]}`
+	success := assertResolveSuccess(t, runResolveCLI(t, config,
+		`{"method":"GET","target":"/api/items?z=1"}`))
+	if success.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", success.RouteID)
+	}
+	if want := "http://api.internal:/base/items?z=1"; success.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, want)
+	}
+}
+
 func TestResolveCLIBracketedHostMustBeIPv6(t *testing.T) {
 	// Brackets may enclose only a legal IPv6 literal. A name or an IPv4
 	// address in brackets on a route the request never reaches still rejects

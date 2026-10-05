@@ -604,6 +604,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUnbracketedUpstreamHost(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamHostPresent(p, loc, id); f != nil {
+		return f
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
@@ -615,6 +618,41 @@ func validateUpstream(raw, loc, id string) *Failure {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
 	return nil
+}
+
+// validateUpstreamHostPresent enforces on the split raw boundaries that the
+// authority carries a non-empty host:
+//
+//	scheme "://" [userinfo "@"] host [":" port] [basePath]
+//
+// The check is needed because url.Parse treats a leading colon as a port
+// separator with an empty hostname: it reads "http://:8080/base" with
+// Host==":8080" and Hostname()=="" instead of rejecting it, so a check on
+// u.Host alone lets the address through and the joined upstream is emitted
+// without a host. The raw decision therefore fails every hostPort that is
+// empty or begins with the port colon — an empty authority
+// ("http:///base"), an authority reduced to userinfo ("http://u@/base"),
+// a bare port with or without digits ("http://:8080/base",
+// "https://:8443", "http://:/base") and any of those after userinfo
+// ("https://user:p%40ss@:8443/v1"). Neither userinfo, the port nor a base
+// path can fill the host slot, no default address is ever substituted, and
+// a host that is simply followed by an empty port ("http://host:/base")
+// stays accepted: its hostPort begins with the host, not the separator.
+// Like the bracket rules this is a content error in a syntactically valid
+// JSON document — the reason names the route's 1-based position, its id and
+// the upstream field and says the upstream is missing a host, never that
+// the JSON is broken or that an IPv6 literal needs brackets.
+func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	hostPort := p.hostPort
+	if hostPort != "" && hostPort[0] != ':' {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
+		routeLabel(loc, id), p.raw)
 }
 
 // validateBracketedUpstreamHost checks the split raw upstream's authority for
