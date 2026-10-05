@@ -1331,6 +1331,125 @@ func TestResolveCLIValidIPv6Upstreams(t *testing.T) {
 	}
 }
 
+// TestResolveCLITargetDirectControlCharacter drives the direct-character
+// rule at the command boundary: a JSON-escaped newline decodes to a literal
+// control byte in the target, and a space, U+0000..U+001F byte or U+007F
+// appearing directly — in the path, a parameter name or a value — makes the
+// request invalid_request even when a route would match (or a transform
+// would remove the carrying parameter). Percent-encoded forms such as
+// "%20" and "%0A" keep resolving. Failure exits non-zero, leaves stdout
+// completely empty and emits one JSON error on stderr whose reason names the
+// first offending character as U+XXXX; a bad config still wins over such a
+// request.
+func TestResolveCLITargetDirectControlCharacter(t *testing.T) {
+	removeConfig := `{
+	  "routes": [
+	    {"id": "orders", "methods": ["GET"], "pathPrefix": "/api/orders",
+	     "upstream": "http://orders.internal",
+	     "queryTransforms": [{"op": "remove", "name": "bad name"}]}
+	  ]
+	}`
+	cases := []struct {
+		name    string
+		config  string
+		request string
+		want    string
+	}{
+		{
+			name:    "json newline escape after a matching prefix",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api/orders\n"}`,
+			want:    "U+000A",
+		},
+		{
+			name:    "json tab escape in the path",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api/orders\t/x"}`,
+			want:    "U+0009",
+		},
+		{
+			name:    "json null escape in a parameter value",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api?x=1\u0000"}`,
+			want:    "U+0000",
+		},
+		{
+			name:    "del character via unicode escape",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api/x\u007f"}`,
+			want:    "U+007F",
+		},
+		{
+			name:    "literal space in a parameter name",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api/orders?a b=1"}`,
+			want:    "U+0020",
+		},
+		{
+			name:    "remove rule cannot delete the parameter carrying the space",
+			config:  removeConfig,
+			request: `{"method":"GET","target":"/api/orders?bad name=1&keep=2"}`,
+			want:    "U+0020",
+		},
+		{
+			name:    "first offender is the earlier newline, not the later space",
+			config:  cliSuccessConfig,
+			request: `{"method":"GET","target":"/api/a\nb c"}`,
+			want:    "U+000A",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runResolveCLI(t, tc.config, tc.request)
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_request" {
+				t.Fatalf("code = %q, want invalid_request", fail.Code)
+			}
+			for _, want := range []string{"target", tc.want} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+		})
+	}
+
+	// Percent-encoded control bytes stay data: the request resolves and the
+	// escapes reach upstreamURL byte for byte.
+	encoded := assertResolveSuccess(t, runResolveCLI(t, cliSuccessConfig,
+		`{"method":"GET","target":"/api/orders%20next?note=%0A%09"}`))
+	if encoded.RouteID != "api" {
+		t.Errorf("routeId = %q, want api (encoded space keeps the segment under /api)", encoded.RouteID)
+	}
+	if want := "http://api.internal/v1/orders%20next?note=%0A%09"; encoded.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", encoded.UpstreamURL, want)
+	}
+
+	// Config validation still precedes request parsing: a bad config paired
+	// with a newline target yields invalid_config, and stdout stays empty.
+	badConfig := `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/a","upstream":"ftp://h"}]}`
+	res := runResolveCLI(t, badConfig, `{"method":"GET","target":"/a\n"}`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code string `json:"code"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+}
+
 func TestResolveCLIRouteConflict(t *testing.T) {
 	// alpha and zeta both concretely accept GET at the same /api prefix
 	// with no longer prefix to win; the same-prefix wildcard route must not

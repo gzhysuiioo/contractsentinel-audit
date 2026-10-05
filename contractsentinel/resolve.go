@@ -847,8 +847,9 @@ type requestJSON struct {
 // actually received (null counts as a type error, never as a missing field).
 // method is always checked before target, regardless of the key order in the
 // object. Only after both fields are present strings are their contents
-// (required method, legal token, absolute target without a fragment or a bad
-// percent escape) validated, so an empty string stays a content error.
+// (required method, legal token, absolute target without a fragment, a bad
+// percent escape, or a direct space/control character) validated, so an empty
+// string stays a content error.
 func ParseRequest(data []byte) (*Request, *Failure) {
 	body, err := unmarshalJSONValue(data)
 	if err != nil {
@@ -891,6 +892,9 @@ func ParseRequest(data []byte) (*Request, *Failure) {
 	case !validPercentEscapes(req.Target):
 		return nil, failuref("invalid_request", "target contains an invalid percent escape")
 	}
+	if f := validateTargetCharacters(req.Target); f != nil {
+		return nil, f
+	}
 	return &req, nil
 }
 
@@ -931,6 +935,15 @@ func jsonTypeName(raw json.RawMessage) string {
 // computes the upstream URL. Failure codes are route_not_found and
 // route_conflict.
 func Resolve(cfg *Config, req *Request) (*Resolution, *Failure) {
+	// Reject a target carrying a direct space or control character before
+	// route selection, conflict resolution and query rewriting, so such a
+	// request can never match a prefix (and carry the byte into
+	// upstreamURL), report a conflict, or have a remove/set hide the
+	// offending parameter. ParseRequest already ran this check; it is
+	// repeated here so a request built in-process cannot bypass it.
+	if f := validateTargetCharacters(req.Target); f != nil {
+		return nil, f
+	}
 	path := req.Target
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
@@ -1077,6 +1090,37 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 		return "", f
 	}
 	return result + query, nil
+}
+
+// validateTargetCharacters enforces on the raw target that only percent
+// encoding may carry a space or a control character: a direct ASCII space
+// (U+0020), a C0 control byte (U+0000 through U+001F) or DEL (U+007F) is
+// rejected no matter whether it sits in the path, a parameter name or a
+// parameter value. Bytes inside a well-formed percent escape ("%" plus two
+// hex digits) are skipped, so "%20", "%0A" and "%09" keep parsing and
+// matching on the raw encoded form; the rule never decodes an escape first.
+// Invalid percent escapes are owned by validPercentEscapes, which runs
+// before this check, so a lone or malformed "%" keeps its existing reason.
+// The reason names the first offending character as U+XXXX.
+func validateTargetCharacters(target string) *Failure {
+	for i := 0; i < len(target); i++ {
+		c := target[i]
+		if c == '%' && i+2 < len(target) && isHex(target[i+1]) && isHex(target[i+2]) {
+			// Skip a well-formed escape so an encoded space or control byte
+			// is judged as data, never as a direct character. A malformed
+			// escape is skipped byte by byte here; it is owned by the
+			// validPercentEscapes check, which keeps its own earlier
+			// reporting and must not let a following space be jumped over.
+			i += 2
+			continue
+		}
+		if c == ' ' || c < 0x20 || c == 0x7f {
+			return failuref("invalid_request",
+				"target contains a character that must be percent-encoded: U+%04X is not allowed to appear directly (percent-encode it, e.g. %%20 for a space)",
+				c)
+		}
+	}
+	return nil
 }
 
 // isToken reports whether s is an RFC 7230 token, i.e. a legal HTTP method.
