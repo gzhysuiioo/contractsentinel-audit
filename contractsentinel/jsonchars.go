@@ -17,17 +17,9 @@ package contractsentinel
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"unicode/utf8"
 )
-
-// charPathStep locates one JSON value, the same schema-free convention as
-// dupPathStep: a member step or an array-index step.
-type charPathStep struct {
-	key   string // member name for an object step; "" for an array step
-	index int    // 0-based array index for an array step; -1 for a member step
-}
 
 const (
 	// charKindEncoding classifies an invalid UTF-8 byte.
@@ -44,7 +36,7 @@ type charEncodingError struct {
 	kind    string
 	problem string // e.g. `unpaired high surrogate escape \uD800`
 	where   string // "member name", "string value" or "input"
-	path    []charPathStep
+	path    []jsonPathStep
 	offset  int
 	line    int
 	column  int
@@ -57,30 +49,17 @@ func (e *charEncodingError) Error() string {
 		return fmt.Sprintf("%s: %s in JSON input (byte offset %d, line %d, column %d)",
 			e.kind, e.problem, e.offset, e.line, e.column)
 	}
-	loc := renderCharPath(e.path)
+	// An empty value path is the document root: a scalar at the top of the
+	// document, or the top-level object when the bad token is a member name.
+	loc := "the top-level value"
+	if len(e.path) > 0 {
+		loc = renderJSONPath(e.path)
+	}
 	if e.where == "member name" && len(e.path) == 0 {
 		loc = "the top-level object"
 	}
 	return fmt.Sprintf("%s: %s in JSON %s at %s (byte offset %d, line %d, column %d)",
 		e.kind, e.problem, e.where, loc, e.offset, e.line, e.column)
-}
-
-// renderCharPath renders the location as ".key[index].key"; an empty path is
-// the document root.
-func renderCharPath(path []charPathStep) string {
-	if len(path) == 0 {
-		return "the top-level value"
-	}
-	var b bytes.Buffer
-	for _, step := range path {
-		if step.index >= 0 {
-			fmt.Fprintf(&b, "[%d]", step.index)
-		} else {
-			b.WriteByte('.')
-			b.WriteString(step.key)
-		}
-	}
-	return b.String()
 }
 
 // validateJSONCharacters scans data and returns the first character-legality
@@ -128,115 +107,49 @@ func firstInvalidUTF8Byte(data []byte) *charEncodingError {
 	return nil
 }
 
-// scanJSONStringEscapes walks the document token by token and validates every
-// JSON string literal it reaches, checking both raw UTF-8 validity and
-// surrogate pairing. It is best-effort over syntax: any decoder error stops
-// the walk and returns nil, because json.Unmarshal owns syntax errors. String
-// tokens returned successfully have precise bounds even if a later part of
-// the document is malformed.
+// characterVisitor is the character-legality policy plugged into the shared
+// jsonStructureVisitor walk. Every string token the walker reaches -- a
+// member name or a string value, at any depth and inside unknown extension
+// members -- is checked raw. Object and array recognition, array indices and
+// paths come from the single shared walk, identical to the repeated-member
+// gate. The first violation aborts the walk; any decoder error (malformed
+// JSON) leaves err unset, deferring to json.Unmarshal.
+type characterVisitor struct {
+	err *charEncodingError
+}
+
+func (v *characterVisitor) beginObject(_ []jsonPathStep) {}
+func (v *characterVisitor) endObject()                   {}
+
+func (v *characterVisitor) memberName(_ string, data []byte, start, end int, objectPath []jsonPathStep) error {
+	// The member name itself is a JSON string and must be legal even when the
+	// member is an unknown extension that never reaches the decoder. Its
+	// location is the containing object: an unpaired escape in the name cannot
+	// render the name itself, so the path stops at the parent.
+	if e := checkStringToken(data, start, end, objectPath, true); e != nil {
+		v.err = e
+		return errJSONWalkStop
+	}
+	return nil
+}
+
+func (v *characterVisitor) stringValue(data []byte, start, end int, valuePath []jsonPathStep) error {
+	if e := checkStringToken(data, start, end, valuePath, false); e != nil {
+		v.err = e
+		return errJSONWalkStop
+	}
+	return nil
+}
+
+// scanJSONStringEscapes walks the document with characterVisitor and reports
+// the first illegal string token in document order. It is best-effort over
+// syntax: any decoder error stops the walk and yields nil, because
+// json.Unmarshal owns syntax errors. String tokens reached before a later
+// syntax problem still carry precise bounds and are validated.
 func scanJSONStringEscapes(data []byte) *charEncodingError {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	// Keep number literals as text; their bytes are never string content.
-	dec.UseNumber()
-
-	start := 0
-	tok, err := dec.Token()
-	if err != nil {
-		return nil // malformed JSON: defer to json.Unmarshal
-	}
-	end := int(dec.InputOffset())
-	switch v := tok.(type) {
-	case string:
-		return checkStringToken(data, start, end, nil, false)
-	case json.Delim:
-		if v == '{' {
-			return scanCharObject(dec, data, nil)
-		}
-		if v == '[' {
-			return scanCharArray(dec, data, nil)
-		}
-	}
-	return nil
-}
-
-// scanCharObject scans one JSON object whose opening brace was just consumed.
-func scanCharObject(dec *json.Decoder, data []byte, path []charPathStep) *charEncodingError {
-	for dec.More() {
-		keyStart := int(dec.InputOffset())
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		keyEnd := int(dec.InputOffset())
-		key, _ := keyTok.(string)
-		memberPath := append(append([]charPathStep(nil), path...), charPathStep{key: key, index: -1})
-		// The member name itself is a JSON string and must be legal even when
-		// the member is an unknown extension that never reaches the decoder.
-		// Its location is the containing object: an unpaired escape in the
-		// name cannot render the name itself, so the path stops at the parent.
-		if e := checkStringToken(data, keyStart, keyEnd, path, true); e != nil {
-			return e
-		}
-		valStart := int(dec.InputOffset())
-		valTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		valEnd := int(dec.InputOffset())
-		switch v := valTok.(type) {
-		case string:
-			if e := checkStringToken(data, valStart, valEnd, memberPath, false); e != nil {
-				return e
-			}
-		case json.Delim:
-			if v == '{' {
-				if e := scanCharObject(dec, data, memberPath); e != nil {
-					return e
-				}
-			} else if v == '[' {
-				if e := scanCharArray(dec, data, memberPath); e != nil {
-					return e
-				}
-			}
-		}
-	}
-	if _, err := dec.Token(); err != nil { // consume '}'
-		return nil // malformed JSON: defer
-	}
-	return nil
-}
-
-// scanCharArray scans one JSON array whose opening bracket was just consumed.
-func scanCharArray(dec *json.Decoder, data []byte, path []charPathStep) *charEncodingError {
-	for i := 0; dec.More(); i++ {
-		elemStart := int(dec.InputOffset())
-		elemTok, err := dec.Token()
-		if err != nil {
-			return nil // malformed JSON: defer
-		}
-		elemEnd := int(dec.InputOffset())
-		elemPath := append(append([]charPathStep(nil), path...), charPathStep{index: i})
-		switch v := elemTok.(type) {
-		case string:
-			if e := checkStringToken(data, elemStart, elemEnd, elemPath, false); e != nil {
-				return e
-			}
-		case json.Delim:
-			if v == '{' {
-				if e := scanCharObject(dec, data, elemPath); e != nil {
-					return e
-				}
-			} else if v == '[' {
-				if e := scanCharArray(dec, data, elemPath); e != nil {
-					return e
-				}
-			}
-		}
-	}
-	if _, err := dec.Token(); err != nil { // consume ']'
-		return nil // malformed JSON: defer
-	}
-	return nil
+	v := &characterVisitor{}
+	_ = walkJSONStructure(data, v)
+	return v.err
 }
 
 // checkStringToken validates one raw token slice data[start:end] holding a
@@ -245,7 +158,7 @@ func scanCharArray(dec *json.Decoder, data []byte, path []charPathStep) *charEnc
 // ends on the token's closing quote and JSON grammar permits no quote in that
 // prefix, so the first quote byte is the opening quote. isMemberName selects
 // how the location is described.
-func checkStringToken(data []byte, start, end int, path []charPathStep, isMemberName bool) *charEncodingError {
+func checkStringToken(data []byte, start, end int, path []jsonPathStep, isMemberName bool) *charEncodingError {
 	raw := data[start:end]
 	q := bytes.IndexByte(raw, '"')
 	if q < 0 || raw[len(raw)-1] != '"' {
@@ -360,13 +273,13 @@ func isHighSurrogate(r rune) bool { return 0xD800 <= r && r <= 0xDBFF }
 func isLowSurrogate(r rune) bool  { return 0xDC00 <= r && r <= 0xDFFF }
 
 // charError builds a charEncodingError, deriving line and column once.
-func charError(kind, problem, where string, path []charPathStep, offset int, data []byte) *charEncodingError {
+func charError(kind, problem, where string, path []jsonPathStep, offset int, data []byte) *charEncodingError {
 	line, column := lineColumn(data, offset)
 	return &charEncodingError{
 		kind:    kind,
 		problem: problem,
 		where:   where,
-		path:    append([]charPathStep(nil), path...),
+		path:    jsonPathCopy(path),
 		offset:  offset,
 		line:    line,
 		column:  column,
