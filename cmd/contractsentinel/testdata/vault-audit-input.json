@@ -1,0 +1,57 @@
+{
+  "artifact": {
+    "name": "Vault",
+    "abi": "[{\"name\":\"withdraw\",\"type\":\"function\",\"stateMutability\":\"payable\"}]",
+    "bytecode": "0x6080604052",
+    "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Vault {\n    mapping(address => uint256) private balances;\n\n    function withdraw(uint256 amount) public {\n        (bool sent, ) = msg.sender.call{value: amount}(\"\");\n        require(sent, \"transfer failed\");\n        balances[msg.sender] -= amount;\n    }\n}\n"
+  },
+  "rules": [
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.4.2"
+    },
+    {
+      "id": "owner-only-withdraw",
+      "kind": "static",
+      "severity": "medium",
+      "invariant": "withdraw-owner-only",
+      "requiresABI": true,
+      "version": "2.1.0"
+    },
+    {
+      "id": "solvency-symbolic",
+      "kind": "symbolic",
+      "severity": "critical",
+      "invariant": "balances-cover-withdrawals",
+      "requiresABI": false,
+      "version": "0.9.3"
+    }
+  ],
+  "invariants": {},
+  "checks": [
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "reentrancy-guard",
+      "version": "1.4.2",
+      "status": "发现缺陷",
+      "note": "反例：攻击者先存入 1 ether 后调用 withdraw；call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，此时 balances[msg.sender] 仍是旧值，同一笔余额被第二次转出。"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "owner-only-withdraw",
+      "version": "2.1.0",
+      "status": "通过"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "solvency-symbolic",
+      "version": "0.9.3",
+      "status": "工具缺失",
+      "note": "符号执行引擎未安装：PATH 中未找到 mythril，无法求解 balances-cover-withdrawals。"
+    }
+  ]
+}
