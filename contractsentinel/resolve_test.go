@@ -618,6 +618,120 @@ func TestUnbracketedNonIPv6AuthoritiesUnaffected(t *testing.T) {
 	}
 }
 
+func TestInvalidConfigUnbracketedHostExtraColon(t *testing.T) {
+	// An unbracketed host part may carry at most the one colon that
+	// separates the host from its port. Two or more colons are illegal
+	// regardless of their content: a numeric last segment never becomes a
+	// guessed port, a malformed IPv6-shaped spelling is not rescued because
+	// it resembles an address, and a base path changes nothing. Each such
+	// upstream rejects the whole configuration as invalid_config — a content
+	// error in legal JSON, never a JSON syntax failure — with a reason
+	// naming the route's 1-based position, its id and the upstream field and
+	// stating the unbracketed host part carries an extra colon.
+	badUpstreams := []struct {
+		name     string
+		upstream string
+	}{
+		{"name part, name part and digits under a base path", "http://api:internal:8080/base"},
+		{"name part, name part and digits without a base path", "http://api:internal:8080"},
+		{"name part and two digit segments", "http://name:part:80"},
+		{"malformed ipv6 shaped spelling with triple colon", "http://2001:db8:::1/base"},
+		{"nine all numeric groups are not a legal ipv6 host", "http://1:2:3:4:5:6:7:8:9"},
+		{"colon name with a path and no digits at the end", "http://a:b:c/base"},
+		{"colons in userinfo plus an extra colon after the at sign", "https://user:pa:ss@api:internal:8080/base"},
+		{"extra colon after userinfo without a base path", "http://u:p@host:part:80"},
+		{"https name with two separators", "https://svc:name:8443"},
+	}
+	for _, tc := range badUpstreams {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[
+			  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+			  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"` + tc.upstream + `"}
+			]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil {
+				t.Fatalf("expected invalid_config for upstream %q", tc.upstream)
+			}
+			if f.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", f.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "more than one colon"} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "not valid JSON") {
+				t.Fatalf("an extra-colon host is a content error, not a JSON syntax failure: %q", f.Reason)
+			}
+			if strings.Contains(f.Reason, "invalid port") {
+				t.Fatalf("the reason must name the extra colon, not a generic url.Parse port error: %q", f.Reason)
+			}
+			if cfg != nil {
+				t.Fatalf("a rejected config must not be returned, got %+v", cfg)
+			}
+		})
+	}
+
+	// The offending route can be the only route, and it still fails even
+	// though a request is never resolved against it: config validation owns
+	// the rule up front.
+	only := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api:internal:8080/base"}]}`
+	if cfg, f := ParseConfig([]byte(only)); f == nil || f.Code != "invalid_config" {
+		t.Fatalf("single-route multi-colon upstream: got cfg=%+v f=%+v, want invalid_config", cfg, f)
+	} else if !strings.Contains(f.Reason, "route 1") || !strings.Contains(f.Reason, `"api"`) {
+		t.Fatalf("reason = %q, want route 1 and id \"api\"", f.Reason)
+	}
+
+	// A bad later route rejects the config even when a request would only
+	// ever hit the valid first route.
+	src := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"http://name:part:80/base"}
+	]}`
+	cfg, f := ParseConfig([]byte(src))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got cfg=%+v f=%+v, want invalid_config", cfg, f)
+	}
+	if cfg != nil {
+		t.Fatalf("a rejected config must not be returned")
+	}
+}
+
+func TestUnbracketedExtraColonRuleDoesNotMisfire(t *testing.T) {
+	// The rule is confined to hostPort — the authority after the last '@'
+	// and before the first path slash — so colons that belong to userinfo or
+	// the base path, a percent-encoded colon in the host, and every ordinary
+	// domain / IPv4 / single-port spelling must keep parsing and joining
+	// byte for byte.
+	cases := []struct {
+		name     string
+		upstream string
+		target   string
+		want     string
+	}{
+		{"colons in both userinfo and base path", "http://user:pa:ss@api.internal:8080/base/a:b", "/x", "http://user:pa:ss@api.internal:8080/base/a:b/x"},
+		{"many colons in userinfo only", "http://a:b:c:d@h.internal:80/b", "/x", "http://a:b:c:d@h.internal:80/b/x"},
+		{"colon only in the base path", "http://h.internal/base/a:b", "/x", "http://h.internal/base/a:b/x"},
+		{"plain domain", "http://api.internal/v1", "/x", "http://api.internal/v1/x"},
+		{"domain with one port colon", "http://api.internal:8080/v1", "/x", "http://api.internal:8080/v1/x"},
+		{"bare ipv4", "http://192.0.2.1/base", "/x", "http://192.0.2.1/base/x"},
+		{"ipv4 with port", "http://192.0.2.1:8080/base", "/x", "http://192.0.2.1:8080/base/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/","upstream":"` + tc.upstream + `"}]}`
+			cfg := mustConfig(t, src)
+			res := resolveJSON(t, cfg, `{"method":"GET","target":"`+tc.target+`"}`)
+			if res.RouteID != "r" {
+				t.Errorf("routeId = %q, want r", res.RouteID)
+			}
+			if res.UpstreamURL != tc.want {
+				t.Errorf("upstreamURL = %q, want %q", res.UpstreamURL, tc.want)
+			}
+		})
+	}
+}
+
 func TestInvalidConfigUpstreamPercentEscape(t *testing.T) {
 	// A malformed percent escape anywhere in the upstream URL rejects the
 	// whole configuration as invalid_config, and the reason locates the

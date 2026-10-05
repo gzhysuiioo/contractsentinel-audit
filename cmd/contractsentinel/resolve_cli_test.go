@@ -882,6 +882,78 @@ func TestResolveCLIInvalidUpstreamEscapeRejectsConfig(t *testing.T) {
 	}
 }
 
+// TestResolveCLIUnbracketedHostExtraColon drives the at-most-one-colon rule
+// at the command boundary: an unbracketed host part with two or more colons
+// — a name:name:port spelling that parses as neither a domain nor an IPv6
+// literal, or a malformed IPv6-shaped spelling — rejects the whole config up
+// front even when the request only hits the valid first route and even
+// though the document is legal JSON. Failure keeps the usual contract:
+// non-zero exit, completely empty stdout and one JSON invalid_config error
+// on stderr whose reason names the route position, its id and the upstream
+// field and says the unbracketed host part carries an extra colon.
+func TestResolveCLIUnbracketedHostExtraColon(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"headline name name port with a base path", "http://api:internal:8080/base"},
+		{"name part and a numeric end", "http://name:part:80"},
+		{"malformed ipv6 shaped spelling", "http://2001:db8:::1/base"},
+		{"name spelling under https without a base path", "https://svc:name:8443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.upstream + `"}
+			  ]
+			}`
+			// The request hits the valid first route only.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "more than one colon"} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			if strings.Contains(fail.Reason, "not valid JSON") {
+				t.Errorf("an extra-colon host is a content error, not a JSON syntax failure: %q", fail.Reason)
+			}
+			if strings.Contains(fail.Reason, "invalid port") {
+				t.Errorf("the reason must name the extra colon, not a generic url.Parse port error: %q", fail.Reason)
+			}
+		})
+	}
+
+	// Colons that belong to userinfo or the base path stay legal end to end:
+	// the headline example from the rule's scope resolves byte for byte.
+	config := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api",
+	  "upstream":"http://user:pa:ss@api.internal:8080/base/a:b"}]}`
+	success := assertResolveSuccess(t, runResolveCLI(t, config,
+		`{"method":"GET","target":"/api/items?z=1"}`))
+	if success.RouteID != "api" {
+		t.Errorf("routeId = %q, want api", success.RouteID)
+	}
+	if want := "http://user:pa:ss@api.internal:8080/base/a:b/items?z=1"; success.UpstreamURL != want {
+		t.Errorf("upstreamURL = %q, want %q", success.UpstreamURL, want)
+	}
+}
+
 func TestResolveCLIBracketedHostMustBeIPv6(t *testing.T) {
 	// Brackets may enclose only a legal IPv6 literal. A name or an IPv4
 	// address in brackets on a route the request never reaches still rejects

@@ -548,6 +548,7 @@ func validatePrefix(prefix, loc, id string) *Failure {
 // can never be read as part of an IPv6 host, while brackets, a port and a
 // zone stay inside hostPort.
 type upstreamParts struct {
+	raw       string // the upstream exactly as configured; every other field slices this
 	schemeEnd int    // index of the ':' in "://", or -1 when the scheme is absent
 	authority string // bytes between "://" and the first path slash (userinfo included)
 	hostPort  string // authority after the last '@' (host plus optional port)
@@ -560,7 +561,7 @@ type upstreamParts struct {
 // set to -1 and empty parts, leaving the generic absolute-URL check to
 // report it, exactly as the per-caller preamble used to.
 func splitUpstream(raw string) upstreamParts {
-	p := upstreamParts{schemeEnd: -1}
+	p := upstreamParts{raw: raw, schemeEnd: -1}
 	i := strings.Index(raw, "://")
 	if i < 0 {
 		return p
@@ -700,20 +701,40 @@ func invalidBracketedHost(label, literal string) *Failure {
 		"%s: upstream host in brackets must be a valid IPv6 address, but %q is not a legal IPv6 address", label, literal)
 }
 
-// validateUnbracketedUpstreamHost rejects an IPv6 literal written without the
-// square brackets an IP literal requires in a URL's authority:
+// validateUnbracketedUpstreamHost checks the split raw upstream's
+// authority-without-brackets (hostPort) against the authority grammar:
 //
 //	host = IP-literal / IPv4address / reg-name
 //	IP-literal = "[" ( IPv6address / ... ) "]"
 //
-// A bare "2001:db8::1" leaves the host/port boundary undefined (the reader
-// cannot tell "::1" from "::1:8080" with a port), so the literal must be
-// wrapped as "[2001:db8::1]" rather than guessed at: brackets are never
-// inserted and a trailing run of digits is never promoted to a port. The
-// check fires for every IPv6 spelling — the full form, the compressed form
-// ("::1"), an IPv6 address with an embedded IPv4 tail ("::ffff:192.0.2.1")
-// and a percent-encoded zone ("%25eth0") — whether or not a ":<digits>"
-// port is also present and whether userinfo precedes the host.
+// An unbracketed host part may therefore carry at most one colon, the one
+// separating the host from its port:
+//
+//	reg-name [ ":" port ]
+//
+// Two or more colons are illegal no matter what the bytes spell: a bare IPv6
+// literal leaves the host/port boundary undefined (the reader cannot tell
+// "::1" from "::1:8080" with a port) and must be written as "[2001:db8::1]",
+// while a name such as "api:internal:8080" or even a malformed IPv6-shaped
+// spelling such as "2001:db8:::1" is not rescued by a numeric last segment —
+// an extra colon stays an extra colon whether or not the address parses as
+// IPv6 and whether or not a base path follows. The spelling is rejected on
+// the colon count alone: the host and port are never guessed apart, brackets
+// are never inserted and a trailing run of digits is never promoted to a
+// port, so validity never depends on this Go release's url.Parse port
+// strictness.
+//
+// When the part does parse as an IPv6 literal as written, the reason keeps
+// the existing missing-brackets wording; a part that is merely
+// multi-colon gets the extra-colon wording. The decision never strips a
+// trailing ":<digits>" segment as a hypothetical port: every true bare IPv6
+// spelling already parses whole ("::1:8080" and "fe80::1:8443" are complete
+// addresses, whose last hextet merely happens to be digits), so stripping
+// would only mislabel a malformed spelling such as "2001:db8:::1" that
+// parses once a hextet is removed. Both reasons cover every form — the full
+// form, the compressed form ("::1"), an IPv6 address with an embedded IPv4
+// tail ("::ffff:192.0.2.1") and a percent-encoded zone ("%25eth0") — and
+// both name the route's 1-based position, its id and the upstream field.
 //
 // Ordinary domains and bare IPv4 hosts (with or without a port) stay
 // untouched, and the colons in userinfo or the base path are never
@@ -734,50 +755,33 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 		return nil
 	}
 
-	// A bare IPv6 literal carries at least two colons; a reg-name may contain
-	// a single colon only in the port separator, so skip the parse for those.
-	host := hostPort
-	if strings.Count(host, ":") < 2 {
+	// A single colon is the legal host/port separator ("host:8080"); zero
+	// colons is a bare host. Count raw colons only: percent-encoded colons
+	// ("%3A") carry no separator byte, and userinfo and the base path were
+	// sliced off by splitUpstream.
+	if strings.Count(hostPort, ":") <= 1 {
 		return nil
 	}
-	// A trailing ":<digits>" might be a port; test the address without it as
-	// well, since an unbracketed address with a port ("fe80::1:8080") is
-	// exactly the ambiguous spelling that must be refused rather than parsed
-	// as host plus port. The suffix is only stripped once: a real bare IPv6
-	// literal without a port is tested first and rejected anyway.
-	candidates := []string{host}
-	if i := strings.LastIndexByte(host, ':'); i >= 0 {
-		port := host[i+1:]
-		if port != "" && isDigits(port) {
-			candidates = append(candidates, host[:i])
-		}
-	}
-	for _, cand := range candidates {
-		decoded, err := url.PathUnescape(cand)
-		if err != nil {
-			continue
-		}
-		addr, err := netip.ParseAddr(decoded)
-		if err == nil && addr.Is6() {
+	label := routeLabel(loc, id)
+
+	// Classify the spelling as written, never guessing a host/port split:
+	// percent-decode once so a "%25eth0" zone reaches netip as "%eth0" while
+	// every other byte keeps its spelling, then parse the whole hostPort. A
+	// legal IPv6 literal keeps the existing missing-brackets reason (this
+	// covers every form, "::1:8080" and "fe80::1:8443" included — a trailing
+	// hextet of digits is part of the address, not a guessed port); anything
+	// else that merely carries extra colons gets the extra-colon reason.
+	decoded, err := url.PathUnescape(hostPort)
+	if err == nil {
+		if addr, perr := netip.ParseAddr(decoded); perr == nil && addr.Is6() {
 			return failuref("invalid_config",
 				"%s: upstream IPv6 host %q is missing its square brackets: an IPv6 literal must be enclosed in a pair of brackets with any port outside them (e.g. \"[2001:db8::1]:8080\"); brackets are never added and a trailing number is not guessed as a port",
-				routeLabel(loc, id), host)
+				label, hostPort)
 		}
 	}
-	return nil
-}
-
-// isDigits reports whether s is a non-empty run of ASCII digits.
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
+	return failuref("invalid_config",
+		"%s: upstream %q has an unbracketed host part %q with more than one colon: a host without square brackets may contain at most the one colon separating it from its port (e.g. \"example.com:8080\"); an IPv6 literal must be enclosed in brackets (e.g. \"[2001:db8::1]:8080\") and the host and port are never guessed apart",
+		label, p.raw, hostPort)
 }
 
 // invalidBracketedHostShape builds the content error for a bracketed host
