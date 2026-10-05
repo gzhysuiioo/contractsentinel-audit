@@ -762,6 +762,62 @@ func validateArchiveRequiresABI(strict []byte, id string) error {
 	return nil
 }
 
+// archiveRuleStringFields lists the formal string members of a stored rule,
+// in the order they are checked.
+var archiveRuleStringFields = []string{"id", "kind", "severity", "invariant", "version", "status", "note"}
+
+// validateArchiveRuleStrings is the read-side type gate for the formal string
+// members of every stored rule. A ReportRule field is a Go string, so decoding
+// the strict archive straight into Report turns a formal null member into the
+// zero value "": an archive that writes "note":null on a passing rule would
+// read byte-for-byte like one that omitted the note, the recomputed id and the
+// rule/finding evidence correspondence would all pass on that laundered value,
+// and a diff could even compare it as an unchanged rule. When a formal member
+// is present its value must therefore be a JSON string; null, a boolean, a
+// number, an object or an array makes the whole archive corrupt, independently
+// of the rule's check status and of whether the report carries any finding —
+// the offending rule is never skipped and no partial report is returned. An
+// omitted member still decodes to its usual default and an explicit empty
+// string is still judged by the ordinary business rules; this gate is about
+// the JSON type alone, not about emptiness. The strict rewrite dropped
+// extension members, so a case-variant or whitespace-padded name is invisible
+// here: a string it carries neither supplies nor rescues the formal value,
+// and a null it carries never reaches this check. The error names the
+// requested report id, the offending field and the rule's position in the
+// rules array, and also names the rule itself when its formal id member is a
+// legal non-empty string.
+func validateArchiveRuleStrings(strict []byte, id string) error {
+	var top struct {
+		Rules []map[string]json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errCorrupt("invalid JSON in report " + id + ": " + err.Error())
+	}
+	for i, rule := range top.Rules {
+		where := fmt.Sprintf("rules[%d]", i)
+		if raw, ok := rule["id"]; ok {
+			var ruleID string
+			if err := json.Unmarshal(raw, &ruleID); err == nil && ruleID != "" {
+				where += " (rule " + ruleID + ")"
+			}
+		}
+		for _, field := range archiveRuleStringFields {
+			raw, ok := rule[field]
+			if !ok {
+				continue
+			}
+			var token any
+			if err := json.Unmarshal(raw, &token); err != nil {
+				return errCorrupt("report " + id + " archive is corrupt: " + where + ": " + field + " must be a string")
+			}
+			if _, isString := token.(string); !isString {
+				return errCorrupt("report " + id + " archive is corrupt: " + where + ": " + field + " must be a string")
+			}
+		}
+	}
+	return nil
+}
+
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
 	// Read-side counterpart of the submission character gate in
@@ -797,6 +853,13 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	// become the zero value false and could pass every later check, including
 	// the content id, as if the archive had explicitly said false.
 	if err := validateArchiveRequiresABI(strict, id); err != nil {
+		return Report{}, err
+	}
+	// Same gate for the formal string members of every rule: a null note (or
+	// any other non-string value) would otherwise silently decode to the zero
+	// value "" and could pass every later check, including the content id, as
+	// if the archive had omitted the member or written an empty string.
+	if err := validateArchiveRuleStrings(strict, id); err != nil {
 		return Report{}, err
 	}
 	var r Report
