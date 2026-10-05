@@ -1026,6 +1026,93 @@ func TestResolveCLIBracketedHostShape(t *testing.T) {
 	}
 }
 
+func TestResolveCLIBareIPv6HostMustBeBracketed(t *testing.T) {
+	// An IPv6 upstream host must be bracketed. Full, compressed and
+	// IPv4-tail literals written without brackets reject the whole config up
+	// front even when the request only hits the valid first route: non-zero
+	// exit, completely empty stdout and one JSON invalid_config error on
+	// stderr whose reason names the route position, its id and the upstream
+	// field and says the IPv6 host is missing square brackets — it must not
+	// read as broken config JSON nor as a generic invalid-port error.
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{"compressed form", "http://2001:db8::1/base"},
+		{"loopback with trailing digits", "http://::1:8080/base"},
+		{"embedded ipv4 tail", "http://::ffff:192.0.2.1/base"},
+		{"full form", "http://2001:0db8:0000:0000:0000:0000:0000:0001/base"},
+		{"userinfo present", "https://user:p%40ss@2001:db8::1/base"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := `{
+			  "routes": [
+			    {"id": "api", "methods": ["GET"], "pathPrefix": "/api", "upstream": "http://api.internal/v1"},
+			    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin", "upstream": "` + tc.upstream + `"}
+			  ]
+			}`
+			// The request hits the valid first route only.
+			res := runResolveCLI(t, config, cliSuccessRequest)
+
+			if res.exitCode == 0 {
+				t.Fatalf("exit code = 0, want non-zero")
+			}
+			if len(res.stdout) != 0 {
+				t.Fatalf("stdout = %q, want completely empty on failure", res.stdout)
+			}
+			var fail struct {
+				Code   string `json:"code"`
+				Reason string `json:"reason"`
+			}
+			decodeOneJSON(t, res.stderr, "stderr", &fail)
+			if fail.Code != "invalid_config" {
+				t.Fatalf("code = %q, want invalid_config", fail.Code)
+			}
+			for _, want := range []string{"route 2", `"admin"`, "upstream", "IPv6", "square brackets"} {
+				if !strings.Contains(fail.Reason, want) {
+					t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+				}
+			}
+			for _, bad := range []string{"not valid JSON", "invalid port"} {
+				if strings.Contains(fail.Reason, bad) {
+					t.Errorf("a bare IPv6 host is a bracket content error, not %q: %q", bad, fail.Reason)
+				}
+			}
+		})
+	}
+
+	// Config validation precedes request parsing: a bare-IPv6 config paired
+	// with a syntactically broken request still reports invalid_config.
+	badConfig := `{"routes":[{"id":"x","methods":["GET"],"pathPrefix":"/x","upstream":"http://2001:db8::1/b"}]}`
+	res := runResolveCLI(t, badConfig, `{not json`)
+	if res.exitCode == 0 || len(res.stdout) != 0 {
+		t.Fatalf("got exit %d stdout %q, want non-zero exit and empty stdout", res.exitCode, res.stdout)
+	}
+	var fail struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	decodeOneJSON(t, res.stderr, "stderr", &fail)
+	if fail.Code != "invalid_config" {
+		t.Fatalf("code = %q, want invalid_config to take priority", fail.Code)
+	}
+	for _, want := range []string{"route 1", `"x"`, "IPv6", "square brackets"} {
+		if !strings.Contains(fail.Reason, want) {
+			t.Errorf("reason = %q, want substring %q", fail.Reason, want)
+		}
+	}
+
+	// Adding brackets repairs the config and resolution keeps the configured
+	// bytes verbatim, port and zone included.
+	fixed := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/","upstream":"http://[::1]:8080/base"}]}`
+	success := assertResolveSuccess(t, runResolveCLI(t, fixed,
+		`{"method":"GET","target":"/x?z=1"}`))
+	if success.RouteID != "r" || success.UpstreamURL != "http://[::1]:8080/base/x?z=1" {
+		t.Fatalf("got %+v, want r / bracketed upstream verbatim", success)
+	}
+}
+
 func TestResolveCLIValidIPv6Upstreams(t *testing.T) {
 	cases := []struct {
 		name     string

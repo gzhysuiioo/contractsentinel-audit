@@ -540,12 +540,17 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
 	}
-	// Validate any bracketed host against the raw string before url.Parse:
-	// square brackets are the IP-literal marker, so whatever they enclose
-	// must be a legal IPv6 address (zone included) rather than a name or an
-	// IPv4 address. Doing this explicitly keeps the rule independent of
-	// url.Parse's parser strictness and lets the reason name the field and
-	// the actual problem instead of surfacing a generic URL parse error.
+	// Validate the host against the raw string before url.Parse: square
+	// brackets are the IP-literal marker, so whatever they enclose must be a
+	// legal IPv6 address (zone included) rather than a name or an IPv4
+	// address, and a bare IPv6 literal is not allowed to omit them. Doing
+	// this explicitly keeps both rules independent of url.Parse's parser
+	// strictness and lets the reason name the field and the actual problem
+	// instead of surfacing a generic URL parse error (a bare IPv6 literal
+	// otherwise reads as a host carrying an invalid-looking ":port").
+	if f := validateUnbracketedIPv6UpstreamHost(raw, loc, id); f != nil {
+		return f
+	}
 	if f := validateBracketedUpstreamHost(raw, loc, id); f != nil {
 		return f
 	}
@@ -560,6 +565,85 @@ func validateUpstream(raw, loc, id string) *Failure {
 		return failuref("invalid_config", "%s (id %q): upstream must include a host", loc, id)
 	}
 	return nil
+}
+
+// upstreamHostPort slices the authority's host (plus any port) out of the raw
+// upstream on raw bytes: it starts after the scheme separator, ends at the
+// first path slash (the caller has already rejected a query or fragment), and
+// any userinfo ending at the last '@' is stripped. It returns ok=false when
+// the raw URL has no scheme separator, in which case the generic
+// absolute-URL check reports that and no host rule applies.
+func upstreamHostPort(raw string) (hostPort string, ok bool) {
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 0 {
+		return "", false
+	}
+	authority := raw[schemeEnd+3:]
+	if i := strings.IndexByte(authority, '/'); i >= 0 {
+		authority = authority[:i]
+	}
+	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
+		authority = authority[i+1:]
+	}
+	return authority, true
+}
+
+// validateUnbracketedIPv6UpstreamHost checks the raw upstream's host for an
+// IPv6 literal written without its required square brackets:
+//
+//	http://2001:db8::1/base        -> invalid
+//	http://[2001:db8::1]/base      -> valid
+//
+// RFC 3986 reserves brackets as the IP-literal marker precisely because an
+// IPv6 address's colons would otherwise be indistinguishable from the
+// host/port boundary, so the bare literal must be rejected rather than
+// bracketed automatically or its last group guessed as a port. The rule
+// covers full form (eight groups), compressed form ("::") and an IPv6
+// address with an embedded IPv4 tail (e.g. "::ffff:192.0.2.1") — a literal
+// that ends in a digit is still a bare literal, not a host with a port. A
+// percent-encoded zone is part of the address, not a reason to skip the
+// rule. Detection runs here on the raw bytes, before url.Parse, so the
+// reason names the route, its id and the upstream field and says the IPv6
+// host lacks brackets — a content error in valid JSON — instead of the
+// parser's generic "invalid port after host" verdict, and independent of
+// how strict the parser is about such authorities.
+func validateUnbracketedIPv6UpstreamHost(raw, loc, id string) *Failure {
+	hostPort, ok := upstreamHostPort(raw)
+	if !ok {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	// Brackets are validated separately. An ordinary reg-name (domain) or a
+	// bare IPv4 host with a port carries exactly one colon ("example.com:8080",
+	// "127.0.0.1:8080"), whereas a bare IPv6 literal always carries at least
+	// two — seven in the full form, two adjacent ones ("::") in a compressed
+	// form — so the colon count separates them without mistaking a port for
+	// address bytes. Colons in the userinfo or base path never reach here
+	// (both are sliced away), so they cannot make a legal host look bare.
+	if strings.ContainsAny(hostPort, "[]") || strings.Count(hostPort, ":") < 2 {
+		return nil
+	}
+	// The host bytes are parsed exactly as written, a percent-encoded zone
+	// ("%25eth0") unescaped once so netip sees "fe80::1%eth0". A trailing
+	// ":8080" is never split off as a guessed port: if the whole literal
+	// parses as IPv6 (as "2001:db8::1:8080" or "::1:8080" do), it is a bare
+	// IPv6 host that must have been bracketed.
+	decoded, err := url.PathUnescape(hostPort)
+	if err != nil {
+		return invalidUnbracketedIPv6Host(loc, id, hostPort)
+	}
+	addr, err := netip.ParseAddr(decoded)
+	if err != nil || !addr.Is6() {
+		return nil // not an IPv6 literal; the generic URL checks judge it
+	}
+	return invalidUnbracketedIPv6Host(loc, id, hostPort)
+}
+
+// invalidUnbracketedIPv6Host builds the content error for a bare IPv6 host
+// that omits its required square brackets.
+func invalidUnbracketedIPv6Host(loc, id, hostPort string) *Failure {
+	return failuref("invalid_config",
+		"%s: upstream IPv6 host %q must be enclosed in square brackets, write it as \"[<ipv6>]\" (optionally followed by a port)",
+		routeLabel(loc, id), hostPort)
 }
 
 // validateBracketedUpstreamHost checks the raw upstream's authority for an
@@ -583,20 +667,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 // and the rule is enforced here on the raw bytes rather than left to
 // url.Parse's parser strictness.
 func validateBracketedUpstreamHost(raw, loc, id string) *Failure {
-	// The authority starts after the scheme separator and ends at the first
-	// path slash (query and fragment were rejected by the caller).
-	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd < 0 {
+	hostPort, ok := upstreamHostPort(raw)
+	if !ok {
 		return nil // no scheme: the generic absolute-URL check reports this
-	}
-	authority := raw[schemeEnd+3:]
-	if i := strings.IndexByte(authority, '/'); i >= 0 {
-		authority = authority[:i]
-	}
-	// Any userinfo precedes the host and ends at the last '@'.
-	hostPort := authority
-	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
-		hostPort = authority[i+1:]
 	}
 
 	if !strings.ContainsAny(hostPort, "[]") {
