@@ -31,6 +31,19 @@ func TestQueryTransformSpecExample(t *testing.T) {
 	}
 }
 
+func TestQueryTransformSpecExampleWithEmptyFragments(t *testing.T) {
+	// x=%2f+&a=1&&%61=2&flag&z=, then set a="" and remove flag:
+	// the two differently-spelled a's merge at the first hit, the untouched x
+	// keeps its escape case and '+', and the empty fragment and z's empty
+	// value survive — nothing is re-encoded wholesale.
+	rules := `[{"op":"set","name":"a","value":""},{"op":"remove","name":"flag"}]`
+	got := transformResult(t, rules, "/p?x=%2f+&a=1&&%61=2&flag&z=")
+	want := "http://h.internal/base/p?x=%2f+&a=&&z="
+	if got != want {
+		t.Fatalf("upstreamURL = %q, want %q", got, want)
+	}
+}
+
 func TestQueryTransformSet(t *testing.T) {
 	cases := []struct {
 		name      string

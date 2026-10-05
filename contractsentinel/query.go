@@ -80,30 +80,48 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 	return "?" + strings.Join(parts, "&"), nil
 }
 
+// matches reports whether the fragment is a parameter (never an empty
+// fragment) whose decoded name equals name. This is the one name-comparison
+// rule shared by set and remove: comparison is case-sensitive against the
+// already decoded name, so percent escapes and '+' in the request have been
+// resolved before the call, and a fragment without an '=' still matches by
+// its whole text.
+func (it queryItem) matches(name string) bool {
+	return !it.empty && it.name == name
+}
+
+// splitNameMatch is the shared scan of set and remove: one pass finds the
+// first fragment matching name (empty fragments never match) and keeps every
+// other fragment — non-matching parameters, duplicates and empty fragments —
+// in its place with its existing bytes, dropping every matching fragment from
+// kept. A negative first means the name was absent, leaving the caller free
+// to append (set) or return the query untouched (remove). The first hit was
+// at items[first], so a set merging the name restores the position by
+// inserting the merged pair at kept[first].
+func splitNameMatch(items []queryItem, name string) (first int, kept []queryItem) {
+	first = -1
+	kept = items[:0]
+	for k, it := range items {
+		if it.matches(name) {
+			if first < 0 {
+				first = k
+			}
+			continue
+		}
+		kept = append(kept, it)
+	}
+	return first, kept
+}
+
 // applyRemove deletes every parameter whose decoded name equals name. With
 // no hit the query is untouched; after a hit the '?' is dropped only when no
 // parameters or empty fragments remain.
 func applyRemove(items []queryItem, present bool, name string) (bool, []queryItem) {
-	first := -1
-	for k := range items {
-		if !items[k].empty && items[k].name == name {
-			first = k
-			break
-		}
-	}
+	first, kept := splitNameMatch(items, name)
 	if first < 0 {
 		return present, items
 	}
-	kept := items[:0]
-	for _, it := range items {
-		if it.empty || it.name != name {
-			kept = append(kept, it)
-		}
-	}
-	if len(kept) == 0 {
-		return false, kept
-	}
-	return true, kept
+	return len(kept) > 0, kept
 }
 
 // applySet merges all parameters with the decoded name into one encoded
@@ -111,24 +129,15 @@ func applyRemove(items []queryItem, present bool, name string) (bool, []queryIte
 // appended to the end and creates a query string when none existed.
 func applySet(items []queryItem, present bool, name, value string) (bool, []queryItem) {
 	encoded := encodeQueryComponent(name) + "=" + encodeQueryComponent(value)
-	first := -1
-	for k := range items {
-		if !items[k].empty && items[k].name == name {
-			first = k
-			break
-		}
-	}
+	first, kept := splitNameMatch(items, name)
 	if first < 0 {
 		items = append(items, queryItem{name: name, raw: encoded})
 		return true, items
 	}
-	items[first].raw = encoded
-	kept := items[:first+1]
-	for _, it := range items[first+1:] {
-		if it.empty || it.name != name {
-			kept = append(kept, it)
-		}
-	}
+	// Put the merged pair back at the first hit's position. splitNameMatch
+	// kept every fragment before that position at the same index, so inserting
+	// there restores the original ordering exactly.
+	kept = append(kept[:first], append([]queryItem{{name: name, raw: encoded}}, kept[first:]...)...)
 	return true, kept
 }
 
