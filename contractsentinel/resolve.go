@@ -534,7 +534,9 @@ func failuref(code, format string, args ...any) *Failure {
 //  3. Query rewrite rules: each route's queryTransforms array and every rule
 //     in it.
 //  4. Field contents: a non-empty unique id, legal methods, an absolute
-//     pathPrefix and a valid upstream (Config.validate).
+//     pathPrefix (with no direct space, C0 control byte or DEL — only
+//     percent encoding may carry those) and a valid upstream
+//     (Config.validate).
 //
 // Within one layer the earliest array position wins — routes by their
 // position in the routes array and rules by their position in the route's
@@ -608,6 +610,38 @@ func validatePrefix(prefix, loc, id string) *Failure {
 		return failuref("invalid_config", "%s (id %q): pathPrefix must not contain a query string or fragment", loc, id)
 	case !validPercentEscapes(prefix):
 		return failuref("invalid_config", "%s (id %q): pathPrefix contains an invalid percent escape", loc, id)
+	}
+	if f := validatePrefixDirectCharacters(prefix, loc, id); f != nil {
+		return f
+	}
+	return nil
+}
+
+// validatePrefixDirectCharacters rejects a direct space or control byte in a
+// pathPrefix: a direct ASCII space (U+0020), a C0 control byte (U+0000
+// through U+001F) or DEL (U+007F) makes the whole configuration
+// invalid_config, because a request target can never carry that character
+// directly — ParseRequest rejects it before route selection — so such a
+// prefix could never be hit by a legal request. The check is decided on the
+// decoded configured string: writing the byte literally or spelling it as a
+// JSON escape ("\n", "\t", or the backslash-u0020 space escape) decodes to
+// the same byte and fails
+// the same way. Bytes inside a well-formed percent escape are skipped
+// without decoding, so "%20", "%09" and "%00" stay legal raw text and keep
+// matching on the raw encoded form; the prefix is never trimmed, the byte is
+// never stripped or percent-encoded on the user's behalf, and the rule is
+// not widened to other Unicode content (e.g. Chinese characters). It runs in
+// check layer 4 (Config.validate), after JSON syntax, structure and basic
+// field types and the queryTransforms rules, in routes-array order like the
+// other field-content checks, so a later route's bad queryTransforms rule or
+// an earlier route's other content error keeps its existing precedence. The
+// reason names the pathPrefix field, the route's 1-based position and valid
+// non-empty id and the first offending character as U+XXXX.
+func validatePrefixDirectCharacters(prefix, loc, id string) *Failure {
+	if c, ok := firstDirectRawCharacter(prefix); ok {
+		return failuref("invalid_config",
+			"%s (id %q): pathPrefix contains a character that must be percent-encoded: U+%04X is not allowed to appear directly in a pathPrefix (a request target may not carry it directly either, so no legal request could match this route; percent-encode it, e.g. %%20 for a space; the prefix is used exactly as configured and the byte is never stripped, trimmed or encoded on its behalf)",
+			loc, id, c)
 	}
 	return nil
 }
@@ -1198,33 +1232,45 @@ func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	return result + query, nil
 }
 
-// validateTargetCharacters enforces on the raw target that only percent
-// encoding may carry a space or a control character: a direct ASCII space
-// (U+0020), a C0 control byte (U+0000 through U+001F) or DEL (U+007F) is
-// rejected no matter whether it sits in the path, a parameter name or a
-// parameter value. Bytes inside a well-formed percent escape ("%" plus two
-// hex digits) are skipped, so "%20", "%0A" and "%09" keep parsing and
-// matching on the raw encoded form; the rule never decodes an escape first.
-// Invalid percent escapes are owned by validPercentEscapes, which runs
-// before this check, so a lone or malformed "%" keeps its existing reason.
-// The reason names the first offending character as U+XXXX.
-func validateTargetCharacters(target string) *Failure {
-	for i := 0; i < len(target); i++ {
-		c := target[i]
-		if c == '%' && i+2 < len(target) && isHex(target[i+1]) && isHex(target[i+2]) {
-			// Skip a well-formed escape so an encoded space or control byte
-			// is judged as data, never as a direct character. A malformed
-			// escape is skipped byte by byte here; it is owned by the
-			// validPercentEscapes check, which keeps its own earlier
-			// reporting and must not let a following space be jumped over.
+// firstDirectRawCharacter scans raw path text as written — without decoding
+// percent escapes — and returns the first byte that may not appear directly:
+// an ASCII space (U+0020), a C0 control byte (U+0000 through U+001F) or DEL
+// (U+007F). Bytes inside a well-formed percent escape ("%" plus two hex
+// digits) are skipped, so "%20", "%0A" and "%09" keep parsing and matching
+// on the raw encoded form and never register as a direct character; the
+// scan never decodes an escape first. A lone or malformed "%" is traversed
+// byte by byte here — such an escape is owned by validPercentEscapes, which
+// runs before this scan in both readers, and must not let a following
+// offending byte be jumped over. It is the one shared decision of the
+// request target rule and the route pathPrefix rule, so the two sides that
+// must agree on which bytes may appear directly cannot drift apart.
+func firstDirectRawCharacter(s string) (byte, bool) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
 			i += 2
 			continue
 		}
 		if c == ' ' || c < 0x20 || c == 0x7f {
-			return failuref("invalid_request",
-				"target contains a character that must be percent-encoded: U+%04X is not allowed to appear directly (percent-encode it, e.g. %%20 for a space)",
-				c)
+			return c, true
 		}
+	}
+	return 0, false
+}
+
+// validateTargetCharacters enforces on the raw target that only percent
+// encoding may carry a space or a control character: a direct ASCII space
+// (U+0020), a C0 control byte (U+0000 through U+001F) or DEL (U+007F) is
+// rejected no matter whether it sits in the path, a parameter name or a
+// parameter value. Invalid percent escapes are owned by
+// validPercentEscapes, which runs before this check, so a lone or malformed
+// "%" keeps its existing reason. The reason names the first offending
+// character as U+XXXX.
+func validateTargetCharacters(target string) *Failure {
+	if c, ok := firstDirectRawCharacter(target); ok {
+		return failuref("invalid_request",
+			"target contains a character that must be percent-encoded: U+%04X is not allowed to appear directly (percent-encode it, e.g. %%20 for a space)",
+			c)
 	}
 	return nil
 }
