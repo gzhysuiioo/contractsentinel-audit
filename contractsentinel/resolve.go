@@ -75,9 +75,9 @@ func (r Route) MarshalJSON() ([]byte, error) {
 }
 
 // QueryTransform is one rule in a route's queryTransforms array: op is
-// "set", "remove" or "rename"; name is matched against decoded parameter
-// names, value (set only) is used literally, and to (rename only) is the
-// literal replacement name.
+// "set", "remove", "rename" or "copy"; name is matched against decoded
+// parameter names, value (set only) is used literally, and to (rename and
+// copy only) is the literal replacement or copy name.
 type QueryTransform struct {
 	Op    string `json:"op"`
 	Name  string `json:"name"`
@@ -89,7 +89,7 @@ type QueryTransform struct {
 // parseQueryTransforms enforces on input:
 //   - set keeps "value" as a JSON string, including the empty string;
 //   - remove emits only op and name (never value or to);
-//   - rename keeps a non-empty "to" and never emits value.
+//   - rename and copy keep a non-empty "to" and never emit value.
 //
 // name, value and to are written as the literal strings read in — spaces,
 // non-ASCII letters, '+' and '%' included — with only JSON string escaping,
@@ -103,7 +103,7 @@ func (q *QueryTransform) MarshalJSON() ([]byte, error) {
 			Name  string `json:"name"`
 			Value string `json:"value"`
 		}{q.Op, q.Name, q.Value})
-	case "rename":
+	case "rename", "copy":
 		return json.Marshal(struct {
 			Op   string `json:"op"`
 			Name string `json:"name"`
@@ -271,8 +271,8 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
 		case !jsonString(opRaw, &qt.Op):
 			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
-		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename":
-			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove and rename are supported)", ruleLoc, qt.Op)
+		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename" && qt.Op != "copy":
+			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove, rename and copy are supported)", ruleLoc, qt.Op)
 		}
 
 		nameRaw, ok := fields["name"]
@@ -299,13 +299,13 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			if hasValue {
 				return nil, failuref("invalid_config", "%s: remove must not include a value", ruleLoc)
 			}
-		case "rename":
+		case "rename", "copy":
 			if hasValue {
-				return nil, failuref("invalid_config", "%s: rename must not include a value", ruleLoc)
+				return nil, failuref("invalid_config", "%s: %s must not include a value", ruleLoc, qt.Op)
 			}
 			switch {
 			case !hasTo:
-				return nil, failuref("invalid_config", "%s: rename requires a non-empty string to", ruleLoc)
+				return nil, failuref("invalid_config", "%s: %s requires a non-empty string to", ruleLoc, qt.Op)
 			case !jsonString(toRaw, &qt.To):
 				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
 			case qt.To == "":

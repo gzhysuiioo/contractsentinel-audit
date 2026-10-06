@@ -67,6 +67,8 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 			present, items = applySet(items, present, tr.Name, tr.Value)
 		case "rename":
 			items = applyRename(items, tr.Name, tr.To)
+		case "copy":
+			items = applyCopy(items, tr.Name, tr.To)
 		}
 	}
 
@@ -168,6 +170,40 @@ func applyRename(items []queryItem, name, to string) []queryItem {
 		items[k].name = to
 	}
 	return items
+}
+
+// applyCopy duplicates every parameter whose decoded name equals name: the
+// original stays in place and its copy follows it immediately. The copy's
+// name is encoded the way set encodes names, while the '=' (if any) and the
+// raw value bytes after it are copied verbatim — a valueless source yields a
+// valueless copy, an empty value keeps its '=', and percent escapes, '+' and
+// extra '=' inside the value are never rewritten. Parameters already named
+// to, empty fragments and non-matching parameters are untouched (existing
+// target-name parameters are kept, never merged or overwritten), and the
+// copies made by this rule are not themselves re-copied. When nothing
+// matches (or name and to are identical) every fragment keeps its bytes.
+func applyCopy(items []queryItem, name, to string) []queryItem {
+	if name == to {
+		// Copying onto the same name must not re-encode existing names.
+		return items
+	}
+	encodedTo := encodeQueryComponent(to)
+	out := make([]queryItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, it)
+		if !matchesName(it, name) {
+			continue
+		}
+		frag := it.raw
+		if j := strings.IndexByte(frag, '='); j >= 0 {
+			// Keep the '=' and everything after it byte for byte.
+			frag = encodedTo + frag[j:]
+		} else {
+			frag = encodedTo
+		}
+		out = append(out, queryItem{name: to, raw: frag})
+	}
+	return out
 }
 
 // decodeQueryName percent-decodes a raw parameter name with '+' treated as a

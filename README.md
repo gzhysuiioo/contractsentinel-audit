@@ -74,11 +74,12 @@ go test ./...
 "queryTransforms": [
   {"op": "set",    "name": "a",    "value": ""},
   {"op": "remove", "name": "flag"},
-  {"op": "rename", "name": "old",  "to": "new"}
+  {"op": "rename", "name": "old",  "to": "new"},
+  {"op": "copy",   "name": "old",  "to": "new"}
 ]
 ```
 
-- `op` 仅支持 `set`、`remove`、`rename`；`name` 为非空字符串，按字面值使用。
+- `op` 仅支持 `set`、`remove`、`rename`、`copy`；`name` 为非空字符串，按字面值使用。
 - `set` 必须提供字符串 `value`（允许空字符串）；`remove` 不接受 `value`。
 - `rename` 必须提供非空字符串 `to`，不接受 `value`；`name` 与 `to` 按
   字面值使用。命中的参数在原位置改名，各自的值、数量与相对顺序保留；
@@ -88,6 +89,16 @@ go test ./...
   与大小写都不改写。例如 `old=1&new=9&%6Fld=%2f+&old&x=` 把 `old`
   改名为 `new` 后得到 `new=1&new=9&new=%2f+&new&x=`。没有来源参数时
   查询串完全不变；`name` 与 `to` 相同时也不改写已有的名称编码。
+- `copy` 必须提供非空字符串 `to`，不接受 `value`；`name` 与 `to` 按
+  字面值使用。复制在保留原参数的同时向上游提供另一个名称：每个名称匹配
+  的参数原样留在原位置，副本紧跟其原参数插入；已经叫目标名的参数继续
+  保留，不合并也不覆盖。无等号的参数产生无等号的副本，空值保留等号；
+  副本只按 `set` 的方式编码新名称，第一个等号及其后的内容逐字节复制，
+  值中的百分号编码、`+` 与额外等号都不改写。例如 `old=%2f+&new=9&old`
+  把 `old` 复制为 `new` 后得到 `old=%2f+&new=%2f+&new=9&old&new`。
+  来源不存在时查询串完全不变；`name` 与 `to` 相同时不生成副本，也不
+  重新编码已有名称。没有查询串时 `copy` 不创建问号，原有的空问号也不
+  因复制操作消失。
 - 查询串只以 `&` 分隔，第一个 `=` 分开名称和值；没有 `=` 的片段也能按名称
   命中。空查询串（`?` 后为空）视为没有片段，其余空片段（如 `?a=1&` 末尾）
   保留且不作为参数。
@@ -102,10 +113,12 @@ go test ./...
 - 后一条规则基于前一条规则的结果执行。例如查询串
   `x=%2f&a=1&%61=2&flag` 先 `set a=""` 再 `remove flag`，结果为
   `x=%2f&a=`。`rename` 同样按数组次序串接：后续对目标名的 `set`
-  仍合并所有同名参数，`remove` 仍删除全部同名参数。
+  仍合并所有同名参数，`remove` 仍删除全部同名参数。`copy` 产生
+  的副本也参与后续规则：例如先 `copy old→new` 再 `remove old`，
+  原参数被删除而副本 `new` 保留。
 
 数组或规则为 `null`、字段类型错误、未知操作、空名称、缺少必要字段、
-`remove` 带 `value` 或 `rename` 缺少/带非法 `to` 或带 `value`，都使
+`remove` 带 `value` 或 `rename`/`copy` 缺少/带非法 `to` 或带 `value`，都使
 整个配置返回 `invalid_config`（即使出错路由不会被命中）；reason 定位到
 路由，规则错误另给出从 1 开始的规则序号。
 
@@ -215,8 +228,8 @@ saved, err := json.Marshal(cfg) // Config、Route、QueryTransform 实现了 Mar
 
 - `set` 的空字符串 `value` 仍会写出（`"value":""`）：空字符串是合法值，
   读取时只有缺少 `value` 字段才报错；
-- `remove` 不写 `value` 或 `to`，`rename` 保留 `to` 且不写 `value`——
-  多写的字段正是读取时会拒绝的形状；
+- `remove` 不写 `value` 或 `to`，`rename` 与 `copy` 保留 `to` 且不写
+  `value`——多写的字段正是读取时会拒绝的形状；
 - 未提供 `queryTransforms` 与显式 `"queryTransforms": []` 都保存为省略
   该字段（不会写成 `null`）：两种写法本就等价，重新读取后原查询串
   逐字节保留，不会被改写；
