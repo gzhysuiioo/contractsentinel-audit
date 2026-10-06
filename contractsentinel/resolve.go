@@ -18,25 +18,35 @@ import (
 // been selected.
 //
 // QueryTransforms stays tag-less in the default (un)marshal sense: reading
-// goes through Config.UnmarshalJSON via the routeJSON raw mirror, and writing
-// goes through Route.MarshalJSON, so the rules round-trip instead of being
-// silently dropped (a plain json:"-" tag only omitted them on save).
+// goes through Config.UnmarshalJSON, which decodes each route through the
+// routeJSON raw mirror and validates the rules before they reach this field,
+// and writing goes through Route.MarshalJSON, so the rules round-trip
+// instead of being silently dropped (a plain json:"-" tag only omitted them
+// on save).
 type Route struct {
 	ID         string
 	Methods    []string
 	PathPrefix string
 	Upstream   string
 
-	// QueryTransforms holds the parsed rules. When it carries no rules the
-	// field is omitted on save, whether the source named no field or an
+	// QueryTransforms holds the validated rules. When it carries no rules
+	// the field is omitted on save, whether the source named no field or an
 	// explicit queryTransforms: [] — both are valid ways to write a route
 	// without rules, and ParseConfig accepts either.
 	QueryTransforms []*QueryTransform
+}
 
-	// queryTransformsRaw holds the undecoded queryTransforms value until
-	// Config.UnmarshalJSON validates it once the route's position in its own
-	// config is known. It is nil in every successfully parsed config.
-	queryTransformsRaw json.RawMessage
+// pendingRoute is the read-side intermediate form of one route: the decoded
+// basic fields alongside the still-unchecked raw queryTransforms value. It
+// exists only inside the config reader, where the rules are validated against
+// the route's 1-based position in check layer 3, and never becomes part of a
+// finished Config — Route itself only ever carries the validated result, so
+// no read path can observe a route that still holds unchecked rule text.
+type pendingRoute struct {
+	route Route
+	// rawTransforms is the undecoded queryTransforms value, kept apart from
+	// the formal route data until checkQueryTransforms validates it.
+	rawTransforms json.RawMessage
 }
 
 // MarshalJSON writes routes back in the shape ParseConfig accepts: the four
@@ -46,7 +56,7 @@ type Route struct {
 // either spelling; the field is never written as null. The rules' order and
 // literal strings are preserved byte for byte apart from JSON string
 // escaping, so re-parsing the output and resolving yields the same routeId
-// and upstreamURL. Unexported fields never appear in the output.
+// and upstreamURL.
 func (r Route) MarshalJSON() ([]byte, error) {
 	type routeOut struct {
 		ID              string            `json:"id"`
@@ -111,10 +121,10 @@ func (q *QueryTransform) MarshalJSON() ([]byte, error) {
 }
 
 // routeJSON mirrors Route but keeps every field raw: the basic fields are
-// type-checked in Config.UnmarshalJSON with the route's position (and, when
-// available, its id), so a wrong field type is reported on that route rather
-// than as a generic JSON decode error, and queryTransforms can surface
-// null, wrong types and malformed rules the same way.
+// type-checked by decodeRoute with the route's position (and, when available,
+// its id), so a wrong field type is reported on that route rather than as a
+// generic JSON decode error, and queryTransforms can surface null, wrong
+// types and malformed rules the same way.
 type routeJSON struct {
 	ID              json.RawMessage `json:"id"`
 	Methods         json.RawMessage `json:"methods"`
@@ -123,20 +133,22 @@ type routeJSON struct {
 	QueryTransforms json.RawMessage `json:"queryTransforms"`
 }
 
-// decodeRoute type-checks and decodes one raw route object. loc is the
-// route's 1-based location in its config (e.g. "route 2"). The element's JSON
-// type is checked first: a null entry or any non-object value fails on the
-// entry itself, naming the position, the required object type and the type
-// actually received, instead of falling through to a missing-field error such
-// as a missing id. Field type errors then carry that location and, when the
-// route supplies a valid non-empty string id anywhere in its object (even
-// after the offending field), that id. Missing fields stay silent here and
-// are rejected later by validate, which preserves the existing missing-field
-// behavior.
-func decodeRoute(data []byte, loc string) (Route, *Failure) {
+// decodeRoute type-checks and decodes one raw route object into its
+// intermediate form: the basic fields land on the pending route, while the
+// raw queryTransforms value travels alongside it, still unchecked, for check
+// layer 3. loc is the route's 1-based location in its config (e.g.
+// "route 2"). The element's JSON type is checked first: a null entry or any
+// non-object value fails on the entry itself, naming the position, the
+// required object type and the type actually received, instead of falling
+// through to a missing-field error such as a missing id. Field type errors
+// then carry that location and, when the route supplies a valid non-empty
+// string id anywhere in its object (even after the offending field), that id.
+// Missing fields stay silent here and are rejected later by validate, which
+// preserves the existing missing-field behavior.
+func decodeRoute(data []byte, loc string) (pendingRoute, *Failure) {
 	elem := bytes.TrimSpace(data)
 	if len(elem) == 0 || elem[0] != '{' {
-		return Route{}, failuref("invalid_config",
+		return pendingRoute{}, failuref("invalid_config",
 			"%s: route entry must be an object, got %s", loc, jsonTypeName(elem))
 	}
 	var rj routeJSON
@@ -144,17 +156,18 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 		// The element already parsed as one JSON value and starts with '{';
 		// an object that cannot be read is a syntax failure rather than a
 		// field type error.
-		return Route{}, failuref("invalid_config", "config is not valid JSON: %v", err)
+		return pendingRoute{}, failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
 
-	var route Route
+	var pending pendingRoute
+	route := &pending.route
 	// Type-check id first so it can identify the route on an error in any
 	// later field regardless of object order. Only a valid non-empty JSON
 	// string becomes the label; a wrong-typed id is reported against the id
 	// field and never rendered (e.g. as a number or object) as the route's
 	// identity, so that error is located by position alone.
 	if !decodeStringField(rj.ID, &route.ID) {
-		return Route{}, failuref("invalid_config", "%s: id must be a string", loc)
+		return pendingRoute{}, failuref("invalid_config", "%s: id must be a string", loc)
 	}
 	label := loc
 	if route.ID != "" {
@@ -162,16 +175,16 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 	}
 
 	if f := decodeMethodsField(rj.Methods, label, &route.Methods); f != nil {
-		return Route{}, f
+		return pendingRoute{}, f
 	}
 	if f := decodeRouteStringField(rj.PathPrefix, label, "pathPrefix", &route.PathPrefix); f != nil {
-		return Route{}, f
+		return pendingRoute{}, f
 	}
 	if f := decodeRouteStringField(rj.Upstream, label, "upstream", &route.Upstream); f != nil {
-		return Route{}, f
+		return pendingRoute{}, f
 	}
-	route.queryTransformsRaw = rj.QueryTransforms
-	return route, nil
+	pending.rawTransforms = rj.QueryTransforms
+	return pending, nil
 }
 
 // decodeRouteStringField renders a route field's string type error with the
@@ -342,76 +355,115 @@ func (cfg *Config) MarshalJSON() ([]byte, error) {
 	}{Routes: routes})
 }
 
-// UnmarshalJSON first confirms the document is one syntactically valid JSON
-// value, then checks its structure: the top-level value must be a JSON object
-// and, when present, the routes field must hold an array. A syntactically
-// legal value of the wrong shape (an array, string, number, boolean or null
-// at the top level; a non-array routes, null included) is an invalid_config
-// naming both the required type and the type received, never a JSON parse
-// failure. The routes array is then decoded one entry at a time, each entry
-// type-checked and validated against its 1-based position in this config; a
-// non-object entry (null included) fails on that entry before any field is
-// inspected. Decoding entries from raw values means wrong field types are
-// reported on the offending route (with its id when available) instead of
-// as a generic JSON syntax failure. The position comes from the array
-// decoded here, so configs parsed concurrently or interleaved in the same
-// process cannot shift each other's route numbering. A broken JSON document
-// still fails the outer decode and is reported as a parse failure, without a
-// guessed route position or field.
+// UnmarshalJSON runs check layers 1–3 of config reading (see ParseConfig for
+// the full layer list and the error-selection rules): JSON syntax, then the
+// document structure and basic field types, then the queryTransforms rules.
+// Layer 4 (field contents) is Config.validate, run by ParseConfig after
+// decoding. The routes are decoded one entry at a time from raw values, each
+// type-checked against its 1-based position in this config, so a wrong field
+// type is reported on the offending route (with its id when available)
+// instead of as a generic JSON syntax failure, and configs parsed
+// concurrently or interleaved in the same process cannot shift each other's
+// route numbering. A broken JSON document fails the outer decode and is
+// reported as a parse failure, without a guessed route position or field.
 func (cfg *Config) UnmarshalJSON(data []byte) error {
-	// Syntax first, then the top-level shape; both basic checks are shared
-	// with ParseRequest (see unmarshalJSONValue / requireJSONObject), only
-	// the code and wording differ.
-	body, err := unmarshalJSONValue(data)
+	read, err := readConfig(data)
 	if err != nil {
 		return err
 	}
-	if f := requireJSONObject(body, "invalid_config", "config", true); f != nil {
-		return f
+	*cfg = *read
+	return nil
+}
+
+// readConfig runs check layers 1–3 and returns the configuration with every
+// route's basic fields decoded and its queryTransforms validated. The
+// intermediate pendingRoutes keep the unchecked rule text out of the
+// returned Config; layer 4 (field contents) is Config.validate, run by
+// ParseConfig.
+func readConfig(data []byte) (*Config, error) {
+	// Layer 1: JSON syntax. A broken document is only ever a parse failure,
+	// reported without a guessed route position or field.
+	body, err := unmarshalJSONValue(data)
+	if err != nil {
+		return nil, err
 	}
+	// Layer 2: structure and basic field types.
+	if f := requireJSONObject(body, "invalid_config", "config", true); f != nil {
+		return nil, f
+	}
+	routes, err := decodeConfigRoutes(body)
+	if err != nil {
+		return nil, err
+	}
+	// Layer 3: query rewrite rules, checked only once every route's basic
+	// fields have the right type, so a type error on any route — earlier or
+	// later — is always reported before any rule error.
+	if f := checkQueryTransforms(routes); f != nil {
+		return nil, f
+	}
+	cfg := &Config{Routes: make([]Route, len(routes))}
+	for i := range routes {
+		cfg.Routes[i] = routes[i].route
+	}
+	return cfg, nil
+}
+
+// decodeConfigRoutes is check layer 2: the top-level object is taken apart
+// and every route entry is type-checked against its 1-based position. The
+// routes field must hold an array when present — null is a type error here,
+// never an absent field: a config that explicitly supplies routes must supply
+// an array. A non-object entry (null included) fails on that entry before
+// any field is inspected, and a wrong field type is reported on the offending
+// route with its id when the route supplies a valid non-empty string id
+// anywhere in its object. Each route's unchecked queryTransforms value
+// travels in the returned pendingRoutes for layer 3.
+func decodeConfigRoutes(body json.RawMessage) ([]pendingRoute, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return err
+		return nil, err
 	}
 
 	var rawRoutes []json.RawMessage
 	if raw, ok := fields["routes"]; ok {
-		body := bytes.TrimSpace(raw)
-		if len(body) == 0 || body[0] != '[' {
-			// null is a type error here, never an absent field: a config
-			// that explicitly supplies routes must supply an array.
-			return failuref("invalid_config", "routes must be an array, got %s", jsonTypeName(body))
+		elem := bytes.TrimSpace(raw)
+		if len(elem) == 0 || elem[0] != '[' {
+			return nil, failuref("invalid_config", "routes must be an array, got %s", jsonTypeName(elem))
 		}
-		if err := json.Unmarshal(body, &rawRoutes); err != nil {
-			return err
+		if err := json.Unmarshal(elem, &rawRoutes); err != nil {
+			return nil, err
 		}
 	}
 
-	// Pass 1: decode and type-check every entry, so a wrong field type on a
-	// later route fails before any queryTransforms validation (matching the
-	// precedence of decoding before validation).
-	cfg.Routes = make([]Route, len(rawRoutes))
+	routes := make([]pendingRoute, len(rawRoutes))
 	for i, entry := range rawRoutes {
 		route, f := decodeRoute(entry, fmt.Sprintf("route %d", i+1))
 		if f != nil {
-			return f
+			return nil, f
 		}
-		cfg.Routes[i] = route
+		routes[i] = route
 	}
-	// Pass 2: validate each route's queryTransforms now that every position
-	// is known.
-	for i := range cfg.Routes {
-		route := &cfg.Routes[i]
-		if len(route.queryTransformsRaw) == 0 {
+	return routes, nil
+}
+
+// checkQueryTransforms is check layer 3: every route's raw queryTransforms
+// value is decoded and validated against the route's 1-based position, in
+// routes-array order, and the validated rules replace the pending raw value.
+// It runs only after layer 2 has cleared every route, so a basic-field type
+// error on any route — earlier or later — is always reported before any rule
+// error, while within this layer the earliest route (and within it the
+// earliest rule) wins.
+func checkQueryTransforms(routes []pendingRoute) *Failure {
+	for i := range routes {
+		if len(routes[i].rawTransforms) == 0 {
 			continue // field absent
 		}
 		loc := fmt.Sprintf("route %d", i+1)
-		transforms, f := parseQueryTransforms(route.queryTransformsRaw, loc, route.ID)
+		transforms, f := parseQueryTransforms(routes[i].rawTransforms, loc, routes[i].route.ID)
 		if f != nil {
 			return f
 		}
-		route.QueryTransforms = transforms
-		route.queryTransformsRaw = nil
+		routes[i].route.QueryTransforms = transforms
+		routes[i].rawTransforms = nil
 	}
 	return nil
 }
@@ -470,7 +522,27 @@ func failuref(code, format string, args ...any) *Failure {
 	return &Failure{Code: code, Reason: fmt.Sprintf(format, args...)}
 }
 
-// ParseConfig parses and fully validates the route configuration.
+// ParseConfig parses and fully validates the route configuration. Reading
+// checks the document in four layers, and the first layer that finds a
+// problem decides which error is reported:
+//
+//  1. JSON syntax: a broken document is only ever a parse failure, reported
+//     without a guessed route position or field.
+//  2. Structure and basic field types: the top-level value must be an
+//     object, routes must be an array of objects, and id, methods,
+//     pathPrefix and upstream must carry their JSON types.
+//  3. Query rewrite rules: each route's queryTransforms array and every rule
+//     in it.
+//  4. Field contents: a non-empty unique id, legal methods, an absolute
+//     pathPrefix and a valid upstream (Config.validate).
+//
+// Within one layer the earliest array position wins — routes by their
+// position in the routes array and rules by their position in the route's
+// queryTransforms array, never by id ordering or by the object field order.
+// Layers 1–3 run in Config.UnmarshalJSON (so they also guard a plain
+// json.Unmarshal into a Config); layer 4 runs here, after decoding. Every
+// failure hands back no config at all, so a half-parsed configuration can
+// never resolve a request.
 func ParseConfig(data []byte) (*Config, *Failure) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -485,6 +557,10 @@ func ParseConfig(data []byte) (*Config, *Failure) {
 	return &cfg, nil
 }
 
+// validate is check layer 4 (see ParseConfig): the field contents of every
+// route, in routes-array order. It runs only after layers 1–3 have cleared
+// the whole document, so any structure, field-type or rule error anywhere is
+// reported before any content error.
 func (cfg *Config) validate() *Failure {
 	seenIDs := make(map[string]int, len(cfg.Routes))
 	for i := range cfg.Routes {
