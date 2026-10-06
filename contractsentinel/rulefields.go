@@ -1,6 +1,7 @@
 // Package contractsentinel rulefields: raw JSON type gates for the formal
-// members of a rule definition, shared by the audit submission and the stored
-// report archive.
+// members of the fixed-shape objects (rule definitions, imported check
+// records and stored defect findings), shared by the audit submission and
+// the stored report archive.
 package contractsentinel
 
 import "encoding/json"
@@ -106,20 +107,25 @@ func formalMemberString(obj map[string]json.RawMessage, name string) string {
 }
 
 // checkObjectArrayFieldTypes is checkRuleFieldTypes generalized over the
-// top-level array carrying the fixed-shape objects: "rules" on both sides and
-// "checks" on the submission side share the same written-means-typed walk,
-// while each gate supplies the array name, locator and error attribution.
+// top-level array carrying the fixed-shape objects: "rules" on both sides,
+// "checks" on the submission side and "findings" on the stored-report read
+// share the same written-means-typed walk, while each gate supplies the array
+// name, locator and error attribution. Only these three arrays ever carry a
+// fixed shape; any other name walks an empty array.
 func checkObjectArrayFieldTypes(strict []byte, arrayName string, checks []ruleFieldTypeCheck, hooks ruleFieldTypeHooks) error {
-	var top struct {
-		Rules  []map[string]json.RawMessage `json:"rules"`
-		Checks []map[string]json.RawMessage `json:"checks"`
-	}
+	var top map[string]json.RawMessage
 	if err := json.Unmarshal(strict, &top); err != nil {
 		return hooks.invalidJSON(err)
 	}
-	objects := top.Rules
-	if arrayName == "checks" {
-		objects = top.Checks
+	// Decode only the requested array, so an object-typed sibling such as the
+	// report artifact never has to unmarshal into the slice element type. A
+	// missing or null array carries no objects to check and walks as empty,
+	// matching the zero slice a struct decode would yield.
+	var objects []map[string]json.RawMessage
+	if raw, ok := top[arrayName]; ok && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &objects); err != nil {
+			return hooks.invalidJSON(err)
+		}
 	}
 	for i, obj := range objects {
 		where := hooks.locate(i, obj)
