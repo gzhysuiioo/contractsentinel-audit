@@ -607,6 +607,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUpstreamHostPresent(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamBasePathSpace(p, loc, id); f != nil {
+		return f
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
@@ -653,6 +656,33 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
 		routeLabel(loc, id), p.raw)
+}
+
+// validateUpstreamBasePathSpace rejects a direct ASCII space (U+0020) in the
+// upstream base path — inside a path segment, beside a slash or at the end,
+// it is all the same error. Only percent encoding may carry a space there:
+// "%20" is legal path content and is never decoded first, so an encoded
+// space stays accepted while the literal byte is rejected. The check reads
+// the same splitUpstream base-path boundaries the join uses, so a space that
+// would reach upstreamURL can never pass validation. It is decided on the
+// decoded configured string (a " " JSON escape decodes to the same
+// byte), only the ASCII space is rejected — the rule is not widened to other
+// Unicode whitespace — and the address is judged exactly as configured: the
+// space is never stripped, the path never trimmed and the byte never
+// re-encoded on the user's behalf. The reason names the route's 1-based
+// position, its id and the upstream field; like the host rules this is a
+// content error in a syntactically valid JSON document, never a JSON parse
+// failure.
+func validateUpstreamBasePathSpace(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	if !strings.ContainsRune(p.basePath, ' ') {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream base path contains an unencoded space (U+0020): a space in the upstream address must be percent-encoded as %%20 in the configuration; the address is used exactly as configured and the space is never stripped, the path never trimmed and the byte never encoded on its behalf",
+		routeLabel(loc, id))
 }
 
 // validateBracketedUpstreamHost checks the split raw upstream's authority for
