@@ -729,6 +729,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUpstreamHostPresent(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamPortRange(p, loc, id); f != nil {
+		return f
+	}
 	if f := validateUpstreamBasePathSpace(p, loc, id); f != nil {
 		return f
 	}
@@ -778,6 +781,111 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
 		routeLabel(loc, id), p.raw)
+}
+
+// validateUpstreamPortRange enforces the TCP port range on an explicitly
+// written, non-empty, all-digits port in the upstream address:
+//
+//	scheme "://" [userinfo "@"] host [":" port] [basePath]
+//
+// A port is a decimal number from 0 to 65535, both ends included; 65536 or
+// anything larger is not a TCP port and the whole configuration fails as
+// invalid_config. The decision is made on the decimal value, not the string
+// length: leading zeros change nothing ("00065535" is legal, "00065536" is
+// not), and the digit string is compared without ever being converted to an
+// integer, so a port of arbitrary length cannot overflow a conversion into
+// an accepted value or crash the read. The comparison is length-then-
+// lexicographic against "65535" on the zero-stripped digits, which is exact
+// for equal-length decimal strings.
+//
+// The port is sliced out of the same splitUpstream hostPort boundaries the
+// host validators and the final join use, so only the real port is judged:
+// the colon inside userinfo ends at the last '@' before hostPort is even
+// formed, the colons of an IPv6 literal sit inside the bracket pair the
+// bracketed-host check already validated (its port is the digits after the
+// closing ']'), and a number in the base path is past the first path slash
+// and never reaches hostPort. Ordinary domains, bare IPv4 hosts and
+// bracketed IPv6 hosts all answer to the same range.
+//
+// Only an explicitly written non-empty digit run is judged here: an absent
+// port and the existing legal "host:" spelling (a colon with an empty port)
+// stay accepted, and port text that is not all digits keeps its existing
+// owner — the bracketed-host shape check for a bracketed host, the generic
+// URL parse error otherwise — so this check never rewords an illegal-port
+// error that already exists. The check runs in check layer 4
+// (Config.validate) after the host-shape rules, in routes-array order like
+// the other field-content checks, so every earlier error keeps its
+// precedence and one bad route fails the whole read even when a request
+// would only have hit another, legal route. The reason names the route's
+// 1-based position, its id and the upstream field and says the port is
+// outside 0–65535; this is a content error in a syntactically valid JSON
+// document, never a JSON parse failure. A legal port is never normalized:
+// the join slices the raw upstream, so "00065535" reaches upstreamURL with
+// its leading zeros intact.
+func validateUpstreamPortRange(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	port, ok := upstreamExplicitPort(p.hostPort)
+	if !ok || port == "" {
+		return nil
+	}
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			// Not a numeric port: the existing illegal-port checks own it.
+			return nil
+		}
+	}
+	if portWithinTCPRange(port) {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream port %q is out of range: an explicitly written port must be a decimal number from 0 to 65535 (leading zeros do not change the value); the address is used exactly as configured and the port is never clamped, truncated or rewritten",
+		routeLabel(loc, id), port)
+}
+
+// upstreamExplicitPort slices the explicitly written port out of a hostPort
+// (the authority after the last '@', per splitUpstream). It reports false
+// when there is no port separator at all; a present separator with an empty
+// port ("host:") reports the empty string with true, and the caller leaves
+// that existing legal spelling alone. The shape decisions of the host
+// validators are trusted, not repeated: a bracketed host's port follows the
+// closing ']', and an unbracketed hostPort carries at most one colon — the
+// one separating host and port — because validateUnbracketedUpstreamHost
+// already rejected anything with more.
+func upstreamExplicitPort(hostPort string) (port string, ok bool) {
+	if hostPort == "" {
+		return "", false
+	}
+	if hostPort[0] == '[' {
+		closeBracket := strings.IndexByte(hostPort, ']')
+		if closeBracket < 0 {
+			return "", false // owned by the bracketed-host check
+		}
+		suffix := hostPort[closeBracket+1:]
+		if suffix == "" || suffix[0] != ':' {
+			return "", false
+		}
+		return suffix[1:], true
+	}
+	if strings.Count(hostPort, ":") != 1 {
+		return "", false
+	}
+	return hostPort[strings.IndexByte(hostPort, ':')+1:], true
+}
+
+// portWithinTCPRange reports whether an all-digits port string names a value
+// from 0 to 65535 inclusive. The digits are never converted to an integer:
+// leading zeros are stripped and the remaining string is compared against
+// "65535" by length and then lexicographically, which decides the decimal
+// order exactly and cannot overflow no matter how long the input is. An
+// all-zeros port strips to the empty string and is in range (it is 0).
+func portWithinTCPRange(port string) bool {
+	trimmed := strings.TrimLeft(port, "0")
+	if len(trimmed) > len("65535") {
+		return false
+	}
+	return len(trimmed) < len("65535") || trimmed <= "65535"
 }
 
 // validateUpstreamBasePathSpace rejects a direct ASCII space (U+0020) in the
