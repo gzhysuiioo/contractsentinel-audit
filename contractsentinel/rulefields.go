@@ -62,25 +62,69 @@ type ruleFieldTypeHooks struct {
 // member of every strict rule, before the document is decoded into Go
 // bool/string struct fields where null would silently become the zero value
 // false or "" and launder an illegal submission or archive into a legal one.
-// It is the single implementation behind the audit submission and the stored
-// report read: the written-means-typed rule, omission handling, per-rule and
-// per-member order, and the treatment of extension members all live here,
-// while each side supplies its own locator and error attribution. The strict
-// rewrite has already dropped extension members, so only the agreed spelling
-// (Unicode escapes included) is visible here — a case-variant or
-// whitespace-padded name can neither supply nor rescue a formal value, and a
-// null it carries never reaches this gate.
+// It is the rule-array specialization of checkObjectArrayFieldTypes shared by
+// the audit submission and the stored report read: the written-means-typed
+// rule, omission handling, per-rule and per-member order, and the treatment of
+// extension members all live there, while each side supplies its own locator
+// and error attribution. The strict rewrite has already dropped extension
+// members, so only the agreed spelling (Unicode escapes included) is visible
+// here — a case-variant or whitespace-padded name can neither supply nor
+// rescue a formal value, and a null it carries never reaches this gate.
 func checkRuleFieldTypes(strict []byte, checks []ruleFieldTypeCheck, hooks ruleFieldTypeHooks) error {
+	return checkObjectArrayFieldTypes(strict, "rules", checks, hooks)
+}
+
+// formalRuleID returns the decoded value of a rule's formal id member when it
+// is present and itself a legal non-empty JSON string; otherwise it returns
+// "", so a rule with a missing, empty or mistyped id is located by its other
+// context alone.
+func formalRuleID(rule map[string]json.RawMessage) string {
+	return formalMemberString(rule, "id")
+}
+
+// formalCheckRuleID returns the decoded value of a check record's formal
+// ruleId member when it is present and itself a legal non-empty JSON string;
+// otherwise it returns "", so a record with a missing, empty or mistyped
+// ruleId is located by its checks-array position alone.
+func formalCheckRuleID(rec map[string]json.RawMessage) string {
+	return formalMemberString(rec, "ruleId")
+}
+
+// formalMemberString returns the decoded string value of obj's named formal
+// member when the member is present and itself a legal JSON string; a missing
+// member, a non-string value or an empty string all yield "".
+func formalMemberString(obj map[string]json.RawMessage, name string) string {
+	raw, ok := obj[name]
+	if !ok {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || value == "" {
+		return ""
+	}
+	return value
+}
+
+// checkObjectArrayFieldTypes is checkRuleFieldTypes generalized over the
+// top-level array carrying the fixed-shape objects: "rules" on both sides and
+// "checks" on the submission side share the same written-means-typed walk,
+// while each gate supplies the array name, locator and error attribution.
+func checkObjectArrayFieldTypes(strict []byte, arrayName string, checks []ruleFieldTypeCheck, hooks ruleFieldTypeHooks) error {
 	var top struct {
-		Rules []map[string]json.RawMessage `json:"rules"`
+		Rules  []map[string]json.RawMessage `json:"rules"`
+		Checks []map[string]json.RawMessage `json:"checks"`
 	}
 	if err := json.Unmarshal(strict, &top); err != nil {
 		return hooks.invalidJSON(err)
 	}
-	for i, rule := range top.Rules {
-		where := hooks.locate(i, rule)
+	objects := top.Rules
+	if arrayName == "checks" {
+		objects = top.Checks
+	}
+	for i, obj := range objects {
+		where := hooks.locate(i, obj)
 		for _, check := range checks {
-			raw, present := rule[check.field]
+			raw, present := obj[check.field]
 			if !present {
 				continue
 			}
@@ -91,20 +135,4 @@ func checkRuleFieldTypes(strict []byte, checks []ruleFieldTypeCheck, hooks ruleF
 		}
 	}
 	return nil
-}
-
-// formalRuleID returns the decoded value of a rule's formal id member when it
-// is present and itself a legal non-empty JSON string; otherwise it returns
-// "", so a rule with a missing, empty or mistyped id is located by its other
-// context alone.
-func formalRuleID(rule map[string]json.RawMessage) string {
-	raw, ok := rule["id"]
-	if !ok {
-		return ""
-	}
-	var id string
-	if err := json.Unmarshal(raw, &id); err != nil || id == "" {
-		return ""
-	}
-	return id
 }

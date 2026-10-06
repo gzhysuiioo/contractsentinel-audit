@@ -169,6 +169,48 @@ func validateFormalCheckStatuses(strict []byte) error {
 	return nil
 }
 
+// validateFormalCheckNotes checks the formal "note" member of every strict
+// check record. The strict rewrite dropped extension members, so the note
+// seen here is the agreed-spelling one alone: decoding it straight into the
+// Go wireCheck string field turns a formal null into the zero value "",
+// indistinguishable from an omitted note — a passing record written with
+// "note":null would then produce the very same report (and report id) as one
+// that omitted the note, laundering a malformed submission into a legal one.
+// Whenever the formal note is present its value must therefore be a JSON
+// string — null, a boolean, a number, an object or an array rejects the whole
+// submission, for all four importable statuses and independently of the other
+// records; other legal records can neither make the submission succeed nor be
+// partially reported. The gate is about the JSON type alone, not non-empty
+// text: an omitted note keeps the existing per-status business judgement (a
+// pass needs no note; the other three statuses still require non-blank text
+// in BuildReport), and an explicit "" or whitespace-only string keeps that
+// same judgement. A case-variant or whitespace-padded name ("Note", " note ")
+// is extension data: its value, a non-string one included, never reaches this
+// gate and can neither fill a missing formal note nor rescue an illegal one,
+// whatever the member order; a name written with Unicode escapes denotes the
+// same formal field after decoding. The error names the record's zero-based
+// position in the checks array and, when the record carries a legal non-empty
+// ruleId, that rule id too — a missing or mistyped ruleId leaves the record
+// locatable by position alone.
+func validateFormalCheckNotes(strict []byte) error {
+	return checkObjectArrayFieldTypes(strict,
+		"checks",
+		[]ruleFieldTypeCheck{{field: "note", typ: ruleFieldString}},
+		ruleFieldTypeHooks{
+			locate: func(i int, rec map[string]json.RawMessage) string {
+				where := fmt.Sprintf("checks[%d]", i)
+				if id := formalCheckRuleID(rec); id != "" {
+					where += " (rule " + id + ")"
+				}
+				return where
+			},
+			invalidJSON: func(err error) error { return errInvalid("invalid JSON: " + err.Error()) },
+			reject: func(where, field string, typ ruleFieldType) error {
+				return errInvalid(where + ": " + field + " " + typ.requirement())
+			},
+		})
+}
+
 // validateFormalRequiresABI checks the formal "requiresABI" member of every
 // strict rule definition in an audit submission; the written-means-boolean
 // rule and the per-rule walk are shared with the archive side in
@@ -316,12 +358,13 @@ func validateFormalArtifactFields(strict []byte) error {
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
 // zero value false, while an omitted member still means false. Each formal
-// rule text member (id, kind, severity, invariant, version) and each formal
-// artifact member (name, abi, bytecode, source) that is written out must be a
-// JSON string: null or any non-string value rejects the whole submission
-// instead of being read as the zero value "", while an omitted member still
-// takes its default and an explicit empty string keeps the ordinary business
-// judgement. Any JSON object in the submission that repeats a member name
+// rule text member (id, kind, severity, invariant, version), each formal
+// artifact member (name, abi, bytecode, source) and the formal note member of
+// each check record that is written out must be a JSON string: null or any
+// non-string value rejects the whole submission instead of being read as the
+// zero value "", while an omitted member still takes its default and an
+// explicit empty string keeps the ordinary business judgement. Any JSON
+// object in the submission that repeats a member name
 // rejects the whole submission: the decoder keeps only the last value
 // silently, so a repeated invariant key would choose a conclusion by member
 // order instead of giving one trustworthy result. A character the decoder
@@ -347,6 +390,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	if err := validateFormalCheckStatuses(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalCheckNotes(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
