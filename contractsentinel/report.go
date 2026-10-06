@@ -169,6 +169,73 @@ func validateFormalCheckStatuses(strict []byte) error {
 	return nil
 }
 
+// formalCheckRuleID returns the decoded value of a check record's formal
+// ruleId member when it is present and itself a legal non-empty JSON string;
+// otherwise it returns "", so a record with a missing, empty or mistyped
+// ruleId is located by its checks-array position alone.
+func formalCheckRuleID(rec map[string]json.RawMessage) string {
+	raw, ok := rec["ruleId"]
+	if !ok {
+		return ""
+	}
+	var ruleID string
+	if err := json.Unmarshal(raw, &ruleID); err != nil || ruleID == "" {
+		return ""
+	}
+	return ruleID
+}
+
+// validateFormalCheckNotes checks the formal "note" member of every strict
+// check record. The strict rewrite dropped extension members, so the note
+// seen here is the agreed-spelling one alone: decoding a record straight into
+// the Go wireCheck string field turns a formal "note":null on a passing record
+// into the zero value "", indistinguishable from an omitted note, so a record
+// that explicitly wrote null would parse, pass every business check and
+// produce exactly the report the omitted-note submission yields, laundering a
+// malformed submission into a legal one. Whenever the formal note member is
+// present its value must therefore be a JSON string — null, a boolean, a
+// number, an object or an array rejects the whole submission, independently
+// of the record's status (the rule applies to 通过, 发现缺陷, 工具缺失 and
+// 超时 alike), of the other records and of whether any rule produced a
+// finding: the offending record is never skipped and no partial report is
+// returned or saved. The check is about the JSON type alone, not non-empty
+// text: an omitted note keeps the status-based business judgement (a passing
+// check needs no note; the other three statuses still require non-blank text
+// in BuildReport), and an explicit empty or whitespace-only string stays
+// legal. The strict rewrite dropped extension members, so a case-variant or
+// whitespace-padded name ("Note", " note ") neither fills a missing formal
+// note nor rescues an illegal formal value, whatever type it carries, and
+// member order is irrelevant; names written with Unicode escapes are
+// compared after decoding, so "note":null names the same formal note.
+// The error names the record's zero-based position in the checks array and,
+// when the record carries a legal non-empty ruleId, that rule too.
+func validateFormalCheckNotes(strict []byte) error {
+	var top struct {
+		Checks []map[string]json.RawMessage `json:"checks"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	for i, rec := range top.Checks {
+		raw, present := rec["note"]
+		if !present {
+			continue
+		}
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil {
+			return errInvalid("invalid JSON: " + err.Error())
+		}
+		if _, ok := token.(string); !ok {
+			where := fmt.Sprintf("checks[%d]", i)
+			if ruleID := formalCheckRuleID(rec); ruleID != "" {
+				where += " (rule " + ruleID + ")"
+			}
+			return errInvalid(where + ": note must be a string")
+		}
+	}
+	return nil
+}
+
 // validateFormalRequiresABI checks the formal "requiresABI" member of every
 // strict rule definition in an audit submission; the written-means-boolean
 // rule and the per-rule walk are shared with the archive side in
@@ -316,12 +383,14 @@ func validateFormalArtifactFields(strict []byte) error {
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
 // zero value false, while an omitted member still means false. Each formal
-// rule text member (id, kind, severity, invariant, version) and each formal
-// artifact member (name, abi, bytecode, source) that is written out must be a
-// JSON string: null or any non-string value rejects the whole submission
-// instead of being read as the zero value "", while an omitted member still
-// takes its default and an explicit empty string keeps the ordinary business
-// judgement. Any JSON object in the submission that repeats a member name
+// rule text member (id, kind, severity, invariant, version), each formal
+// artifact member (name, abi, bytecode, source) and the formal note member of
+// each check record that is written out must be a JSON string: null or any
+// non-string value rejects the whole submission instead of being read as the
+// zero value "", while an omitted member still takes its default and an
+// explicit empty string keeps the ordinary business judgement (a passing
+// check needs no note; the other three statuses still require non-blank
+// text). Any JSON object in the submission that repeats a member name
 // rejects the whole submission: the decoder keeps only the last value
 // silently, so a repeated invariant key would choose a conclusion by member
 // order instead of giving one trustworthy result. A character the decoder
@@ -347,6 +416,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, errInvalid("invalid JSON: " + err.Error())
 	}
 	if err := validateFormalCheckStatuses(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalCheckNotes(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
