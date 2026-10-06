@@ -853,8 +853,8 @@ func strictReportJSON(data []byte) ([]byte, error) {
 // would read byte-for-byte like one that omitted the member, the recomputed
 // id and the rule/finding correspondence would all pass on that laundered
 // value, and a diff could even compare the rule as unchanged. The shared
-// checkRuleFieldTypes gate therefore inspects each written formal member's
-// raw JSON token before that decoding happens. null or any other
+// checkObjectArrayFieldTypes gate therefore inspects each written formal
+// member's raw JSON token before that decoding happens. null or any other
 // non-required type makes the whole archive corrupt, independently of the
 // rule's check status and of whether it has a finding — the offending rule is
 // never skipped and no partial report is returned. An omitted member still
@@ -869,7 +869,16 @@ func strictReportJSON(data []byte) ([]byte, error) {
 // corruption.
 func validateArchiveRuleFields(strict []byte, id string, checks []ruleFieldTypeCheck,
 	locate func(int, map[string]json.RawMessage) string) error {
-	return checkRuleFieldTypes(strict, checks, ruleFieldTypeHooks{
+	return validateArchiveArrayFields(strict, id, "rules", checks, locate)
+}
+
+// validateArchiveArrayFields runs the raw-token type gate for one top-level
+// fixed-shape object array of a stored report archive ("rules" or
+// "findings"); the written-means-typed rule and the error classification are
+// identical on both arrays and live in this single wrapper.
+func validateArchiveArrayFields(strict []byte, id, arrayName string, checks []ruleFieldTypeCheck,
+	locate func(int, map[string]json.RawMessage) string) error {
+	return checkObjectArrayFieldTypes(strict, arrayName, checks, ruleFieldTypeHooks{
 		locate: locate,
 		invalidJSON: func(err error) error {
 			return errCorrupt("invalid JSON in report " + id + ": " + err.Error())
@@ -924,6 +933,50 @@ func validateArchiveRuleText(strict []byte, id string) error {
 	return validateArchiveRuleFields(strict, id, checks, archiveRulePositionLocator)
 }
 
+// archiveFindingTextFields lists the six formal finding members whose value,
+// once the member is written out in a stored report archive, must be a JSON
+// string.
+var archiveFindingTextFields = []string{"artifactHash", "ruleId", "version", "severity", "invariant", "evidence"}
+
+// archiveFindingPositionLocator names a finding's zero-based position in the
+// findings array ("findings[1]") and, when the record carries a legal
+// non-empty ruleId, also names the rule it belongs to
+// ("findings[1] (rule r-bad)"); a missing, empty or mistyped ruleId leaves
+// the record locatable by position alone.
+func archiveFindingPositionLocator(i int, rec map[string]json.RawMessage) string {
+	where := fmt.Sprintf("findings[%d]", i)
+	if ruleID := formalFindingRuleID(rec); ruleID != "" {
+		where += " (rule " + ruleID + ")"
+	}
+	return where
+}
+
+// validateArchiveFindingText runs the read-side string gate for the text
+// fields of every stored finding; see validateArchiveRuleFields for why the
+// raw token is checked before decoding. A ReportFinding's members are all Go
+// strings, so decoding a finding straight from the strict archive turns a
+// formal null member into the zero value "": a legal report whose rule and
+// finding both carry the empty string for severity (or invariant) could have
+// the finding's member rewritten to null and still read back byte-identical —
+// the artifact hash, the report id and the rule/finding correspondence all
+// agree on that laundered empty text, and a later diff could even show
+// 无变化. Whenever one of the six formal members is present its value must
+// therefore be a JSON string — null, a boolean, a number, an object or an
+// array rejects the whole archive even when every binding still matches; the
+// offending finding is never skipped and no partial report is returned. The
+// gate is about the JSON type alone, not non-empty text: an omitted member
+// still decodes to "" and an explicit empty string keeps the ordinary
+// required-field and binding judgement, so legal empty severity and invariant
+// text stays legal. Extension names are invisible here for the same reason as
+// on rules.
+func validateArchiveFindingText(strict []byte, id string) error {
+	checks := make([]ruleFieldTypeCheck, len(archiveFindingTextFields))
+	for i, field := range archiveFindingTextFields {
+		checks[i] = ruleFieldTypeCheck{field: field, typ: ruleFieldString}
+	}
+	return validateArchiveArrayFields(strict, id, "findings", checks, archiveFindingPositionLocator)
+}
+
 // loadStoredReport parses archive bytes for id and fully validates them.
 func loadStoredReport(data []byte, id string) (Report, error) {
 	// Read-side counterpart of the submission character gate in
@@ -967,6 +1020,16 @@ func loadStoredReport(data []byte, id string) (Report, error) {
 	// including the content id, as if the member had been omitted. Check the
 	// raw JSON token of every written formal text member before decoding.
 	if err := validateArchiveRuleText(strict, id); err != nil {
+		return Report{}, err
+	}
+	// Same hazard on the findings array, where every member is a Go string:
+	// a finding written with "severity":null or "invariant":null decodes to
+	// the empty string and, in a report whose rule carries that same empty
+	// text, passes the id and every rule/finding binding as if the archive
+	// had saved the legal empty text; diffs could then read 无变化 from text
+	// the archive never contained. Check the raw JSON token of every written
+	// finding text member before decoding into ReportFinding.
+	if err := validateArchiveFindingText(strict, id); err != nil {
 		return Report{}, err
 	}
 	var r Report
