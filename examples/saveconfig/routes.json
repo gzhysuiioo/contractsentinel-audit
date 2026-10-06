@@ -1,0 +1,22 @@
+{
+  "routes": [
+    {
+      "id": "api",
+      "methods": ["get"],
+      "pathPrefix": "/api",
+      "upstream": "http://api.internal/v1/",
+      "queryTransforms": [
+        {"op": "rename", "name": "old", "to": "new"},
+        {"op": "set", "name": "new", "value": ""},
+        {"op": "set", "name": "a b", "value": "中+%"},
+        {"op": "remove", "name": "flag"}
+      ]
+    },
+    {
+      "id": "root",
+      "methods": ["*"],
+      "pathPrefix": "/",
+      "upstream": "https://fallback.internal/base/"
+    }
+  ]
+}
