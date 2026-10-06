@@ -8,6 +8,17 @@
 // here. The checks themselves (which names repeat inside one object, which
 // characters a string literal may contain) stay in their own files and plug
 // into this walk as hooks.
+//
+// The walk keeps a single path stack for the whole document: one step is
+// pushed before descending into a member or element and popped when that
+// branch is done, so the locating state stays proportional to the deepest
+// open nesting chain instead of being re-copied at every level. Deeply
+// nested extension content — thousands of alternating object and array
+// layers — therefore costs memory linear in the input size and the maximum
+// nesting depth, never quadratic in the depth. A pop always restores the
+// exact prefix the parent saw, so once a branch is finished none of its
+// member names or array indices can leak into the location reported for a
+// later sibling branch.
 package contractsentinel
 
 import (
@@ -45,6 +56,16 @@ type jsonWalkHooks struct {
 	stringValue func(path []jsonPathStep, start, end int) (stop bool)
 }
 
+// jsonWalk carries the state of one structural walk: the token decoder, the
+// hooks to fire, and the single shared path stack. The stack is the only
+// per-depth state the walk keeps beyond the decoder's own, and it is reused
+// across sibling branches: push on the way in, pop on the way out.
+type jsonWalk struct {
+	dec   *json.Decoder
+	hooks jsonWalkHooks
+	path  []jsonPathStep
+}
+
 // walkJSONTokens scans data structurally once, firing hooks for every object,
 // member name and string value at every depth: the top-level value, nested
 // objects, array elements and the contents of unknown extension members
@@ -61,14 +82,16 @@ type jsonWalkHooks struct {
 func walkJSONTokens(data []byte, hooks jsonWalkHooks) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	walkJSONValue(dec, nil, hooks)
+	w := &jsonWalk{dec: dec, hooks: hooks}
+	w.value()
 }
 
-// walkJSONValue consumes exactly one JSON value from dec, firing the hooks at
-// and below it. path locates the value within its document. It reports true
-// when the walk stopped, either because a hook asked to stop or because the
-// input turned out to be malformed.
-func walkJSONValue(dec *json.Decoder, path []jsonPathStep, hooks jsonWalkHooks) (stop bool) {
+// value consumes exactly one JSON value from the decoder, firing the hooks at
+// and below it. The walk's path stack locates the value within its document.
+// It reports true when the walk stopped, either because a hook asked to stop
+// or because the input turned out to be malformed.
+func (w *jsonWalk) value() (stop bool) {
+	dec := w.dec
 	start := int(dec.InputOffset())
 	tok, err := dec.Token()
 	if err != nil {
@@ -77,15 +100,15 @@ func walkJSONValue(dec *json.Decoder, path []jsonPathStep, hooks jsonWalkHooks) 
 	end := int(dec.InputOffset())
 	switch v := tok.(type) {
 	case string:
-		if hooks.stringValue != nil {
-			return hooks.stringValue(path, start, end)
+		if w.hooks.stringValue != nil {
+			return w.hooks.stringValue(w.path, start, end)
 		}
 		return false
 	case json.Delim:
 		switch v {
 		case '{':
-			if hooks.enterObject != nil {
-				hooks.enterObject(path)
+			if w.hooks.enterObject != nil {
+				w.hooks.enterObject(w.path)
 			}
 			for dec.More() {
 				keyStart := int(dec.InputOffset())
@@ -96,25 +119,23 @@ func walkJSONValue(dec *json.Decoder, path []jsonPathStep, hooks jsonWalkHooks) 
 				keyEnd := int(dec.InputOffset())
 				// Between More() and the value, Token can only be a member name.
 				key, _ := keyTok.(string)
-				if hooks.memberName != nil && hooks.memberName(path, key, keyStart, keyEnd) {
+				if w.hooks.memberName != nil && w.hooks.memberName(w.path, key, keyStart, keyEnd) {
 					return true
 				}
-				child := append(append([]jsonPathStep(nil), path...), jsonPathStep{key: key, index: -1})
-				if walkJSONValue(dec, child, hooks) {
+				if w.descend(jsonPathStep{key: key, index: -1}) {
 					return true
 				}
 			}
 			if _, err := dec.Token(); err != nil { // consume '}'
 				return true // malformed JSON: defer
 			}
-			if hooks.exitObject != nil {
-				hooks.exitObject(path)
+			if w.hooks.exitObject != nil {
+				w.hooks.exitObject(w.path)
 			}
 			return false
 		case '[':
 			for i := 0; dec.More(); i++ {
-				child := append(append([]jsonPathStep(nil), path...), jsonPathStep{index: i})
-				if walkJSONValue(dec, child, hooks) {
+				if w.descend(jsonPathStep{index: i}) {
 					return true
 				}
 			}
@@ -127,6 +148,17 @@ func walkJSONValue(dec *json.Decoder, path []jsonPathStep, hooks jsonWalkHooks) 
 	// '}' and ']' are consumed by the enclosing object or array and never
 	// start a value; numbers, booleans and null are complete scalars.
 	return false
+}
+
+// descend runs one nested value with step pushed onto the shared path stack
+// and pops the step afterwards, whatever the nested walk returned. The pop
+// restores the parent's exact path prefix, so a finished branch leaves no
+// member name or array index behind for later branches to inherit.
+func (w *jsonWalk) descend(step jsonPathStep) (stop bool) {
+	w.path = append(w.path, step)
+	stop = w.value()
+	w.path = w.path[:len(w.path)-1]
+	return stop
 }
 
 // renderJSONPath renders schema-free path steps as ".key" and "[index]".
