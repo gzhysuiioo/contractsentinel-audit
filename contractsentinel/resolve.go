@@ -607,6 +607,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUpstreamHostPresent(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamBasePathSpace(p, loc, id); f != nil {
+		return f
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
@@ -653,6 +656,59 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
 		routeLabel(loc, id), p.raw)
+}
+
+// validateUpstreamBasePathSpace enforces on the raw split boundaries that the
+// upstream base path carries no direct ASCII space (U+0020): a spelling such
+// as "http://api.internal/base path" is otherwise accepted and the hit route
+// emits an upstreamURL that still contains the space, while the same byte in
+// a request target is already rejected as invalid_request. Only the base
+// path — the bytes from the first path slash to the end per splitUpstream —
+// is inspected, so a space anywhere else is left to the existing rules; the
+// check is deliberately confined to U+0020 and is never broadened to other
+// Unicode whitespace.
+//
+// The decision is taken on the address exactly as the user wrote it: a
+// well-formed percent escape ("%" plus two hex digits) is skipped, so an
+// encoded space such as "base%20path" is legal path content and is never
+// percent-decoded first and then rejected, and no space is trimmed, stripped,
+// replaced with "%20" or otherwise repaired to keep parsing. A JSON
+// \u0020 escape has already become a literal space by the time this sees
+// the value.
+// A malformed escape is left to the existing url.Parse check that runs right
+// after this one, so an input that carries both (e.g. "base%2 0") keeps its
+// existing "invalid URL escape" failure rather than being relabeled; only a
+// base path whose escapes are all well formed reaches the space scan, which
+// then only has to skip escape bytes it already knows to be well formed.
+// Like the host rules this is a content error in a syntactically valid JSON
+// document — the reason names the route's 1-based position, its id and the
+// upstream field and says the base path contains an unencoded space, never
+// that the config JSON is broken — and Config.validate runs over every route,
+// so a later offending route rejects the whole configuration even when a
+// request would only hit an earlier, valid route.
+func validateUpstreamBasePathSpace(p upstreamParts, loc, id string) *Failure {
+	basePath := p.basePath
+	if !validPercentEscapes(basePath) {
+		// The existing url.Parse check reports the malformed escape with its
+		// existing reason and precedence, including when a direct space sits
+		// beside it.
+		return nil
+	}
+	for i := 0; i < len(basePath); i++ {
+		if basePath[i] == '%' {
+			// validPercentEscapes proved the two following bytes are hex; skip
+			// the encoded byte so an encoded space ("%20") stays path content
+			// and is never decoded into a direct U+0020.
+			i += 2
+			continue
+		}
+		if basePath[i] == ' ' {
+			return failuref("invalid_config",
+				"%s: upstream %q base path contains an unencoded space (U+0020): a space in the path must be percent-encoded as %%20 (e.g. \"http://example.com/base%%20path\"); the address is judged as written, so the space is neither trimmed nor replaced with an encoding",
+				routeLabel(loc, id), p.raw)
+		}
+	}
+	return nil
 }
 
 // validateBracketedUpstreamHost checks the split raw upstream's authority for
