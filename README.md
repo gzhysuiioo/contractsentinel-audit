@@ -32,7 +32,7 @@ Go 1.26，仅使用标准库，全部行为可在本机 CPU 上离线复现。
 
 ### 提交 JSON 的结构
 
-- `artifact`：合约产物，含 `name`、`abi`、`bytecode`、`source` 四个字符串字段。
+- `artifact`：合约产物，含 `name`、`abi`、`bytecode`、`source` 四个字符串字段。四个字段都可以省略（分别按空字符串处理），但一旦写出就必须是 JSON 字符串：`null`、布尔值、数字、对象或数组都会使整份提交失败，错误点名具体字段（例如 `artifact.source must be a string`），而不会被当成空字符串继续参与产物哈希——即使名称合法、规则数组为空也不例外。显式空字符串与省略等价，仍走原有业务判断：名称为空不能生成报告，需要 ABI 的规则仍要求非空 `abi`，符号规则仍要求非空 `bytecode`，没有这些要求时空文本合法。`source` 是提交的文本本身，不会按文件名读取内容。
 - `rules`：本次适用的规则数组，每条规则必须有非空 `id` 与 `version`，`id` 在数组内唯一；`requiresABI` 为真时产物必须有非空 `abi`，`kind` 为 `symbolic` 时产物必须有非空 `bytecode`。`requiresABI` 可以省略（按 `false` 处理），但一旦写出就必须是 JSON 布尔值 `true` 或 `false`：`null`、字符串、数字、对象或数组都会使整份提交失败，而不会被当成 `false` 继续。
 - `invariants`：不变式名到 JSON 布尔值的映射（既有用法，见文末）。
 - `checks`：外部检查器给出的逐规则记录数组，每条记录含：

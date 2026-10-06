@@ -203,25 +203,71 @@ func validateFormalRequiresABI(strict []byte) error {
 		})
 }
 
+// validateFormalArtifactFields checks the formal members of the strict
+// artifact object: once a name, abi, bytecode or source member is written
+// out its value must be a JSON string. Decoding straight into the Go string
+// fields of wireArtifact would turn null into the zero value "", so a
+// malformed submission such as "source":null would hash byte-for-byte like
+// one that explicitly wrote "source":"" or omitted the member, and could
+// even succeed with a report: the malformed content would be
+// indistinguishable from empty text the submitter deliberately sent. The
+// raw token is therefore checked before that decoding happens, in the same
+// shape order and with the same written-means-typed rule as the rule-field
+// gates. null or a boolean, number, object or array rejects the whole
+// submission as an input error naming the exact field, e.g.
+// "artifact.source must be a string", whether or not any rule needs the
+// field, whether or not any check record is present, and even when the
+// rules array is empty. An omitted member still decodes to its default and
+// an explicit empty string stays subject to the ordinary business rules —
+// a missing or empty name still cannot produce a report, a rule requiring
+// an ABI still requires a non-empty one, a symbolic rule still requires
+// non-empty bytecode, and legal empty text otherwise remains usable. The
+// strict rewrite dropped extension members, so a case-variant or
+// whitespace-padded name never reaches this gate: its value neither
+// supplies a missing formal field nor rescues an illegal formal one.
+func validateFormalArtifactFields(strict []byte) error {
+	var top struct {
+		Artifact map[string]json.RawMessage `json:"artifact"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	for _, field := range []string{"name", "abi", "bytecode", "source"} {
+		raw, present := top.Artifact[field]
+		if !present {
+			continue
+		}
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil || !ruleFieldString.matches(token) {
+			return errInvalid("artifact." + field + " " + ruleFieldString.requirement())
+		}
+	}
+	return nil
+}
+
 // ParseAuditInput decodes an audit submission JSON object into domain values.
 // Invariant values must be JSON booleans; any other type is an error. A formal
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
-// zero value false, while an omitted member still means false. Any JSON
-// object in the submission that repeats a member name rejects the whole
-// submission: the decoder keeps only the last value silently, so a repeated
-// invariant key would choose a conclusion by member order instead of giving
-// one trustworthy result. A character the decoder would silently rewrite — an
-// invalid UTF-8 byte, or an unpaired or wrongly ordered surrogate escape in
-// any member name or string value, including values nested under unknown
-// extension members — rejects the whole submission as an input error before
-// any content is hashed, so evidence and hashes always reflect the submitted
-// bytes rather than a U+FFFD-rewritten copy. Only the fixed fields under their
-// agreed spelling participate: case variants and whitespace-padded names are
-// extension data and are ignored, so they can neither override a formal value
-// nor supply one when the formal member is missing or unsupported. Invariant
-// names are not fixed fields — they are user-defined, compared case
-// sensitively and never trimmed.
+// zero value false, while an omitted member still means false. Each written
+// artifact member — name, abi, bytecode and source — must be a JSON string:
+// null or any non-string value rejects the whole submission and names the
+// field, e.g. artifact.source, instead of being read as the zero value "" and
+// hashed like deliberately submitted empty text; omitted members keep their
+// defaults. Any JSON object in the submission that repeats a member name
+// rejects the whole submission: the decoder keeps only the last value
+// silently, so a repeated invariant key would choose a conclusion by member
+// order instead of giving one trustworthy result. A character the decoder
+// would silently rewrite — an invalid UTF-8 byte, or an unpaired or wrongly
+// ordered surrogate escape in any member name or string value, including
+// values nested under unknown extension members — rejects the whole
+// submission as an input error before any content is hashed, so evidence and
+// hashes always reflect the submitted bytes rather than a U+FFFD-rewritten
+// copy. Only the fixed fields under their agreed spelling participate: case
+// variants and whitespace-padded names are extension data and are ignored, so
+// they can neither override a formal value nor supply one when the formal
+// member is missing or unsupported. Invariant names are not fixed fields —
+// they are user-defined, compared case sensitively and never trimmed.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	if charErr := validateJSONCharacters(data); charErr != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(charErr.Error())
@@ -237,6 +283,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalArtifactFields(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	var in wireInput
