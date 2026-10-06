@@ -548,7 +548,8 @@ func failuref(code, format string, args ...any) *Failure {
 //  4. Field contents: a non-empty unique id, legal methods, an absolute
 //     pathPrefix (with no direct space, C0 control byte or DEL — only
 //     percent encoding may carry those) and a valid upstream
-//     (Config.validate).
+//     (Config.validate), including a numeric port whose decimal value is in
+//     the TCP range 0–65535.
 //
 // Within one layer the earliest array position wins — routes by their
 // position in the routes array and rules by their position in the route's
@@ -729,6 +730,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 	if f := validateUpstreamHostPresent(p, loc, id); f != nil {
 		return f
 	}
+	if f := validateUpstreamPortRange(p, loc, id); f != nil {
+		return f
+	}
 	if f := validateUpstreamBasePathSpace(p, loc, id); f != nil {
 		return f
 	}
@@ -778,6 +782,104 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
 		routeLabel(loc, id), p.raw)
+}
+
+// validateUpstreamPortRange enforces on the split raw boundaries that an
+// explicitly written numeric port be a TCP port number in the range 0–65535
+// inclusive:
+//
+//	scheme "://" [userinfo "@"] host [":" port] [basePath]
+//
+// The check judges the port by its decimal value read from the raw bytes, not
+// by anything an integer conversion truncates to: 65535 and every smaller
+// number pass, 65536 and every larger number fail, and a digit string too long
+// to fit an int fails as over-range instead of being accepted through an
+// overflow that wraps or saturates the value. Leading zeros change neither the
+// value nor the decision ("00065535" is 65535 and stays legal; "00065536" is
+// 65536 and stays out of range), and a legal spelling reaches upstreamURL
+// exactly as configured — the zeros are never stripped.
+//
+// Only the real port slot is read, and the slot is located with the same
+// splitUpstream boundaries the bracket checks and the join use, so a colon in
+// userinfo, a colon inside a bracketed IPv6 literal, or digits in the base
+// path can never be mistaken for a port:
+//
+//   - a reg-name or bare IPv4 host carries at most the one host/port colon, so
+//     a colon in its hostPort delimits the port;
+//   - a bracketed IPv6 host keeps every address colon inside the brackets, and
+//     the port is the digits after the closing ']' and its one colon.
+//
+// The structural validators run first, so by the time this runs the spelling
+// is either a no-bracket authority with at most one colon or a bracketed
+// literal whose only text after ']' is "" or ":" followed by digits. An absent
+// port and an explicitly empty port ("host", "host:", "[::1]:") stay legal:
+// only a non-empty, purely numeric spelling is judged, so non-numeric port
+// text ("host:abc", "[::1]:80x") keeps its existing url.Parse "invalid port"
+// rejection, and nothing here guesses a host boundary, inserts brackets or
+// rewrites the address. Like the other host rules this is a content error in a
+// syntactically valid JSON document — the reason names the route's 1-based
+// position, its id and the upstream field and states the port is outside
+// 0–65535, never that the JSON is broken.
+func validateUpstreamPortRange(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	hostPort := p.hostPort
+	port := ""
+	switch {
+	case strings.ContainsAny(hostPort, "[]"):
+		// Bracketed IP literal: validateBracketedUpstreamHost already proved
+		// the shape is "[" IPv6 "]" followed by "" or ":" plus digits, so the
+		// digits after the closing bracket's colon are the port.
+		closeBracket := strings.LastIndexByte(hostPort, ']')
+		suffix := hostPort[closeBracket+1:]
+		if strings.HasPrefix(suffix, ":") {
+			port = suffix[1:]
+		}
+	default:
+		// validateUnbracketedUpstreamHost already proved at most one colon, so
+		// the only possible colon separates the host from its port.
+		if i := strings.LastIndexByte(hostPort, ':'); i >= 0 {
+			port = hostPort[i+1:]
+		}
+	}
+	if port == "" {
+		return nil // no port written, or just a trailing port colon: both legal
+	}
+	// Judge only a non-empty numeric port. A non-numeric spelling ("abc",
+	// "80a") is not an out-of-range number but illegal port text, and that
+	// decision stays with url.Parse below, which gives the existing
+	// "invalid port" reason; this check must not rename it.
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return nil
+		}
+	}
+	if decimalInRange(port, 65535) {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream %q writes port %q, which is outside the TCP port range 0-65535: an explicitly written numeric port must be a decimal number from 0 through 65535 inclusive (leading zeros do not change the value), and the port is used exactly as configured without being truncated, wrapped or otherwise rewritten",
+		routeLabel(loc, id), p.raw, port)
+}
+
+// decimalInRange reports whether the non-empty ASCII digit string digits reads
+// as a base-10 number no greater than max, comparing digit by digit so a value
+// too large for an integer type can never overflow into a passing result.
+// Leading zeros are insignificant; the caller has already established that
+// every byte is a decimal digit.
+func decimalInRange(digits string, max int) bool {
+	value := 0
+	for i := 0; i < len(digits); i++ {
+		d := int(digits[i] - '0')
+		// value*10 + d > max means the next (and every later) value is already
+		// out of range; the guard keeps the running value at most max as well.
+		if value > (max-d)/10 {
+			return false
+		}
+		value = value*10 + d
+	}
+	return true
 }
 
 // validateUpstreamBasePathSpace rejects a direct ASCII space (U+0020) in the
