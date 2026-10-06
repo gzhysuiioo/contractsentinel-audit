@@ -203,25 +203,87 @@ func validateFormalRequiresABI(strict []byte) error {
 		})
 }
 
+// artifactTextFields lists the formal artifact members whose value, once the
+// member is written out, must be a JSON string.
+var artifactTextFields = []string{"name", "abi", "bytecode", "source"}
+
+// validateFormalArtifactFields checks the raw JSON token of every written
+// formal artifact member before the strict submission is decoded into the Go
+// wireArtifact string fields. Decoding straight into a Go string turns a
+// formal null member into the zero value "", indistinguishable from an
+// omitted member or an explicitly written empty string: an artifact with a
+// legal name and "source":null and no rules that need the ABI or bytecode
+// would then hash exactly like one whose source was submitted as "", pass
+// every business check and receive a success report, laundering a malformed
+// submission into a legal one. Whenever a formal member is present its value
+// must therefore be a JSON string — null, a boolean, a number, an object or
+// an array rejects the whole submission, independently of the rules array,
+// the check records and of whether any rule references the field. The check
+// is about the JSON type alone, not non-empty text: an omitted member still
+// decodes to its default and an explicit "" keeps the ordinary business
+// judgement (an empty name still produces no report, a rule that needs an
+// ABI still needs a non-empty one, a symbolic rule still needs non-empty
+// bytecode, and legal empty text is otherwise accepted). The strict rewrite
+// dropped extension members, so a case-variant or whitespace-padded name
+// ("Source", " source ") neither fills a missing formal field nor rescues an
+// illegal formal value; names written with Unicode escapes are compared
+// after decoding, so "source":null names the same formal source field.
+// The error names the exact field, e.g. "artifact.source". An absent or null
+// artifact object is left untouched here: the existing "artifact name is
+// required" business error keeps covering it.
+func validateFormalArtifactFields(strict []byte) error {
+	var top struct {
+		Artifact json.RawMessage `json:"artifact"`
+	}
+	if err := json.Unmarshal(strict, &top); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	if len(top.Artifact) == 0 || string(top.Artifact) == "null" {
+		return nil
+	}
+	var artifact map[string]json.RawMessage
+	if err := json.Unmarshal(top.Artifact, &artifact); err != nil {
+		return errInvalid("invalid JSON: " + err.Error())
+	}
+	for _, field := range artifactTextFields {
+		raw, present := artifact[field]
+		if !present {
+			continue
+		}
+		var token any
+		if err := json.Unmarshal(raw, &token); err != nil {
+			return errInvalid("artifact." + field + " must be a string")
+		}
+		if _, ok := token.(string); !ok {
+			return errInvalid("artifact." + field + " must be a string")
+		}
+	}
+	return nil
+}
+
 // ParseAuditInput decodes an audit submission JSON object into domain values.
 // Invariant values must be JSON booleans; any other type is an error. A formal
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
-// zero value false, while an omitted member still means false. Any JSON
-// object in the submission that repeats a member name rejects the whole
-// submission: the decoder keeps only the last value silently, so a repeated
-// invariant key would choose a conclusion by member order instead of giving
-// one trustworthy result. A character the decoder would silently rewrite — an
-// invalid UTF-8 byte, or an unpaired or wrongly ordered surrogate escape in
-// any member name or string value, including values nested under unknown
-// extension members — rejects the whole submission as an input error before
-// any content is hashed, so evidence and hashes always reflect the submitted
-// bytes rather than a U+FFFD-rewritten copy. Only the fixed fields under their
-// agreed spelling participate: case variants and whitespace-padded names are
-// extension data and are ignored, so they can neither override a formal value
-// nor supply one when the formal member is missing or unsupported. Invariant
-// names are not fixed fields — they are user-defined, compared case
-// sensitively and never trimmed.
+// zero value false, while an omitted member still means false. Each formal
+// artifact member (name, abi, bytecode, source) that is written out must be a
+// JSON string: null or any non-string value rejects the whole submission
+// instead of being read as the zero value "", while an omitted member still
+// takes its default and an explicit empty string keeps the ordinary business
+// judgement. Any JSON object in the submission that repeats a member name
+// rejects the whole submission: the decoder keeps only the last value
+// silently, so a repeated invariant key would choose a conclusion by member
+// order instead of giving one trustworthy result. A character the decoder
+// would silently rewrite — an invalid UTF-8 byte, or an unpaired or wrongly
+// ordered surrogate escape in any member name or string value, including
+// values nested under unknown extension members — rejects the whole
+// submission as an input error before any content is hashed, so evidence and
+// hashes always reflect the submitted bytes rather than a U+FFFD-rewritten
+// copy. Only the fixed fields under their agreed spelling participate: case
+// variants and whitespace-padded names are extension data and are ignored, so
+// they can neither override a formal value nor supply one when the formal
+// member is missing or unsupported. Invariant names are not fixed fields —
+// they are user-defined, compared case sensitively and never trimmed.
 func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRecord, error) {
 	if charErr := validateJSONCharacters(data); charErr != nil {
 		return Artifact{}, nil, nil, nil, errInvalid(charErr.Error())
@@ -237,6 +299,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalArtifactFields(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	var in wireInput
