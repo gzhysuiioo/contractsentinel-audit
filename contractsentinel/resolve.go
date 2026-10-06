@@ -17,8 +17,9 @@ import (
 // queryTransforms list rewrites the request query string after the route has
 // been selected.
 //
-// QueryTransforms stays tag-less in the default (un)marshal sense: reading
-// goes through Config.UnmarshalJSON via the routeJSON raw mirror, and writing
+// A Route only ever holds validated data: reading goes through
+// Config.UnmarshalJSON, which decodes into the intermediate decodedRoute and
+// copies a route out only once every check it owns has passed, and writing
 // goes through Route.MarshalJSON, so the rules round-trip instead of being
 // silently dropped (a plain json:"-" tag only omitted them on save).
 type Route struct {
@@ -32,11 +33,6 @@ type Route struct {
 	// explicit queryTransforms: [] — both are valid ways to write a route
 	// without rules, and ParseConfig accepts either.
 	QueryTransforms []*QueryTransform
-
-	// queryTransformsRaw holds the undecoded queryTransforms value until
-	// Config.UnmarshalJSON validates it once the route's position in its own
-	// config is known. It is nil in every successfully parsed config.
-	queryTransformsRaw json.RawMessage
 }
 
 // MarshalJSON writes routes back in the shape ParseConfig accepts: the four
@@ -123,20 +119,37 @@ type routeJSON struct {
 	QueryTransforms json.RawMessage `json:"queryTransforms"`
 }
 
-// decodeRoute type-checks and decodes one raw route object. loc is the
-// route's 1-based location in its config (e.g. "route 2"). The element's JSON
-// type is checked first: a null entry or any non-object value fails on the
-// entry itself, naming the position, the required object type and the type
-// actually received, instead of falling through to a missing-field error such
-// as a missing id. Field type errors then carry that location and, when the
-// route supplies a valid non-empty string id anywhere in its object (even
-// after the offending field), that id. Missing fields stay silent here and
-// are rejected later by validate, which preserves the existing missing-field
-// behavior.
-func decodeRoute(data []byte, loc string) (Route, *Failure) {
+// decodedRoute is the intermediate parse-stage representation of one route:
+// the partially checked formal Route plus the queryTransforms value still
+// awaiting validation. It exists only inside config decoding, so the
+// temporary raw text never lives on the formal Route a successfully parsed
+// Config hands out: decodeRoutes validates the raw value into
+// route.QueryTransforms before any Route leaves the decode stage, and a
+// rejected document yields no routes at all.
+type decodedRoute struct {
+	route Route
+	// queryTransformsRaw holds the undecoded queryTransforms value until the
+	// rule pass validates it, once every route's basic fields have been
+	// type-checked (see decodeRoutes for why the passes are ordered so).
+	queryTransformsRaw json.RawMessage
+}
+
+// decodeRoute type-checks and decodes one raw route object into the
+// intermediate decodedRoute. loc is the route's 1-based location in its
+// config (e.g. "route 2"). The element's JSON type is checked first: a null
+// entry or any non-object value fails on the entry itself, naming the
+// position, the required object type and the type actually received, instead
+// of falling through to a missing-field error such as a missing id. Field
+// type errors then carry that location and, when the route supplies a valid
+// non-empty string id anywhere in its object (even after the offending
+// field), that id. Missing fields stay silent here and are rejected later by
+// validate, which preserves the existing missing-field behavior. The raw
+// queryTransforms value is carried over unchecked: rule validation is the
+// next decode pass, not this function's responsibility.
+func decodeRoute(data []byte, loc string) (decodedRoute, *Failure) {
 	elem := bytes.TrimSpace(data)
 	if len(elem) == 0 || elem[0] != '{' {
-		return Route{}, failuref("invalid_config",
+		return decodedRoute{}, failuref("invalid_config",
 			"%s: route entry must be an object, got %s", loc, jsonTypeName(elem))
 	}
 	var rj routeJSON
@@ -144,17 +157,18 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 		// The element already parsed as one JSON value and starts with '{';
 		// an object that cannot be read is a syntax failure rather than a
 		// field type error.
-		return Route{}, failuref("invalid_config", "config is not valid JSON: %v", err)
+		return decodedRoute{}, failuref("invalid_config", "config is not valid JSON: %v", err)
 	}
 
-	var route Route
+	var decoded decodedRoute
+	route := &decoded.route
 	// Type-check id first so it can identify the route on an error in any
 	// later field regardless of object order. Only a valid non-empty JSON
 	// string becomes the label; a wrong-typed id is reported against the id
 	// field and never rendered (e.g. as a number or object) as the route's
 	// identity, so that error is located by position alone.
 	if !decodeStringField(rj.ID, &route.ID) {
-		return Route{}, failuref("invalid_config", "%s: id must be a string", loc)
+		return decodedRoute{}, failuref("invalid_config", "%s: id must be a string", loc)
 	}
 	label := loc
 	if route.ID != "" {
@@ -162,16 +176,16 @@ func decodeRoute(data []byte, loc string) (Route, *Failure) {
 	}
 
 	if f := decodeMethodsField(rj.Methods, label, &route.Methods); f != nil {
-		return Route{}, f
+		return decodedRoute{}, f
 	}
 	if f := decodeRouteStringField(rj.PathPrefix, label, "pathPrefix", &route.PathPrefix); f != nil {
-		return Route{}, f
+		return decodedRoute{}, f
 	}
 	if f := decodeRouteStringField(rj.Upstream, label, "upstream", &route.Upstream); f != nil {
-		return Route{}, f
+		return decodedRoute{}, f
 	}
-	route.queryTransformsRaw = rj.QueryTransforms
-	return route, nil
+	decoded.queryTransformsRaw = rj.QueryTransforms
+	return decoded, nil
 }
 
 // decodeRouteStringField renders a route field's string type error with the
@@ -348,13 +362,11 @@ func (cfg *Config) MarshalJSON() ([]byte, error) {
 // legal value of the wrong shape (an array, string, number, boolean or null
 // at the top level; a non-array routes, null included) is an invalid_config
 // naming both the required type and the type received, never a JSON parse
-// failure. The routes array is then decoded one entry at a time, each entry
-// type-checked and validated against its 1-based position in this config; a
-// non-object entry (null included) fails on that entry before any field is
-// inspected. Decoding entries from raw values means wrong field types are
-// reported on the offending route (with its id when available) instead of
-// as a generic JSON syntax failure. The position comes from the array
-// decoded here, so configs parsed concurrently or interleaved in the same
+// failure. The routes array is then handed to decodeRoutes, which decodes one
+// entry at a time from raw values, so wrong field types are reported on the
+// offending route (with its id when available) instead of as a generic JSON
+// syntax failure, and each entry is checked against its 1-based position in
+// this config — configs parsed concurrently or interleaved in the same
 // process cannot shift each other's route numbering. A broken JSON document
 // still fails the outer decode and is reported as a parse failure, without a
 // guessed route position or field.
@@ -387,33 +399,71 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 		}
 	}
 
+	routes, f := decodeRoutes(rawRoutes)
+	if f != nil {
+		return f
+	}
+	cfg.Routes = routes
+	return nil
+}
+
+// decodeRoutes is the decode stage of config reading: it turns the raw routes
+// array into fully checked formal Routes, owning every error layer that is
+// decided during decoding. The layers run as two whole-array passes so a
+// higher-priority error on a later route always beats a lower-priority one on
+// an earlier route:
+//
+//   - Pass 1 (structure and basic field types): each entry is decoded by
+//     decodeRoute, which rejects a non-object entry and any wrong-typed
+//     id/methods/pathPrefix/upstream field. The raw queryTransforms value is
+//     kept unchecked on the intermediate decodedRoute.
+//   - Pass 2 (queryTransforms rules): only once every entry's basic fields
+//     have the right JSON type are the rules decoded and validated by
+//     parseQueryTransforms, so a rule error is reported only when no field
+//     type error remains anywhere in the array.
+//
+// Within one pass the earliest array position wins: routes by their position
+// in the routes array and rules by their position in the route's
+// queryTransforms array, never by id ordering and regardless of the object
+// field order. Field CONTENT errors (a non-absolute pathPrefix, a bad method
+// token, an empty id, ...) are not this stage's concern: they are the
+// validate stage's, which ParseConfig runs only after decoding has accepted
+// every route, so any rule error still beats any content error. On the first
+// failure decodeRoutes returns no routes at all, so no half-decoded
+// configuration can escape the decode stage.
+func decodeRoutes(rawRoutes []json.RawMessage) ([]Route, *Failure) {
 	// Pass 1: decode and type-check every entry, so a wrong field type on a
 	// later route fails before any queryTransforms validation (matching the
 	// precedence of decoding before validation).
-	cfg.Routes = make([]Route, len(rawRoutes))
+	decoded := make([]decodedRoute, len(rawRoutes))
 	for i, entry := range rawRoutes {
-		route, f := decodeRoute(entry, fmt.Sprintf("route %d", i+1))
+		dr, f := decodeRoute(entry, fmt.Sprintf("route %d", i+1))
 		if f != nil {
-			return f
+			return nil, f
 		}
-		cfg.Routes[i] = route
+		decoded[i] = dr
 	}
-	// Pass 2: validate each route's queryTransforms now that every position
-	// is known.
-	for i := range cfg.Routes {
-		route := &cfg.Routes[i]
-		if len(route.queryTransformsRaw) == 0 {
+	// Pass 2: validate each route's queryTransforms now that every basic
+	// field type is known to be right, then move the checked rules onto the
+	// formal route.
+	for i := range decoded {
+		if len(decoded[i].queryTransformsRaw) == 0 {
 			continue // field absent
 		}
 		loc := fmt.Sprintf("route %d", i+1)
-		transforms, f := parseQueryTransforms(route.queryTransformsRaw, loc, route.ID)
+		transforms, f := parseQueryTransforms(decoded[i].queryTransformsRaw, loc, decoded[i].route.ID)
 		if f != nil {
-			return f
+			return nil, f
 		}
-		route.QueryTransforms = transforms
-		route.queryTransformsRaw = nil
+		decoded[i].route.QueryTransforms = transforms
 	}
-	return nil
+	// Only fully checked routes leave the decode stage; the raw intermediate
+	// form is dropped here.
+	routes := make([]Route, len(decoded))
+	for i := range decoded {
+		routes[i] = decoded[i].route
+	}
+	return routes, nil
 }
 
 // unmarshalJSONValue is the shared first step of parsing either input: it
@@ -470,7 +520,23 @@ func failuref(code, format string, args ...any) *Failure {
 	return &Failure{Code: code, Reason: fmt.Sprintf(format, args...)}
 }
 
-// ParseConfig parses and fully validates the route configuration.
+// ParseConfig parses and fully validates the route configuration. When one
+// document carries several errors, the one reported is chosen by two stages
+// running in a fixed order, each stage owning its layers:
+//
+//  1. decoding (Config.UnmarshalJSON): JSON syntax (a broken document is only
+//     ever a parse failure, with no guessed route position or field), then
+//     the top-level structure and the routes element and basic field types,
+//     then the queryTransforms array and rule validity (see decodeRoutes);
+//  2. validation (Config.validate): field contents — a non-empty unique id,
+//     legal method tokens, an absolute pathPrefix and a well-formed upstream.
+//
+// A stage runs only when every earlier stage accepted the whole document, so
+// a type error anywhere beats every rule error and a rule error anywhere
+// beats every content error; within one layer the earliest array position
+// wins (routes by routes-array order, rules by their queryTransforms order,
+// never by id). Every failure hands back no config at all, so no half-parsed
+// configuration can ever resolve a request.
 func ParseConfig(data []byte) (*Config, *Failure) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -485,6 +551,11 @@ func ParseConfig(data []byte) (*Config, *Failure) {
 	return &cfg, nil
 }
 
+// validate is the validation stage of config reading (see ParseConfig for
+// how it layers with decoding): every route has already passed the decode
+// stage's structure, type and rule checks, and this stage checks field
+// contents in routes-array order — a non-empty unique id, legal method
+// tokens, an absolute pathPrefix and a well-formed upstream.
 func (cfg *Config) validate() *Failure {
 	seenIDs := make(map[string]int, len(cfg.Routes))
 	for i := range cfg.Routes {
