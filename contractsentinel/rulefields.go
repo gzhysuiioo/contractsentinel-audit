@@ -48,10 +48,10 @@ type ruleFieldTypeCheck struct {
 }
 
 // ruleFieldTypeHooks adapt the shared type gate to one entry point. locate
-// renders the locator of the rule at index i (the submission names only the
-// rule, the archive also names its position in the rules array); invalidJSON
-// classifies a strict document that does not decode at all; reject reports the
-// first written member whose raw JSON value carries another type.
+// renders the locator of the rule at index i (some callers name only the rule,
+// others also name its position in the rules array); invalidJSON classifies a
+// strict document that does not decode at all; reject reports the first
+// written member whose raw JSON value carries another type.
 type ruleFieldTypeHooks struct {
 	locate      func(i int, rule map[string]json.RawMessage) string
 	invalidJSON func(err error) error

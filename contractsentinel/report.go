@@ -203,6 +203,55 @@ func validateFormalRequiresABI(strict []byte) error {
 		})
 }
 
+// submissionRuleTextFields lists the five formal rule definition members whose
+// value, once the member is written out, must be a JSON string. requiresABI is
+// not here: it is a formal boolean and has its own gate.
+var submissionRuleTextFields = []string{"id", "kind", "severity", "invariant", "version"}
+
+// validateFormalRuleText checks the raw JSON token of every written formal
+// rule definition text member before the strict submission is decoded into the
+// Go wireRule string fields; the written-means-string rule and the per-rule
+// walk are shared with the archive side in checkRuleFieldTypes. Decoding
+// straight into Go string fields turns a formal null member into the zero
+// value "": a rule carrying a legal id and version but "kind":null,
+// "severity":null or "invariant":null would then decode to exactly the rule
+// definition and report identity the user gets by submitting those members as
+// explicit empty strings, and such a malformed submission could even build a
+// successful report. Whenever one of the five formal text members is present
+// its value must therefore be a JSON string — null, a boolean, a number, an
+// object or an array rejects the whole submission, whether or not the rule is
+// checked, whether or not it produces a finding, and independently of every
+// other rule and check record. The check is about the JSON type alone, not
+// non-empty text or an allowed value set: an omitted member still decodes to
+// its default and an explicit "" keeps the ordinary business judgement (an
+// empty id or version still produces no report, an empty kind/severity/
+// invariant is otherwise accepted), and legal strings keep every byte,
+// including CJK characters, newlines and surrounding whitespace, so artifact
+// hashes, report ids, rule conclusions and finding evidence keep their
+// existing values. The strict rewrite dropped extension members, so a
+// case-variant or whitespace-padded name ("Kind", " kind ") neither fills a
+// missing formal field nor rescues an illegal formal value, wherever it is
+// written, and a null it carries never reaches this gate; a name written with
+// Unicode escapes is compared after decoding and denotes the same formal
+// field. The error names the rule's zero-based position in the rules array,
+// the offending member and the string requirement, and also names the rule id
+// when that id is itself a legal non-empty string, so a rule whose own id is
+// illegal is still locatable by position. It is an input error, never a
+// defect, tool-missing or timeout conclusion.
+func validateFormalRuleText(strict []byte) error {
+	checks := make([]ruleFieldTypeCheck, len(submissionRuleTextFields))
+	for i, field := range submissionRuleTextFields {
+		checks[i] = ruleFieldTypeCheck{field: field, typ: ruleFieldString}
+	}
+	return checkRuleFieldTypes(strict, checks, ruleFieldTypeHooks{
+		locate:      rulePositionLocator,
+		invalidJSON: func(err error) error { return errInvalid("invalid JSON: " + err.Error()) },
+		reject: func(where, field string, typ ruleFieldType) error {
+			return errInvalid(where + ": " + field + " " + typ.requirement())
+		},
+	})
+}
+
 // artifactTextFields lists the formal artifact members whose value, once the
 // member is written out, must be a JSON string.
 var artifactTextFields = []string{"name", "abi", "bytecode", "source"}
@@ -265,12 +314,16 @@ func validateFormalArtifactFields(strict []byte) error {
 // Invariant values must be JSON booleans; any other type is an error. A formal
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
-// zero value false, while an omitted member still means false. Each formal
-// artifact member (name, abi, bytecode, source) that is written out must be a
-// JSON string: null or any non-string value rejects the whole submission
-// instead of being read as the zero value "", while an omitted member still
-// takes its default and an explicit empty string keeps the ordinary business
-// judgement. Any JSON object in the submission that repeats a member name
+// zero value false, while an omitted member still means false. Each of a
+// rule's five formal text members (id, kind, severity, invariant, version)
+// that is written out must be a JSON string: null or any non-string value
+// rejects the whole submission instead of being read as the zero value "",
+// while an omitted member still takes its default and an explicit empty
+// string keeps the ordinary business judgement. Each formal artifact member
+// (name, abi, bytecode, source) that is written out must likewise be a JSON
+// string: null or any non-string value rejects the whole submission instead
+// of being read as the zero value "", while an omitted member still takes its
+// default and an explicit empty string keeps the ordinary business judgement. Any JSON object in the submission that repeats a member name
 // rejects the whole submission: the decoder keeps only the last value
 // silently, so a repeated invariant key would choose a conclusion by member
 // order instead of giving one trustworthy result. A character the decoder
@@ -299,6 +352,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalRuleText(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalArtifactFields(strict); err != nil {
@@ -790,10 +846,13 @@ func archiveRuleLocator(_ int, rule map[string]json.RawMessage) string {
 	return "rule"
 }
 
-// archiveRulePositionLocator names a rule's position in the rules array
+// rulePositionLocator names a rule's position in the rules array
 // ("rules[1]") and, when the rule carries a legal non-empty id, also names it
-// ("rules[1] (rule r-bad)").
-func archiveRulePositionLocator(i int, rule map[string]json.RawMessage) string {
+// ("rules[1] (rule r-bad)"). It is the locator wording shared by the
+// submission gate and the archive text gate, both of which must point at the
+// exact rules-array entry even when the rule's own id is missing, empty or
+// mistyped.
+func rulePositionLocator(i int, rule map[string]json.RawMessage) string {
 	where := fmt.Sprintf("rules[%d]", i)
 	if ruleID := formalRuleID(rule); ruleID != "" {
 		where += " (rule " + ruleID + ")"
@@ -821,7 +880,7 @@ func validateArchiveRuleText(strict []byte, id string) error {
 	for i, field := range archiveRuleTextFields {
 		checks[i] = ruleFieldTypeCheck{field: field, typ: ruleFieldString}
 	}
-	return validateArchiveRuleFields(strict, id, checks, archiveRulePositionLocator)
+	return validateArchiveRuleFields(strict, id, checks, rulePositionLocator)
 }
 
 // loadStoredReport parses archive bytes for id and fully validates them.
