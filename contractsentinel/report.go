@@ -203,6 +203,56 @@ func validateFormalRequiresABI(strict []byte) error {
 		})
 }
 
+// submissionRuleTextFields lists the five formal rule definition members whose
+// value, once the member is written out in an audit submission, must be a JSON
+// string. requiresABI keeps its own boolean gate; status and note exist only in
+// stored reports, where validateArchiveRuleText already gates them.
+var submissionRuleTextFields = []string{"id", "kind", "severity", "invariant", "version"}
+
+// validateFormalRuleText checks the raw JSON token of every written formal
+// rule text member before the strict submission is decoded into the Go
+// wireRule string fields. Decoding straight into a Go string turns a formal
+// null member into the zero value "", indistinguishable from an omitted
+// member or an explicitly written empty string: a rule with a legal id and
+// version and "kind":null, "severity":null or "invariant":null would then
+// parse, pass every business check and produce a report whose rule
+// definition, report id and any defect binding were all computed from text
+// the user never submitted, identical to the report an explicit "" submission
+// yields. Whenever one of the five formal members is present its value must
+// therefore be a JSON string — null, a boolean, a number, an object or an
+// array rejects the whole submission, independently of the other rules, the
+// check records and of whether the rule was checked or produced a finding.
+// The check is about the JSON type alone, not non-empty text: an omitted
+// member still decodes to its default and an explicit "" keeps the ordinary
+// business judgement (an omitted id/version is still required, an empty
+// kind/severity/invariant stays legal). The strict rewrite dropped extension
+// members, so a case-variant or whitespace-padded name ("Kind", " kind ")
+// neither fills a missing formal field nor rescues an illegal formal value,
+// and a null it carries never reaches this gate; names written with Unicode
+// escapes are compared after decoding, so "kind":null names the same formal
+// field. The error names the rule's zero-based position in the rules array
+// and, when the rule carries a legal non-empty id, that id too — an illegal
+// id itself leaves the rule locatable by position alone.
+func validateFormalRuleText(strict []byte) error {
+	checks := make([]ruleFieldTypeCheck, len(submissionRuleTextFields))
+	for i, field := range submissionRuleTextFields {
+		checks[i] = ruleFieldTypeCheck{field: field, typ: ruleFieldString}
+	}
+	return checkRuleFieldTypes(strict, checks, ruleFieldTypeHooks{
+		locate: func(i int, rule map[string]json.RawMessage) string {
+			where := fmt.Sprintf("rules[%d]", i)
+			if id := formalRuleID(rule); id != "" {
+				where += " (rule " + id + ")"
+			}
+			return where
+		},
+		invalidJSON: func(err error) error { return errInvalid("invalid JSON: " + err.Error()) },
+		reject: func(where, field string, typ ruleFieldType) error {
+			return errInvalid(where + ": " + field + " " + typ.requirement())
+		},
+	})
+}
+
 // artifactTextFields lists the formal artifact members whose value, once the
 // member is written out, must be a JSON string.
 var artifactTextFields = []string{"name", "abi", "bytecode", "source"}
@@ -266,6 +316,7 @@ func validateFormalArtifactFields(strict []byte) error {
 // requiresABI member on a rule must likewise be a JSON boolean: null or any
 // non-boolean value rejects the whole submission instead of being read as the
 // zero value false, while an omitted member still means false. Each formal
+// rule text member (id, kind, severity, invariant, version) and each formal
 // artifact member (name, abi, bytecode, source) that is written out must be a
 // JSON string: null or any non-string value rejects the whole submission
 // instead of being read as the zero value "", while an omitted member still
@@ -299,6 +350,9 @@ func ParseAuditInput(data []byte) (Artifact, []Rule, map[string]bool, []CheckRec
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalRequiresABI(strict); err != nil {
+		return Artifact{}, nil, nil, nil, err
+	}
+	if err := validateFormalRuleText(strict); err != nil {
 		return Artifact{}, nil, nil, nil, err
 	}
 	if err := validateFormalArtifactFields(strict); err != nil {
