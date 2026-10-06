@@ -53,16 +53,27 @@ func runResolve(args []string) {
 		fail(contractsentinel.Failure{Code: "invalid_config",
 			Reason: fmt.Sprintf("cannot read config file %q: %v", args[0], err)})
 	}
+
+	// Parse and fully validate the config before touching stdin: a readable
+	// but invalid config must be rejected immediately, even when the caller
+	// keeps the request pipe open and never sends EOF. The request is only
+	// read once the whole config is known to be usable, so a later stdin
+	// read failure can never turn an already-decided invalid_config into an
+	// invalid_request.
+	cfg, f := contractsentinel.ParseConfig(configData)
+	if f != nil {
+		fail(*f)
+	}
+
+	// The config is valid: wait for one complete JSON request on stdin. A
+	// pipe that is simply still open is not an empty or failed read —
+	// ReadAll blocks until the request is fully delivered or the read fails.
 	requestData, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fail(contractsentinel.Failure{Code: "invalid_request",
 			Reason: fmt.Sprintf("cannot read request from stdin: %v", err)})
 	}
 
-	cfg, f := contractsentinel.ParseConfig(configData)
-	if f != nil {
-		fail(*f)
-	}
 	req, f := contractsentinel.ParseRequest(requestData)
 	if f != nil {
 		fail(*f)
