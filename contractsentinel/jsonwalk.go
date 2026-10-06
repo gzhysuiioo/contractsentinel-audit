@@ -61,64 +61,82 @@ type jsonWalkHooks struct {
 func walkJSONTokens(data []byte, hooks jsonWalkHooks) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	walkJSONValue(dec, nil, hooks)
+	w := jsonWalker{dec: dec, hooks: hooks}
+	w.walkValue()
 }
 
-// walkJSONValue consumes exactly one JSON value from dec, firing the hooks at
-// and below it. path locates the value within its document. It reports true
-// when the walk stopped, either because a hook asked to stop or because the
-// input turned out to be malformed.
-func walkJSONValue(dec *json.Decoder, path []jsonPathStep, hooks jsonWalkHooks) (stop bool) {
-	start := int(dec.InputOffset())
-	tok, err := dec.Token()
+// jsonWalker carries the state of one structural walk. path locates the value
+// currently being visited; it is a single buffer shared by every event of the
+// walk, pushed on the way down a nesting chain and popped on the way back up.
+// Keeping one buffer — instead of copying the path for every value — means
+// the extra memory the walk needs grows only with the deepest nesting in the
+// document, never with the number of siblings or values visited, so a long
+// chain of alternating objects and arrays costs memory linear in its depth
+// rather than quadratic.
+type jsonWalker struct {
+	dec   *json.Decoder
+	hooks jsonWalkHooks
+	path  []jsonPathStep
+}
+
+// walkValue consumes exactly one JSON value from the decoder, firing the
+// hooks at and below it. The caller has already pushed the step locating this
+// value onto w.path, and walkValue leaves w.path as it found it. It reports
+// true when the walk stopped, either because a hook asked to stop or because
+// the input turned out to be malformed.
+func (w *jsonWalker) walkValue() (stop bool) {
+	start := int(w.dec.InputOffset())
+	tok, err := w.dec.Token()
 	if err != nil {
 		return true // malformed JSON: defer to json.Unmarshal
 	}
-	end := int(dec.InputOffset())
+	end := int(w.dec.InputOffset())
 	switch v := tok.(type) {
 	case string:
-		if hooks.stringValue != nil {
-			return hooks.stringValue(path, start, end)
+		if w.hooks.stringValue != nil {
+			return w.hooks.stringValue(w.path, start, end)
 		}
 		return false
 	case json.Delim:
 		switch v {
 		case '{':
-			if hooks.enterObject != nil {
-				hooks.enterObject(path)
+			if w.hooks.enterObject != nil {
+				w.hooks.enterObject(w.path)
 			}
-			for dec.More() {
-				keyStart := int(dec.InputOffset())
-				keyTok, err := dec.Token()
+			for w.dec.More() {
+				keyStart := int(w.dec.InputOffset())
+				keyTok, err := w.dec.Token()
 				if err != nil {
 					return true // malformed JSON: defer
 				}
-				keyEnd := int(dec.InputOffset())
+				keyEnd := int(w.dec.InputOffset())
 				// Between More() and the value, Token can only be a member name.
 				key, _ := keyTok.(string)
-				if hooks.memberName != nil && hooks.memberName(path, key, keyStart, keyEnd) {
+				if w.hooks.memberName != nil && w.hooks.memberName(w.path, key, keyStart, keyEnd) {
 					return true
 				}
-				child := append(append([]jsonPathStep(nil), path...), jsonPathStep{key: key, index: -1})
-				if walkJSONValue(dec, child, hooks) {
+				w.path = append(w.path, jsonPathStep{key: key, index: -1})
+				if w.walkValue() {
 					return true
 				}
+				w.path = w.path[:len(w.path)-1]
 			}
-			if _, err := dec.Token(); err != nil { // consume '}'
+			if _, err := w.dec.Token(); err != nil { // consume '}'
 				return true // malformed JSON: defer
 			}
-			if hooks.exitObject != nil {
-				hooks.exitObject(path)
+			if w.hooks.exitObject != nil {
+				w.hooks.exitObject(w.path)
 			}
 			return false
 		case '[':
-			for i := 0; dec.More(); i++ {
-				child := append(append([]jsonPathStep(nil), path...), jsonPathStep{index: i})
-				if walkJSONValue(dec, child, hooks) {
+			for i := 0; w.dec.More(); i++ {
+				w.path = append(w.path, jsonPathStep{index: i})
+				if w.walkValue() {
 					return true
 				}
+				w.path = w.path[:len(w.path)-1]
 			}
-			if _, err := dec.Token(); err != nil { // consume ']'
+			if _, err := w.dec.Token(); err != nil { // consume ']'
 				return true // malformed JSON: defer
 			}
 			return false
