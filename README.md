@@ -186,6 +186,118 @@ go test ./...
   （方法必填、目标路径必须以 `/` 开头），不归为类型错误。
 - `route_conflict` / `route_not_found`：见上。
 
+### 保存配置为 JSON 并重新读取
+
+前面介绍的 `ParseConfig` 是读取配置的完整校验入口；同一份通过校验的
+`*Config` 可以用标准库 `encoding/json` 直接保存回 JSON，保存结果可以
+再次交给 `ParseConfig` 读取，并用重新得到的配置按原规则解析请求：
+
+```go
+cfg, f := contractsentinel.ParseConfig(data)
+if f != nil {
+    // 展示 f.Code 与 f.Reason；读取失败的配置没有可用对象，停止使用。
+}
+saved, err := json.Marshal(cfg) // Config、Route、QueryTransform 实现了 MarshalJSON
+```
+
+保存后的 JSON 不必与原文件逐字节相同：缩进、空白与 JSON 字符串转义
+（如 `&` 写作 `\u0026`）可以变化；以下内容会保留，因此重新读取后解析
+同一请求得到的 routeId 与 upstreamURL 与保存前一致：
+
+- 路由在 `routes` 数组中的顺序、方法名的大小写、`pathPrefix` 的原始
+  文本（含百分号编码）与 `upstream` 的原始地址；
+- `queryTransforms` 规则的执行顺序，以及规则中 `name`、`value`、`to`
+  的字面字符串——它们按原样写入配置，只做 JSON 字符串转义，不会先按
+  查询参数编码（例如名称 `a b` 保存后仍是 `"a b"`，不是 `a%20b`），
+  所以重新读取后命中的仍是同一批参数、应用的仍是同一份字面值。
+
+保存时几个容易误解的结果：
+
+- `set` 的空字符串 `value` 仍会写出（`"value":""`）：空字符串是合法值，
+  读取时只有缺少 `value` 字段才报错；
+- `remove` 不写 `value` 或 `to`，`rename` 保留 `to` 且不写 `value`——
+  多写的字段正是读取时会拒绝的形状；
+- 未提供 `queryTransforms` 与显式 `"queryTransforms": []` 都保存为省略
+  该字段（不会写成 `null`）：两种写法本就等价，重新读取后原查询串
+  逐字节保留，不会被改写；
+- 空路由配置保存为 `"routes": []` 而不是 `"routes": null`（`null` 在
+  读取时是 routes 类型错误）；重新读取仍是合法配置，合法请求对其解析
+  得到 `route_not_found`。
+
+读取配置应始终通过完整校验入口 `ParseConfig`：它执行全部四层检查
+（JSON 语法、结构与字段类型、改写规则、字段内容）。仅把 JSON 解码成
+配置对象（`json.Unmarshal` 到 `Config`）只覆盖前三层，id 为空或重复、
+方法非法、pathPrefix 或 upstream 内容非法等问题不会被发现，得到的
+对象不能当作可用配置。保存成功同样不能代替合法性检查：`json.Marshal`
+只负责把内存中的配置写出来，不重新校验内容。凡是 `ParseConfig` 返回
+`Failure` 的配置都不要继续使用——此时没有可供解析的配置。
+
+保存是库层面的能力；`resolve` 命令的输入、输出与错误约定（标准输出
+的结果 JSON、标准错误的 code/reason、非零退出状态）保持不变。
+
+#### 完整示例
+
+`examples/saveconfig/main.go` 演示读取、保存、重新读取及解析同一个
+请求的完整过程，可在本机离线运行：
+
+```bash
+go run ./examples/saveconfig
+```
+
+示例配置带一条改名后再设置同名参数的连续改写链（先把 `old` 改名为
+`new`，再把 `new` 设为空字符串）：
+
+```json
+{
+  "routes": [
+    {
+      "id": "api",
+      "methods": ["GET"],
+      "pathPrefix": "/api",
+      "upstream": "http://api.internal/v1",
+      "queryTransforms": [
+        {"op": "rename", "name": "old", "to": "new"},
+        {"op": "set", "name": "new", "value": ""}
+      ]
+    }
+  ]
+}
+```
+
+请求含重复参数、空值与原始百分号编码：
+
+```json
+{"method":"GET","target":"/api/orders/7?old=1&old=&keep=%2f%41&flag"}
+```
+
+运行输出（可逐行核对）：
+
+```
+saved config: {"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1","queryTransforms":[{"op":"rename","name":"old","to":"new"},{"op":"set","name":"new","value":""}]}]}
+before save: routeId=api upstreamURL=http://api.internal/v1/orders/7?new=&keep=%2f%41&flag
+after save : routeId=api upstreamURL=http://api.internal/v1/orders/7?new=&keep=%2f%41&flag
+saved empty config: {"routes":[]}
+empty config resolve: code=route_not_found reason=no route matches GET /api/orders/7
+```
+
+保存后的配置里，路由顺序、方法大小写、`/api` 前缀、上游地址与两条
+规则的执行顺序都原样保留；`rename` 带 `to` 不带 `value`，`set` 的空
+字符串 `value` 仍然写出。重新读取后 routeId 与 upstreamURL 与保存前
+一致，是因为保存保留了匹配与拼接所需的全部原始文本（前缀、方法、
+上游、规则及顺序），规则中的名称与值按字面字符串写回，重新解析得到
+的是语义相同的配置。
+
+对请求查询串 `old=1&old=&keep=%2f%41&flag`，改写链的效果是：
+
+- `rename old→new`：两个 `old` 参数在原位置改名，各自的值、数量与
+  相对顺序保留，得到 `new=1&new=&keep=%2f%41&flag`；
+- `set new=""`：合并所有 `new` 参数为一个，放在首次命中的位置，得到
+  `new=`；
+- 未命中任何规则的内容逐字节保留：`keep=%2f%41` 的原始百分号编码不
+  解码也不重编码，无等号的 `flag` 原样保留。
+
+最后的空路由配置演示：保存为 `"routes":[]` 而非 `null`，重新读取
+合法，合法请求得到 `route_not_found`，错误以 code 与 reason 展示。
 
 ## 技术方向
 
