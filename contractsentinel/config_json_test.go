@@ -104,7 +104,8 @@ func TestConfigMarshalRulesFieldShape(t *testing.T) {
 	  "queryTransforms":[
 	    {"op":"set","name":"a","value":""},
 	    {"op":"remove","name":"b"},
-	    {"op":"rename","name":"c","to":"d"}
+	    {"op":"rename","name":"c","to":"d"},
+	    {"op":"copy","name":"e","to":"f"}
 	  ]}]}`)
 	var doc struct {
 		Routes []struct {
@@ -118,6 +119,7 @@ func TestConfigMarshalRulesFieldShape(t *testing.T) {
 		{"op": true, "name": true, "value": true}, // set keeps value even when empty
 		{"op": true, "name": true},                // remove: no value, no to
 		{"op": true, "name": true, "to": true},    // rename: to, no value
+		{"op": true, "name": true, "to": true},    // copy: to, no value
 	}
 	for i, rule := range doc.Routes[0].Rules {
 		if len(rule) != len(wantKeys[i]) {

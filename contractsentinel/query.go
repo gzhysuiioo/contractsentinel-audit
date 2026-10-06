@@ -3,7 +3,7 @@
 // rewriter works on raw fragments so unmodified parameters (including
 // duplicates, empty values and empty fragments) keep their original bytes
 // and relative order; only a rule's target parameter is decoded for name
-// comparison and re-encoded when set.
+// comparison and re-encoded when set, renamed or copied.
 package contractsentinel
 
 import "strings"
@@ -67,6 +67,8 @@ func applyQueryTransforms(transforms []*QueryTransform, target string) (string, 
 			present, items = applySet(items, present, tr.Name, tr.Value)
 		case "rename":
 			items = applyRename(items, tr.Name, tr.To)
+		case "copy":
+			items = applyCopy(items, tr.Name, tr.To)
 		}
 	}
 
@@ -168,6 +170,40 @@ func applyRename(items []queryItem, name, to string) []queryItem {
 		items[k].name = to
 	}
 	return items
+}
+
+// applyCopy duplicates every parameter whose decoded name equals name: each
+// copy takes the new name to (encoded the way set encodes a name) and keeps
+// the source's '=' (if any) and raw value bytes verbatim, so a valueless
+// parameter gains a valueless copy and an empty value keeps its '='. The
+// source parameter stays in place and its copy is inserted immediately after
+// it; parameters already named to, empty fragments and non-matching
+// parameters are untouched and never merged with or overwritten by the
+// copies. When nothing matches (or name and to are identical) every fragment
+// keeps its bytes, no copy is made and no existing name is re-encoded; with
+// no query string none is created, and an empty question mark survives.
+func applyCopy(items []queryItem, name, to string) []queryItem {
+	if name == to {
+		// Copying onto the same name must not duplicate or re-encode.
+		return items
+	}
+	encodedTo := encodeQueryComponent(to)
+	out := make([]queryItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, it)
+		if !matchesName(it, name) {
+			continue
+		}
+		frag := it.raw
+		if j := strings.IndexByte(frag, '='); j >= 0 {
+			// Keep the '=' and everything after it byte for byte.
+			frag = encodedTo + frag[j:]
+		} else {
+			frag = encodedTo
+		}
+		out = append(out, queryItem{name: to, raw: frag})
+	}
+	return out
 }
 
 // decodeQueryName percent-decodes a raw parameter name with '+' treated as a

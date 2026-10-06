@@ -851,6 +851,14 @@ func TestQueryTransformInvalidConfig(t *testing.T) {
 		{"rename with empty value still rejected", `[{"op":"rename","name":"a","to":"b","value":""}]`, "rename must not include a value", true},
 		{"rename missing name", `[{"op":"rename","to":"b"}]`, "name is required", true},
 		{"rename empty name", `[{"op":"rename","name":"","to":"b"}]`, "name must be a non-empty string", true},
+		{"copy missing to", `[{"op":"copy","name":"a"}]`, "copy requires a non-empty string to", true},
+		{"copy null to", `[{"op":"copy","name":"a","to":null}]`, "to must be a non-empty string", true},
+		{"copy numeric to", `[{"op":"copy","name":"a","to":1}]`, "to must be a non-empty string", true},
+		{"copy empty to", `[{"op":"copy","name":"a","to":""}]`, "to must be a non-empty string", true},
+		{"copy with value", `[{"op":"copy","name":"a","to":"b","value":"x"}]`, "copy must not include a value", true},
+		{"copy with empty value still rejected", `[{"op":"copy","name":"a","to":"b","value":""}]`, "copy must not include a value", true},
+		{"copy missing name", `[{"op":"copy","to":"b"}]`, "name is required", true},
+		{"copy empty name", `[{"op":"copy","name":"","to":"b"}]`, "name must be a non-empty string", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
