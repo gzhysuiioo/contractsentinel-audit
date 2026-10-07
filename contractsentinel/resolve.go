@@ -5,6 +5,7 @@ package contractsentinel
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -705,6 +706,47 @@ func splitUpstream(raw string) upstreamParts {
 	return p
 }
 
+// redactUpstreamUserinfo rewrites a raw upstream address for diagnostic
+// output: when the authority carries userinfo, the whole userinfo segment —
+// the username and the optional password, exactly as written, colons and
+// percent escapes included — is replaced by "***" while the '@' separating
+// it from the host is kept, so "https://user:p%40ss@:8443/v1" is reported
+// as "https://***@:8443/v1". The segment is never decoded and never
+// partially kept: a username-only userinfo, an empty password and a
+// password carrying colons or percent escapes are all hidden whole. The
+// userinfo range follows the address's own splitUpstream boundaries —
+// everything before the last '@' of the authority (the part between "://"
+// and the first path slash) — so an '@' in the base path is never treated
+// as userinfo. An address without userinfo, or without a scheme and
+// authority at all, is returned unchanged, so existing diagnostics keep
+// their current text.
+func redactUpstreamUserinfo(raw string) string {
+	p := splitUpstream(raw)
+	if p.schemeEnd < 0 {
+		return raw
+	}
+	k := strings.LastIndexByte(p.authority, '@')
+	if k < 0 {
+		return raw
+	}
+	start := p.schemeEnd + 3
+	return raw[:start] + "***" + raw[start+k:]
+}
+
+// redactURLError renders a url.Parse failure for diagnostic output with the
+// address's userinfo hidden: url.Error quotes the full original address,
+// credentials included, so the address is re-rendered through
+// redactUpstreamUserinfo while the underlying reason (a bad port, an
+// invalid escape, ...) is kept verbatim and the address is never repeated
+// in its original form. Non-url errors are returned unchanged.
+func redactURLError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Sprintf("parse %q: %v", redactUpstreamUserinfo(urlErr.URL), urlErr.Err)
+	}
+	return err.Error()
+}
+
 func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
@@ -737,7 +779,7 @@ func validateUpstream(raw, loc, id string) *Failure {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
+		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %s", loc, id, redactURLError(err))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return failuref("invalid_config", "%s (id %q): upstream must be an absolute http or https URL", loc, id)
@@ -769,7 +811,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 // Like the bracket rules this is a content error in a syntactically valid
 // JSON document — the reason names the route's 1-based position, its id and
 // the upstream field and says the upstream is missing a host, never that
-// the JSON is broken or that an IPv6 literal needs brackets.
+// the JSON is broken or that an IPv6 literal needs brackets. The address is
+// shown with any userinfo hidden (redactUpstreamUserinfo), so the reason
+// cannot leak the configured credentials into a saved diagnostic.
 func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
@@ -780,7 +824,7 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	}
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
-		routeLabel(loc, id), p.raw)
+		routeLabel(loc, id), redactUpstreamUserinfo(p.raw))
 }
 
 // validateUpstreamPortRange enforces the TCP port range on an explicitly
@@ -1041,7 +1085,9 @@ func invalidBracketedHost(label, literal string) *Failure {
 // considered. Like the bracketed-host rule this is a content error in a
 // syntactically valid JSON document, never a JSON parse failure, and it is
 // decided on the raw bytes before url.Parse so the wording cannot regress to
-// that parser's generic "invalid port" error.
+// that parser's generic "invalid port" error. When the reason quotes the
+// whole address, any userinfo is hidden first (redactUpstreamUserinfo), so
+// the diagnostic cannot leak the configured credentials.
 func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
@@ -1079,7 +1125,7 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	}
 	return failuref("invalid_config",
 		"%s: upstream %q has an unbracketed host part %q with more than one colon: a host without square brackets may contain at most the one colon separating it from its port (e.g. \"example.com:8080\"); an IPv6 literal must be enclosed in brackets (e.g. \"[2001:db8::1]:8080\") and the host and port are never guessed apart",
-		label, p.raw, hostPort)
+		label, redactUpstreamUserinfo(p.raw), hostPort)
 }
 
 // invalidBracketedHostShape builds the content error for a bracketed host
@@ -1312,8 +1358,10 @@ func prefixMatch(prefix, path string) bool {
 // route selection.
 func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if _, err := url.Parse(route.Upstream); err != nil {
-		// Config validation already rejected this.
-		return "", failuref("invalid_config", "route %q has an invalid upstream: %v", route.ID, err)
+		// Config validation already rejected this. The parse error is
+		// rendered with any userinfo hidden, so the fallback reason cannot
+		// repeat the address with its credentials.
+		return "", failuref("invalid_config", "route %q has an invalid upstream: %s", route.ID, redactURLError(err))
 	}
 
 	var remainder string
