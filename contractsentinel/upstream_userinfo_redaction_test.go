@@ -63,8 +63,10 @@ func TestUpstreamUserinfoRedactedInMissingHostReason(t *testing.T) {
 
 // TestUpstreamUserinfoRedactedInHostAndParseReasons covers the other
 // diagnostics that quote the address: the extra-colon host rule and the
-// generic URL parse error (an invalid escape). The attached parse error
-// must not repeat the original address either.
+// generic URL parse error. The attached parse error must not repeat the
+// original address either, and when its underlying escape error reports an
+// illegal escape that lives in the host rather than the credentials, the
+// host's escape text stays visible so the diagnosis stays specific.
 func TestUpstreamUserinfoRedactedInHostAndParseReasons(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -79,15 +81,9 @@ func TestUpstreamUserinfoRedactedInHostAndParseReasons(t *testing.T) {
 			hidden:   []string{"alice", "s3:cr3t"},
 		},
 		{
-			name:     "invalid escape in userinfo",
-			upstream: "https://alice:p%4@host.internal/",
-			want:     []string{"route 1", `"api"`, "upstream", "not a valid URL", `parse "https://***@host.internal/"`, "invalid URL escape"},
-			hidden:   []string{"alice"},
-		},
-		{
 			name:     "invalid escape in host with userinfo",
 			upstream: "https://alice:secret@ho%zzst/",
-			want:     []string{"route 1", `"api"`, "upstream", "not a valid URL", `parse "https://***@ho%zzst/"`},
+			want:     []string{"route 1", `"api"`, "upstream", "not a valid URL", `parse "https://***@ho%zzst/"`, "invalid URL escape"},
 			hidden:   []string{"alice", "secret"},
 		},
 	}

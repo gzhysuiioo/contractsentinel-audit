@@ -738,13 +738,81 @@ func redactUpstreamUserinfo(raw string) string {
 // credentials included, so the address is re-rendered through
 // redactUpstreamUserinfo while the underlying reason (a bad port, an
 // invalid escape, ...) is kept verbatim and the address is never repeated
-// in its original form. Non-url errors are returned unchanged.
+// in its original form.
+//
+// One class of underlying reason cannot be kept verbatim: an
+// url.EscapeError quotes the offending escape itself, and when that escape
+// sits in the username or password the quoted bytes ARE the credential
+// (e.g. password "%zz" surfaces as invalid URL escape "%zz"). When the
+// reported fragment reproduces an illegal escape inside the userinfo's
+// username or password component, it is replaced by a generic explanation
+// that names the userinfo without quoting any of its bytes, so even the
+// joinUpstream fallback — which re-parses a Route built in-process and so
+// never met ParseConfig's userinfo pre-check — cannot leak a credential
+// through the error text. The location test mirrors url.Parse itself: the
+// userinfo is split at its first colon into the username and password
+// components and each is scanned as url.Parse unescapes it, rather than
+// searching the segment for a substring, so a legal credential escape such
+// as "%40" can never match a "%4" that is actually illegal in the host or
+// base path; such non-userinfo escapes keep their verbatim reason.
 func redactURLError(err error) string {
 	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return fmt.Sprintf("parse %q: %v", redactUpstreamUserinfo(urlErr.URL), urlErr.Err)
+	if !errors.As(err, &urlErr) {
+		return err.Error()
 	}
-	return err.Error()
+	reason := fmt.Sprintf("%v", urlErr.Err)
+	var escapeErr url.EscapeError
+	if errors.As(err, &escapeErr) && escapeErrorFromUserinfo(urlErr.URL, string(escapeErr)) {
+		reason = "invalid percent escape in the userinfo (the username or password before the host); the credentials are hidden"
+	}
+	return fmt.Sprintf("parse %q: %s", redactUpstreamUserinfo(urlErr.URL), reason)
+}
+
+// escapeErrorFromUserinfo reports whether the escape fragment quoted by an
+// url.EscapeError (the offending '%' plus up to the following two bytes, as
+// url.Parse renders it for one unescaped component) is the first illegal
+// escape url.Parse finds in the upstream address's username or password.
+// The components and their boundaries follow the address's own
+// splitUpstream boundaries and url.Parse's first-colon user/password split;
+// an '@' in the base path never counts as userinfo, and a substring match
+// is deliberately not used so a legal "%40" in a credential cannot match a
+// "%4" reported from the host or base path.
+func escapeErrorFromUserinfo(raw, fragment string) bool {
+	p := splitUpstream(raw)
+	if p.schemeEnd < 0 || fragment == "" || fragment[0] != '%' {
+		return false
+	}
+	k := strings.LastIndexByte(p.authority, '@')
+	if k < 0 {
+		return false
+	}
+	username, password := p.authority[:k], ""
+	if i := strings.IndexByte(username, ':'); i >= 0 {
+		username, password = p.authority[:i], p.authority[i+1:k]
+	}
+	return firstBadEscapeFragment(username) == fragment || firstBadEscapeFragment(password) == fragment
+}
+
+// firstBadEscapeFragment scans one userinfo component the way url.Parse's
+// unescape does and returns the exact fragment an EscapeError would quote
+// for its first illegal escape: the '%' with the following two bytes, or
+// only the bytes left when the component ends mid-escape. A component
+// whose percent escapes are all well formed returns the empty string.
+func firstBadEscapeFragment(component string) string {
+	for i := 0; i < len(component); i++ {
+		if component[i] != '%' {
+			continue
+		}
+		if i+2 >= len(component) || !isHex(component[i+1]) || !isHex(component[i+2]) {
+			end := i + 3
+			if end > len(component) {
+				end = len(component)
+			}
+			return component[i:end]
+		}
+		i += 2
+	}
+	return ""
 }
 
 func validateUpstream(raw, loc, id string) *Failure {
@@ -775,6 +843,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 		return f
 	}
 	if f := validateUpstreamBasePathSpace(p, loc, id); f != nil {
+		return f
+	}
+	if f := validateUpstreamUserinfoEscapes(p, loc, id); f != nil {
 		return f
 	}
 	u, err := url.Parse(raw)
@@ -930,6 +1001,52 @@ func portWithinTCPRange(port string) bool {
 		return false
 	}
 	return len(trimmed) < len("65535") || trimmed <= "65535"
+}
+
+// validateUpstreamUserinfoEscapes rejects an http or https upstream whose
+// userinfo — the username and optional password before the host — carries an
+// illegal percent escape:
+//
+//	scheme "://" userinfo "@" host [":" port] [basePath]
+//
+// A percent sign in the username or password must be followed by two
+// hexadecimal digits, exactly as elsewhere in the address. The check reads
+// the address's own splitUpstream boundaries, so it judges only the bytes
+// before the last '@' of the authority: an '@' in the base path never marks
+// userinfo, and a bad escape in the host or base path is not claimed here —
+// such an address keeps its existing url.Parse diagnostic, which quotes the
+// host or path fragment verbatim. The check runs in check layer 4
+// (Config.validate), in routes-array order like the other field-content
+// checks, so one route whose credentials carry a bad escape fails the whole
+// read even when a request would never hit it.
+//
+// The reason names the route's 1-based position, its id and the upstream
+// field and says the userinfo's percent escape is illegal. It deliberately
+// never quotes the offending bytes: url.Parse's own failure renders the
+// invalid escape fragment (e.g. "%zz"), which IS the configured password,
+// so the address is shown through redactUpstreamUserinfo (the whole
+// userinfo replaced by "***", the '@' kept) and the reason explains the
+// problem in words instead, so a saved diagnostic cannot reconstruct the
+// credentials from text outside the masked address. Only the percent sign
+// and hex digits are described — no literal percent escape is ever used as
+// an example.
+func validateUpstreamUserinfoEscapes(p upstreamParts, loc, id string) *Failure {
+	if p.schemeEnd < 0 {
+		return nil // no scheme: the generic absolute-URL check reports this
+	}
+	if scheme := strings.ToLower(p.raw[:p.schemeEnd]); scheme != "http" && scheme != "https" {
+		return nil // the scheme check after url.Parse owns non-http(s) addresses
+	}
+	k := strings.LastIndexByte(p.authority, '@')
+	if k < 0 {
+		return nil // no userinfo: host/base-path escapes keep their existing diagnostics
+	}
+	if validPercentEscapes(p.authority[:k]) {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream %q has an invalid percent escape in its userinfo (the username or password before the host): a percent sign in the username or password must be immediately followed by two hexadecimal digits (0-9, a-f, A-F); fix the encoding or remove the stray percent sign; the credentials are read exactly as configured and are never decoded or rewritten on the user's behalf",
+		routeLabel(loc, id), redactUpstreamUserinfo(p.raw))
 }
 
 // validateUpstreamBasePathSpace rejects a direct ASCII space (U+0020) in the
