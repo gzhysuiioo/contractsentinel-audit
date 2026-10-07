@@ -107,6 +107,80 @@ func DiffStore(dir, beforeID, afterID string) (DiffResult, error) {
 	return DiffReports(before, after), nil
 }
 
+// DiffStoreRule works exactly like DiffStore — both archives are loaded and
+// fully verified first, the store is only read — but the returned comparison
+// keeps only the result for ruleID. The rule id is matched against its
+// complete text exactly: case and surrounding spaces are part of the id, so
+// "R1" and " R1 " never match "r1". The output keeps the full comparison
+// shape: the two report refs, artifact name/hash flags and the one selected
+// result entry, which is classified by the same rules as the full diff. The
+// summary counts only that entry, and beforeDefects/afterDefects are each
+// zero or one — whether the selected rule has a real defect finding on that
+// side, independently of defects other rules have in the same report.
+//
+// The filter never bypasses archive verification: a missing, corrupt or
+// illegitimately bound archive fails with the usual error even when the
+// problem is on another rule, and only after both archives have passed does
+// the filter itself get validated. An explicitly empty rule id, or an id
+// neither report contains, is then an input error and no result is returned.
+func DiffStoreRule(dir, beforeID, afterID, ruleID string) (DiffResult, error) {
+	before, err := LoadReportForDiff(dir, beforeID)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	after, err := LoadReportForDiff(dir, afterID)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	if ruleID == "" {
+		return DiffResult{}, errInvalid("rule id filter must not be empty")
+	}
+	full := DiffReports(before, after)
+	for i := range full.Results {
+		if full.Results[i].RuleID != ruleID {
+			continue
+		}
+		entry := full.Results[i]
+		full.Results = []RuleDiff{entry}
+		full.Summary = summaryForEntry(entry)
+		return full, nil
+	}
+	return DiffResult{}, errInvalid("rule " + ruleID + " not found in either report")
+}
+
+// summaryForEntry builds the summary of a one-rule comparison: the single
+// category the entry belongs to plus the per-side real-defect presence, each
+// zero or one. A side carries a finding exactly when that report recorded a
+// real defect for the rule; tool-missing, timeout and unchecked sides do not.
+func summaryForEntry(entry RuleDiff) DiffSummary {
+	s := DiffSummary{}
+	switch entry.Change {
+	case ChangeNewDefect:
+		s.NewDefects = 1
+	case ChangeResolvedDefect:
+		s.ResolvedDefects = 1
+	case ChangeStatusChanged:
+		s.StatusChanges = 1
+	case ChangeNoteChanged:
+		s.NoteChanges = 1
+	case ChangeNoChange:
+		s.NoChange = 1
+	case ChangeRuleAdded:
+		s.AddedRules = 1
+	case ChangeRuleRemoved:
+		s.RemovedRules = 1
+	case ChangeRuleChanged:
+		s.ChangedRules = 1
+	}
+	if entry.Before != nil && entry.Before.Finding != nil {
+		s.BeforeDefects = 1
+	}
+	if entry.After != nil && entry.After.Finding != nil {
+		s.AfterDefects = 1
+	}
+	return s
+}
+
 // sameRuleDefinition reports whether two rules with the same id also agree on
 // version, kind, severity, invariant and ABI requirement. Only then may their
 // check statuses be compared.

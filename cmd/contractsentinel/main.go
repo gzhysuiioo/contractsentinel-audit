@@ -90,21 +90,39 @@ func runReport(args []string) {
 	printReport("report", report)
 }
 
-// runDiff compares two stored reports and prints the diff JSON.
+// runDiff compares two stored reports and prints the diff JSON. Without
+// --rule it prints the full comparison; with --rule it keeps only that
+// rule's entry, with the same output shape and a summary scoped to it.
 func runDiff(args []string) {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	store := fs.String("store", "", "report store directory")
 	before := fs.String("before", "", "baseline report id")
 	after := fs.String("after", "", "new report id")
+	ruleFilter := fs.String("rule", "", "only compare this rule id (exact, case-sensitive match)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
+	// Track whether the flag was literally passed: an explicit --rule "" is
+	// an error naming the empty filter, while omitting the flag keeps the
+	// existing full-comparison behaviour.
+	ruleSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "rule" {
+			ruleSet = true
+		}
+	})
 	if *store == "" || *before == "" || *after == "" {
-		fmt.Fprintln(os.Stderr, "usage: contractsentinel diff --store <dir> --before <id> --after <id>")
+		fmt.Fprintln(os.Stderr, "usage: contractsentinel diff --store <dir> --before <id> --after <id> [--rule <ruleId>]")
 		os.Exit(2)
 	}
-	diff, err := contractsentinel.DiffStore(*store, *before, *after)
+	var diff contractsentinel.DiffResult
+	var err error
+	if ruleSet {
+		diff, err = contractsentinel.DiffStoreRule(*store, *before, *after, *ruleFilter)
+	} else {
+		diff, err = contractsentinel.DiffStore(*store, *before, *after)
+	}
 	if err != nil {
 		fail("diff", err)
 	}

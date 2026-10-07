@@ -666,7 +666,8 @@ go run ./cmd/contractsentinel diff --store ./reports \
 go run ./cmd/contractsentinel diff \
   --store ./reports \
   --before <基准报告 reportId> \
-  --after <新报告 reportId>
+  --after <新报告 reportId> \
+  [--rule <规则标识>]
 ```
 
 `./cs diff ...` 与上面的 `go run ./cmd/contractsentinel diff ...` 等价，全程离线。
@@ -676,6 +677,7 @@ go run ./cmd/contractsentinel diff \
 - **`--store`**：两份报告共同所在的报告目录，与 `audit`、`report` 用的是同一个目录参数。
 - **`--before`**：基准报告（当作对照的较早一次审计）；**`--after`**：新报告。
 - **比较方向只由两个标识所在的参数位置决定**：工具不按文件时间或归档顺序猜测方向。交换两个参数，所有“新发现/已消除”的方向随之反转。
+- **`--rule`（可选）**：只查看指定规则的变化。不提供时输出完整比较；提供时只保留这一条规则的结果条目，输出结构不变（见下文“只查看一条规则的变化”）。
 - 两个参数填的都必须是各自 **`audit` 成功输出（stdout）里的 `reportId`**（随后也可用 `report` 读回确认），**不是产物哈希**。产物哈希相同只说明两份报告审计的产物内容相同，不能拿它当报告标识。
 - `diff` 只**读取已保存的结论**做比较：不会重新检查合约，不启动符号执行或模糊测试，不重新解释证据，也不写入或修改报告目录。
 
@@ -870,6 +872,71 @@ go run ./cmd/contractsentinel diff \
 
 `before` / `after` 两侧的 `rule` 是该侧完整规则（含 `version`、`status`、`note`）；`finding` 仅在该侧该规则为 `发现缺陷` 时出现，携带当侧归档的 `artifactHash`、`version` 与逐字证据。顶层 `artifactNameChanged` / `artifactHashChanged` 标明两侧产物是否同名同内容。`summary` 中八类计数与逐条 `change` 一一对应且零值也总是出现，`beforeDefects` / `afterDefects` 是两侧缺陷总数。
 
+### 只查看一条规则的变化（可选 `--rule`）
+
+比较两份报告时可以额外给出 `--rule <规则标识>`，把比较结果限定在这一条规则上：
+
+```bash
+go run ./cmd/contractsentinel diff \
+  --store ./reports \
+  --before <基准报告 reportId> \
+  --after <新报告 reportId> \
+  --rule reentrancy-guard
+```
+
+筛选后的输出与完整比较是**同一个结构**：
+
+- 顶层仍保留实际比较的两份报告标识（`before.reportId` / `after.reportId`）、两侧产物名称与哈希，以及 `artifactNameChanged` / `artifactHashChanged`——这两个标记描述的是两份报告整体的产物差异，即使所选规则本身“无变化”也照常给出。
+- `results` 只包含所选规则的一个条目，仍是数组。条目的分类规则与完整比较完全相同：定义完全一致时才比较状态，版本、检查种类、严重级别、不变式或 ABI 要求有变化仍归 **“规则变化”**；涉及工具缺失、超时、未检查的状态迁移仍归 **“检查状态变化”**，不会因为只看一条规则就把它们推断成新增或消除缺陷。
+- `summary` 与返回的唯一条目对应：该条目所属分类计一，其余七类为零。`beforeDefects` / `afterDefects` 在这里各为**零或一**，只表示这条规则在对应报告中是否有真实缺陷记录；同一份报告里其他规则的缺陷不计入。例如两份报告都还有别的缺陷，但所选规则定义一致、从“通过”变成“发现缺陷”，结果只计一条“新发现缺陷”，两个缺陷数为零和一。
+- 规则标识按**完整文字精确匹配**：大小写与前后空格都是标识的一部分，`"R1"`、`" R1 "` 与 `"r1"` 互不相同，不做子串匹配或修剪。
+- 规则只存在于一侧时照常返回 **“新增规则”** 或 **“移除规则”**，缺失的一侧为 `null`；存在的一侧保留完整规则、状态、原始说明以及对应缺陷记录的产物哈希、版本和逐字证据（中文、换行与空格不被改写）。
+
+不提供 `--rule` 时（包括完全不带这个参数）行为与以前逐字节一致：仍是完整比较，保留已有的结果次序、分类与统计。
+
+沿用前面“基准侧发现缺陷、新侧超时”的例子，对同一对报告加 `--rule reentrancy-guard`，输出的顶层和条目内容不变，`results` 只剩这一条，`summary` 只统计它（状态迁移仍是“检查状态变化”，缺陷数为一和零）：
+
+```json
+{
+  "before": {
+    "reportId": "fd2b18fc0819786bc466a3bc8f5a60ffbf24d44e86d0b9b2bd09495bb80383dc",
+    "artifact": {
+      "name": "Vault",
+      "hash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7"
+    }
+  },
+  "after": {
+    "reportId": "738004a606559b08a2beb04382ea1ef2c9ec81869081c27e7dd153e840d0e4e0",
+    "artifact": {
+      "name": "Vault",
+      "hash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7"
+    }
+  },
+  "artifactNameChanged": false,
+  "artifactHashChanged": false,
+  "results": [
+    {
+      "ruleId": "reentrancy-guard",
+      "change": "检查状态变化",
+      "before": { "rule": { "…同完整比较…" }, "finding": { "…同完整比较，证据逐字保留…" } },
+      "after": { "rule": { "…同完整比较…" }, "finding": null }
+    }
+  ],
+  "summary": {
+    "newDefects": 0,
+    "resolvedDefects": 0,
+    "statusChanges": 1,
+    "noteChanges": 0,
+    "noChange": 0,
+    "addedRules": 0,
+    "removedRules": 0,
+    "changedRules": 0,
+    "beforeDefects": 1,
+    "afterDefects": 0
+  }
+}
+```
+
 ### diff 失败条件（非零退出，无部分结果，不动归档）
 
 报告标识必须是**恰好 64 位小写十六进制字符串**。下列情况命令都以**非零状态退出**，原因写入 **stderr**，stdout 没有任何比较片段（即使第一份报告已成功读取也不会输出部分结果），报告目录与已有归档保持原样（不创建目录、不修复或改写损坏文件、不留临时文件）：
@@ -923,6 +990,24 @@ go run ./cmd/contractsentinel diff \
   ```
 
   比较前的校验会先拒绝整份归档，**任一侧**命中都直接失败，不输出任何比较分类或统计。只提交不变式布尔值生成的无说明缺陷报告（证据为 `invariant <不变式名> does not hold`）不受影响，已有合法报告的比较结果保持不变。
+
+- 使用 `--rule` 时明确给出空字符串（`--rule ""`）：
+
+  ```text
+  diff failed: rule id filter must not be empty
+  ```
+
+  完全不带 `--rule` 参数不是错误，仍输出完整比较；只有**明确写出**空值才按参数错误处理。
+
+- 使用 `--rule` 给出的标识在两份报告中都不存在：
+
+  ```text
+  diff failed: rule no-such-rule not found in either report
+  ```
+
+  规则标识按完整文字精确匹配（大小写、前后空格都保留），修剪或大小写不同的写法同样按未找到处理，错误信息逐字给出所请求的标识。规则只在一侧出现时不是错误：照常输出“新增规则”/“移除规则”，缺席侧为 `null`。
+
+  上述两类筛选错误都发生在**两份归档完整校验通过之后**：stdout 不输出任何比较片段，也不会留下半截结果。筛选**不能绕过**整份归档校验——任一报告缺失、损坏或绑定不合法，即使问题出在另一条未选择的规则上、即使所选规则只存在于另一份完好的报告中，仍按上面的归档失败行为结束；比较全程只读，不会改写报告目录或任何归档。
 
 ## 仅提交不变式布尔值（既有用法，保持不变）
 
