@@ -196,6 +196,111 @@ go test ./...
   （方法必填、目标路径必须以 `/` 开头），不归为类型错误。
 - `route_conflict` / `route_not_found`：见上。
 
+### 上游地址带凭据时的诊断隐藏
+
+上游地址可以携带用户信息（`scheme://用户名:密码@主机/基础路径`）。配置因
+上游地址非法被拒绝时，reason 需要引用该地址来定位问题，但用户名与密码
+属于凭据，不能写进错误输出：展示地址时，整个用户信息段——用户名、可选
+密码及其中的冒号与百分号转义——整体替换为 `***`，只保留分隔用的 `@`
+以及后面的主机、端口与基础路径。隐藏只作用于失败诊断，不改变配置本身
+的校验、保存与解析结果（见本节末尾的成功示例）。
+
+**情况一：凭据本身含非法百分号转义。** 配置（第二条路由的密码
+`pw%4` 中 `%` 后只跟了一个十六进制数字）：
+
+```json
+{
+  "routes": [
+    {"id": "api",    "methods": ["GET"], "pathPrefix": "/api",    "upstream": "http://api.internal/v1"},
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:pw%4@api.internal/v1"}
+  ]
+}
+```
+
+请求（只命中第一条合法路由）：
+
+```json
+{"method": "GET", "target": "/api/items"}
+```
+
+标准输出为空，退出状态非零，标准错误为：
+
+```json
+{"code":"invalid_config","reason":"route 2 (id \"reader\"): upstream \"https://***@api.internal/v1\" contains an invalid percent escape in its userinfo: the username or password before the '@' carries a '%' that is not followed by two hexadecimal digits, so the address cannot be parsed; write a literal percent as %25 and percent-encode every other byte as two hex digits. The configured username and password are not repeated — shown together as \"***\" — while the '@', host, port and base path stay unchanged"}
+```
+
+reason 定位到从 1 开始的路由位置（route 2）、路由 id 与 `upstream`
+字段，并明确问题在用户信息：用户名或密码中的 `%` 后没有跟两个十六进制
+数字，字面百分号应写作 `%25`。地址显示为
+`https://***@api.internal/v1`——`@`、主机与基础路径原样保留，而 `pw%4`
+及其错误片段 `%4` 在 reason 的任何位置都不再出现，保存下来的诊断不会
+泄露凭据。注意即使当前请求只命中前面的合法路由，只要配置中存在这样的
+非法上游地址，整份配置仍在读取时被拒绝，不返回可供解析的配置。
+
+**情况二：凭据合法，非法转义在主机或基础路径。** 配置（密码
+`p%40ss` 是合法编码，基础路径 `/%zz` 含非法转义）：
+
+```json
+{
+  "routes": [
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:p%40ss@api.internal/%zz"}
+  ]
+}
+```
+
+请求：
+
+```json
+{"method": "GET", "target": "/reader/items"}
+```
+
+标准输出为空，退出状态非零，标准错误为：
+
+```json
+{"code":"invalid_config","reason":"route 1 (id \"reader\"): upstream is not a valid URL: parse \"https://***@api.internal/%zz\": invalid URL escape \"%zz\""}
+```
+
+凭据合法时同样被隐藏（地址仍显示为 `https://***@...`），但路径中的
+`%zz` 作为诊断内容原样保留在 `invalid URL escape "%zz"` 中——它属于
+基础路径，不应被理解为密码错误。主机部分的非法转义（如
+`https://reader:p%40ss@ho%zzst/`）也按同样的实际原因报告：隐藏凭据、
+保留主机片段及其转义错误。基础路径中单独出现的 `@` 属于路径内容
+（如 `/v1@x`），不会被当作用户名或密码的分隔位置。
+
+区分两类错误看 reason 的措辞：说 `invalid percent escape in its
+userinfo` 时问题在凭据，地址中 `@` 之前的内容整体为 `***`，且不引用
+任何凭据片段；说 `not a valid URL` 并引用具体转义片段（如 `%zz`）时，
+问题在主机或基础路径，片段来自 `@` 之后，与凭据无关。
+
+**修正后的成功结果。** 把基础路径改为合法地址：
+
+```json
+{
+  "routes": [
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:p%40ss@api.internal/v1"}
+  ]
+}
+```
+
+请求：
+
+```json
+{"method": "GET", "target": "/reader/orders/7?a=1&a="}
+```
+
+标准输出（退出状态为零，标准错误为空）：
+
+```json
+{"routeId":"reader","upstreamURL":"https://reader:p%40ss@api.internal/v1/orders/7?a=1&a="}
+```
+
+隐藏只作用于失败诊断：合法配置解析成功时，`upstreamURL` 逐字节保留
+原始用户名、密码及其百分号编码（`p%40ss` 不解码也不重编码），路径拼接
+与查询串保留沿用前面的现有规则。用 `json.Marshal` 保存配置再经
+`ParseConfig` 重新读取时，凭据及其编码同样原样保留，重新解析得到的
+routeId 与 upstreamURL 不变；前面关于匹配、queryTransforms 查询串改写
+与配置保存的说明都不受诊断隐藏影响。
+
 ### 保存配置为 JSON 并重新读取
 
 前面介绍的 `ParseConfig` 是读取配置的完整校验入口；同一份通过校验的
