@@ -1,6 +1,7 @@
 package contractsentinel
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -81,8 +82,8 @@ func TestUpstreamUserinfoRedactedInHostAndParseReasons(t *testing.T) {
 		{
 			name:     "invalid escape in userinfo",
 			upstream: "https://alice:p%4@host.internal/",
-			want:     []string{"route 1", `"api"`, "upstream", "not a valid URL", `parse "https://***@host.internal/"`, "invalid URL escape"},
-			hidden:   []string{"alice"},
+			want:     []string{"route 1", `"api"`, "upstream", "invalid percent escape in its userinfo", `"https://***@host.internal/"`},
+			hidden:   []string{"alice", "p%4", `"%4"`},
 		},
 		{
 			name:     "invalid escape in host with userinfo",
@@ -155,5 +156,203 @@ func TestValidUserinfoUpstreamUnchanged(t *testing.T) {
 	}
 	if cfg.Routes[0].Upstream != "https://alice:s3cr%40t@host.internal:8443/v1" {
 		t.Errorf("stored upstream = %q, want the original address with userinfo", cfg.Routes[0].Upstream)
+	}
+}
+
+// TestUpstreamUserinfoBadEscapeDedicatedReason is the headline fix: when
+// the password (or username) itself is an illegal percent escape such as
+// https://alice:%zz@host.internal/base, url.Parse's reason would quote the
+// credential verbatim (invalid URL escape "%zz"). The config reader must
+// instead return invalid_config with a reason that locates the route by its
+// 1-based position, id and the upstream field, shows the address as
+// "scheme://***@host/..." (whole username and optional password hidden,
+// '@' and the rest kept) and never repeats the malformed fragment or any
+// other byte of the credential. No config is returned.
+func TestUpstreamUserinfoBadEscapeDedicatedReason(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		shown    string   // redacted address that must appear quoted
+		hidden   []string // bytes that must not appear anywhere in the reason
+	}{
+		{"illegal escape in password", "https://alice:%zz@host.internal/base", "https://***@host.internal/base", []string{"alice", "%zz", `"%zz"`}},
+		{"truncated escape at password end", "https://alice:pw%2@host.internal/base", "https://***@host.internal/base", []string{"alice", "pw%2", `"%2"`}},
+		{"truncated escape mid password", "https://alice:p%4@host.internal/", "https://***@host.internal/", []string{"alice", "p%4", `"%4"`}},
+		{"lone percent in password", "https://alice:pw%@host/", "https://***@host/", []string{"alice", "pw%", `"%"`}},
+		{"illegal escape in username with password", "https://%zz:secret@host.internal/base", "https://***@host.internal/base", []string{"secret", "%zz", `"%zz"`}},
+		{"illegal escape in username only", "https://al%zz@host.internal/base", "https://***@host.internal/base", []string{"al%zz", `"%zz"`}},
+		{"username-only truncated escape", "http://u%4@host/base", "http://***@host/base", []string{"u%4", `"%4"`}},
+		{"empty password then bad username", "https://%zz:@host/", "https://***@host/", []string{"%zz", `"%zz"`}},
+		{"uppercase scheme spelling", "HTTPS://alice:%zz@host/", "HTTPS://***@host/", []string{"alice", "%zz", `"%zz"`}},
+		{"http scheme", "http://alice:%zz@host/", "http://***@host/", []string{"alice", "%zz", `"%zz"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"` + tc.upstream + `"}]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil || f.Code != "invalid_config" {
+				t.Fatalf("upstream %q: got cfg=%+v f=%+v, want invalid_config", tc.upstream, cfg, f)
+			}
+			if cfg != nil {
+				t.Fatalf("a rejected config must not be returned, got %+v", cfg)
+			}
+			for _, want := range []string{"route 1", `"api"`, "upstream", "invalid percent escape in its userinfo", `"` + tc.shown + `"`} {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+				}
+			}
+			for _, leaked := range tc.hidden {
+				if strings.Contains(f.Reason, leaked) {
+					t.Fatalf("reason = %q leaks credential fragment %q", f.Reason, leaked)
+				}
+			}
+		})
+	}
+}
+
+// TestUpstreamUserinfoBadEscapeRejectsWholeConfig pins that a bad
+// userinfo escape rejects the whole configuration even when the request
+// only matches a different, legal route: ParseConfig hands back no config at
+// all, and the reason locates the offending later route by its 1-based
+// position and id.
+func TestUpstreamUserinfoBadEscapeRejectsWholeConfig(t *testing.T) {
+	src := `{"routes":[
+	  {"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"http://api.internal/v1"},
+	  {"id":"admin","methods":["GET"],"pathPrefix":"/admin","upstream":"https://alice:%zz@host.internal/base"}
+	]}`
+	cfg, f := ParseConfig([]byte(src))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got cfg=%+v f=%+v, want invalid_config", cfg, f)
+	}
+	if cfg != nil {
+		t.Fatalf("the whole config must be rejected even though /api only hits route 1, got %+v", cfg)
+	}
+	for _, want := range []string{"route 2", `"admin"`, "upstream", `"https://***@host.internal/base"`} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+	for _, leaked := range []string{"alice", "%zz"} {
+		if strings.Contains(f.Reason, leaked) {
+			t.Fatalf("reason = %q leaks %q", f.Reason, leaked)
+		}
+	}
+}
+
+// TestUpstreamHostAndPathEscapesKeepTheirDiagnostics pins the other side of
+// the redaction boundary: when the userinfo is legal and the malformed
+// escape actually belongs to the host or base path, the existing specific
+// diagnostic — including its fragment — is preserved verbatim, even when the
+// host or path text is identical to a string that would be a credential,
+// and an '@' inside the base path must not be read as userinfo. Only the
+// credentials are hidden.
+func TestUpstreamHostAndPathEscapesKeepTheirDiagnostics(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		shown    string
+		keep     []string // diagnostics that must survive, fragment included
+		hidden   []string // only the credentials are hidden
+	}{
+		{
+			name:     "illegal escape in host with legal userinfo",
+			upstream: "https://alice:secret@ho%zzst/",
+			shown:    "https://***@ho%zzst/",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`},
+			hidden:   []string{"alice", "secret"},
+		},
+		{
+			name:     "illegal escape in base path with legal userinfo",
+			upstream: "https://alice:pw9@host.internal/base%zz/x",
+			shown:    "https://***@host.internal/base%zz/x",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`},
+			hidden:   []string{"alice", "pw9"},
+		},
+		{
+			name:     "at sign in base path is not userinfo",
+			upstream: "https://alice:pw9@host.internal/v1@x%zz",
+			shown:    "https://***@host.internal/v1@x%zz",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`, "/v1@x%zz"},
+			hidden:   []string{"alice", "pw9"},
+		},
+		{
+			name:     "illegal escape in host without userinfo stays whole",
+			upstream: "http://ho%zzst/",
+			shown:    "http://ho%zzst/",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`},
+			hidden:   nil,
+		},
+		{
+			name:     "illegal escape in base path without userinfo stays whole",
+			upstream: "http://host.internal/base%zz/x",
+			shown:    "http://host.internal/base%zz/x",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`, "host.internal"},
+			hidden:   nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"` + tc.upstream + `"}]}`
+			cfg, f := ParseConfig([]byte(src))
+			if f == nil || f.Code != "invalid_config" {
+				t.Fatalf("upstream %q: got cfg=%+v f=%+v, want invalid_config", tc.upstream, cfg, f)
+			}
+			if !strings.Contains(f.Reason, `parse "`+tc.shown+`"`) {
+				t.Fatalf("reason = %q, want redacted address %q", f.Reason, tc.shown)
+			}
+			for _, want := range tc.keep {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want host/path diagnostic %q preserved", f.Reason, want)
+				}
+			}
+			for _, leaked := range tc.hidden {
+				if strings.Contains(f.Reason, leaked) {
+					t.Fatalf("reason = %q leaks credential %q", f.Reason, leaked)
+				}
+			}
+		})
+	}
+}
+
+// TestUpstreamUserinfoBadEscapeNonHTTPSchemeStillRedacted pins the
+// defense-in-depth path: a non-http scheme with a bad userinfo escape keeps
+// the generic "not a valid URL" wording (the dedicated field reason is the
+// http/https contract) but still never quotes the credential fragment.
+func TestUpstreamUserinfoBadEscapeNonHTTPSchemeStillRedacted(t *testing.T) {
+	src := `{"routes":[{"id":"api","methods":["GET"],"pathPrefix":"/api","upstream":"ftp://alice:%zz@host.internal/base"}]}`
+	cfg, f := ParseConfig([]byte(src))
+	if f == nil || f.Code != "invalid_config" {
+		t.Fatalf("got cfg=%+v f=%+v, want invalid_config", cfg, f)
+	}
+	for _, want := range []string{"not a valid URL", `parse "ftp://***@host.internal/base"`} {
+		if !strings.Contains(f.Reason, want) {
+			t.Fatalf("reason = %q, want substring %q", f.Reason, want)
+		}
+	}
+	for _, leaked := range []string{"alice", "%zz"} {
+		if strings.Contains(f.Reason, leaked) {
+			t.Fatalf("reason = %q leaks credential fragment %q", f.Reason, leaked)
+		}
+	}
+}
+
+// TestValidUserinfoUpstreamSurvivesSaveRoundTrip pins that diagnostic
+// redaction never reaches persisted configuration: a legal credential is
+// accepted and re-marshalled with the username, password and percent
+// encoding byte for byte, and the re-parsed config resolves identically.
+func TestValidUserinfoUpstreamSurvivesSaveRoundTrip(t *testing.T) {
+	src := `{"routes":[{"id":"r","methods":["GET"],"pathPrefix":"/","upstream":"https://alice:s3cr%40t@host.internal/v1"}]}`
+	cfg := mustConfig(t, src)
+	saved, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(saved), `"upstream":"https://alice:s3cr%40t@host.internal/v1"`) {
+		t.Fatalf("saved config lost userinfo or percent encoding: %s", saved)
+	}
+	reparsed := mustConfig(t, string(saved))
+	res := resolveJSON(t, reparsed, `{"method":"GET","target":"/x"}`)
+	if want := "https://alice:s3cr%40t@host.internal/v1/x"; res.UpstreamURL != want {
+		t.Fatalf("reparsed upstreamURL = %q, want %q", res.UpstreamURL, want)
 	}
 }

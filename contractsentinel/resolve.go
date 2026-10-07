@@ -737,14 +737,118 @@ func redactUpstreamUserinfo(raw string) string {
 // address's userinfo hidden: url.Error quotes the full original address,
 // credentials included, so the address is re-rendered through
 // redactUpstreamUserinfo while the underlying reason (a bad port, an
-// invalid escape, ...) is kept verbatim and the address is never repeated
-// in its original form. Non-url errors are returned unchanged.
+// invalid host escape, an invalid path escape, ...) is kept verbatim. The
+// one exception is an EscapeError produced while unescaping the userinfo —
+// its text repeats the malformed credential fragment (e.g. invalid URL
+// escape "%zz" for a password "%zz") — which urlEscapeErrorFromUserinfo
+// identifies exactly; that fragment is swapped for a fixed, fragment-free
+// phrase. A fragment from the host or base path is kept exactly as before,
+// and the address is never repeated in its original form. Non-url errors
+// are returned unchanged.
 func redactURLError(err error) string {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		return fmt.Sprintf("parse %q: %v", redactUpstreamUserinfo(urlErr.URL), urlErr.Err)
+		inner := urlErr.Err.Error()
+		if urlEscapeErrorFromUserinfo(urlErr.URL, err) {
+			inner = "invalid URL escape in upstream userinfo (username or password hidden)"
+		}
+		return fmt.Sprintf("parse %q: %s", redactUpstreamUserinfo(urlErr.URL), inner)
 	}
 	return err.Error()
+}
+
+// urlEscapeErrorFromUserinfo reports whether parseErr is the *url.Error a
+// url.Parse of rawURL failed with because a percent escape inside its
+// userinfo (the username or optional password between "://" and the
+// authority's last '@') is malformed. It replays net/url's parseAuthority
+// ordering exactly — host, then userinfo, then the base path — instead of
+// searching the reported fragment as a substring, which a truncated
+// fragment such as "%" or "%4" would match inside otherwise-legal escapes.
+//
+// The scheme is not judged here: credential redaction applies to every
+// scheme, so a non-http address with a bad userinfo escape never quotes
+// the credential fragment either; callers that only own the http/https
+// dedicated reason (invalidUpstreamUserinfoEscape) gate on the scheme
+// themselves. The probe follows the address's own splitUpstream boundaries
+// and requires userinfo:
+//
+//  1. parseErr must wrap url.EscapeError, the only error unescaping the
+//     username/password (encodeUserPassword mode) produces;
+//  2. the host, parsed on its own with the same scheme, must succeed —
+//     parseAuthority unescapes the host first, so any host-side failure
+//     (a host escape, a bad port or an IP-literal error) is the message
+//     url.Parse actually reports and keeps its existing wording;
+//  3. the userinfo is then parsed against a known-good host; the error its
+//     unescaping produces must be the very same EscapeError reported, so
+//     the decision cannot fire on a coincidentally equal fragment located
+//     elsewhere (the grammar check validUserinfo runs first is covered: it
+//     yields "net/url: invalid userinfo", never an EscapeError).
+//
+// The base path is never probed: after a clean host and a failing userinfo
+// parseAuthority has already returned, before setPath ever runs, so a path
+// escape cannot be the source even when it spells the same three bytes.
+func urlEscapeErrorFromUserinfo(rawURL string, parseErr error) bool {
+	var urlErr *url.Error
+	if !errors.As(parseErr, &urlErr) {
+		return false
+	}
+	var reported url.EscapeError
+	if !errors.As(urlErr.Err, &reported) {
+		return false
+	}
+	p := splitUpstream(rawURL)
+	if p.schemeEnd < 0 {
+		return false
+	}
+	k := strings.LastIndexByte(p.authority, '@')
+	if k < 0 {
+		return false // no userinfo: host and base-path escapes keep their wording
+	}
+	// Stage 1 of parseAuthority: the host alone, with the same scheme.
+	if _, err := url.Parse(rawURL[:p.schemeEnd+3] + p.hostPort); err != nil {
+		return false
+	}
+	// Stage 2: replay the userinfo stage against a trivially legal host;
+	// its path is "/", so the only possible failure is the credential's.
+	probe := rawURL[:p.schemeEnd+3] + p.authority[:k] + "@userinfo-escape-probe.invalid/"
+	_, probeErr := url.Parse(probe)
+	if probeErr == nil {
+		return false
+	}
+	var probeURLErr *url.Error
+	if !errors.As(probeErr, &probeURLErr) {
+		return false
+	}
+	var probeEscape url.EscapeError
+	return errors.As(probeURLErr.Err, &probeEscape) && probeEscape.Error() == reported.Error()
+}
+
+// invalidUpstreamUserinfoEscape turns a url.Parse failure attributed to the
+// userinfo (per urlEscapeErrorFromUserinfo) of an http or https upstream
+// into the config reader's own content error: the reason names the route's
+// 1-based position, its id and the upstream field, shows the address with
+// the whole username and optional password replaced by "***" (the '@' and
+// the host, port and base path kept), and never repeats the malformed
+// fragment or any other credential byte. A non-http scheme returns nil so
+// it keeps the generic parse diagnostic; that path renders through
+// redactURLError, which still hides the credential fragment, it merely
+// keeps the standard "not a valid URL" wording rather than this one. Any
+// other url.Parse failure returns nil for the same reason.
+func invalidUpstreamUserinfoEscape(raw string, parseErr error, loc, id string) *Failure {
+	if !urlEscapeErrorFromUserinfo(raw, parseErr) {
+		return nil
+	}
+	// The dedicated, field-located reason is the http/https contract; other
+	// schemes fall through to the generic parse error (with the credential
+	// fragment still redacted by redactURLError) and are then rejected by the
+	// scheme check that already follows url.Parse.
+	p := splitUpstream(raw)
+	if scheme := strings.ToLower(raw[:p.schemeEnd]); scheme != "http" && scheme != "https" {
+		return nil
+	}
+	return failuref("invalid_config",
+		"%s: upstream %q contains an invalid percent escape in its userinfo: the username or password before the '@' carries a '%%' that is not followed by two hexadecimal digits, so the address cannot be parsed; write a literal percent as %%25 and percent-encode every other byte as two hex digits. The configured username and password are not repeated — shown together as \"***\" — while the '@', host, port and base path stay unchanged",
+		routeLabel(loc, id), redactUpstreamUserinfo(raw))
 }
 
 func validateUpstream(raw, loc, id string) *Failure {
@@ -779,6 +883,13 @@ func validateUpstream(raw, loc, id string) *Failure {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		if f := invalidUpstreamUserinfoEscape(raw, err, loc, id); f != nil {
+			// A malformed percent escape in the username or password makes
+			// url.Parse quote the credential fragment (e.g. invalid URL
+			// escape "%zz"); replace that whole message with a fixed,
+			// fragment-free reason located on this route and field.
+			return f
+		}
 		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %s", loc, id, redactURLError(err))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
