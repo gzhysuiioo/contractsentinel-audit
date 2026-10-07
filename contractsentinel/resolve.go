@@ -86,8 +86,38 @@ type QueryTransform struct {
 	To    string `json:"to"`
 }
 
+// transformOpSpec is the one shared description of an op's field contract:
+// which of the optional rule fields the op uses. Both the config reader
+// (parseQueryTransforms) and the config writer (QueryTransform.MarshalJSON)
+// consult this table, so the fields an op requires or forbids on input and
+// the fields it carries on output are maintained in exactly one place and
+// can never drift apart.
+type transformOpSpec struct {
+	// usesValue marks the op whose rule carries a value (set): the reader
+	// requires a string value and the writer emits it, the empty string
+	// included. For every other op the reader rejects a value and the
+	// writer never emits one.
+	usesValue bool
+	// usesTo marks the ops whose rule carries a target name (rename and
+	// copy): the reader requires a non-empty string to and the writer emits
+	// it. For set and remove a to is accepted but ignored on input and
+	// omitted on output.
+	usesTo bool
+}
+
+// transformOpSpecs is the field contract of every supported op, keyed by
+// the op string. Membership in this table is also the known-op test the
+// reader applies before checking any other rule field.
+var transformOpSpecs = map[string]transformOpSpec{
+	"set":    {usesValue: true},
+	"remove": {},
+	"rename": {usesTo: true},
+	"copy":   {usesTo: true},
+}
+
 // MarshalJSON renders each rule so the output satisfies the same constraints
-// parseQueryTransforms enforces on input:
+// parseQueryTransforms enforces on input — both sides read the op's field
+// contract from the shared transformOpSpecs table:
 //   - set keeps "value" as a JSON string, including the empty string;
 //   - remove emits only op and name (never value or to);
 //   - rename and copy keep a non-empty "to" and never emit value.
@@ -97,14 +127,15 @@ type QueryTransform struct {
 // never query-string percent-encoding or decoding, so a re-read matches the
 // same parameter names and applies the same literal values.
 func (q *QueryTransform) MarshalJSON() ([]byte, error) {
-	switch q.Op {
-	case "set":
+	spec, known := transformOpSpecs[q.Op]
+	switch {
+	case known && spec.usesValue:
 		return json.Marshal(struct {
 			Op    string `json:"op"`
 			Name  string `json:"name"`
 			Value string `json:"value"`
 		}{q.Op, q.Name, q.Value})
-	case "rename", "copy":
+	case known && spec.usesTo:
 		return json.Marshal(struct {
 			Op   string `json:"op"`
 			Name string `json:"name"`
@@ -244,7 +275,11 @@ func decodeMethodsField(raw json.RawMessage, label string, dst *[]string) *Failu
 
 // parseQueryTransforms decodes and validates the raw queryTransforms array
 // of one route. loc identifies the route; rule errors additionally carry a
-// 1-based rule index.
+// 1-based rule index. Each rule's op is looked up in the shared
+// transformOpSpecs table, which decides both the known-op check and which of
+// the optional value/to fields the rule must carry, must not carry or may
+// silently keep (a to on set or remove is accepted and ignored, and
+// QueryTransform.MarshalJSON omits it again on save).
 func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransform, *Failure) {
 	body := strings.TrimSpace(string(raw))
 	if body == "null" {
@@ -272,7 +307,9 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
 		case !jsonString(opRaw, &qt.Op):
 			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
-		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename" && qt.Op != "copy":
+		}
+		spec, known := transformOpSpecs[qt.Op]
+		if !known {
 			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove, rename and copy are supported)", ruleLoc, qt.Op)
 		}
 
@@ -286,39 +323,25 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
 		}
 
+		// The optional fields follow the op's shared field contract
+		// (transformOpSpecs): value before to, so a rule failing both checks
+		// is reported on its value first.
 		valueRaw, hasValue := fields["value"]
 		toRaw, hasTo := fields["to"]
-		switch qt.Op {
-		case "set":
-			if !hasValue {
-				return nil, failuref("invalid_config", "%s: set requires a string value", ruleLoc)
-			}
-			if !jsonString(valueRaw, &qt.Value) {
+		if spec.usesValue {
+			switch {
+			case !hasValue:
+				return nil, failuref("invalid_config", "%s: %s requires a string value", ruleLoc, qt.Op)
+			case !jsonString(valueRaw, &qt.Value):
 				return nil, failuref("invalid_config", "%s: value must be a string", ruleLoc)
 			}
-		case "remove":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: remove must not include a value", ruleLoc)
-			}
-		case "rename":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: rename must not include a value", ruleLoc)
-			}
+		} else if hasValue {
+			return nil, failuref("invalid_config", "%s: %s must not include a value", ruleLoc, qt.Op)
+		}
+		if spec.usesTo {
 			switch {
 			case !hasTo:
-				return nil, failuref("invalid_config", "%s: rename requires a non-empty string to", ruleLoc)
-			case !jsonString(toRaw, &qt.To):
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			case qt.To == "":
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			}
-		case "copy":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: copy must not include a value", ruleLoc)
-			}
-			switch {
-			case !hasTo:
-				return nil, failuref("invalid_config", "%s: copy requires a non-empty string to", ruleLoc)
+				return nil, failuref("invalid_config", "%s: %s requires a non-empty string to", ruleLoc, qt.Op)
 			case !jsonString(toRaw, &qt.To):
 				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
 			case qt.To == "":
