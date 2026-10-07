@@ -403,6 +403,193 @@ func TestSchemelessUpstreamQueryFragmentPrecedence(t *testing.T) {
 	}
 }
 
+// TestSchemelessUpstreamSchemeTextInBasePathBadUserinfoEscape is the
+// regression for the credential leak through an inner scheme marker: the
+// schemeless address //alice:pw%4@api.internal/http://mirror/v1 carries a
+// perfectly legal "http://" in its base path. The leading "//" must decide
+// the address boundaries before any "://" is searched, so that inner text
+// is treated as path content: the malformed credential escape is still
+// attributed to the userinfo and the address is quoted only as
+// "//***@api.internal/http://mirror/v1" — the username, password and the
+// raw and quoted bad fragment never appear, while the host and the whole
+// base path (its "http://" text included) stay visible.
+func TestSchemelessUpstreamSchemeTextInBasePathBadUserinfoEscape(t *testing.T) {
+	cases := []schemelessRedactionCase{
+		{
+			name:     "headline http text in base path",
+			upstream: "//alice:pw%4@api.internal/http://mirror/v1",
+			shown:    "//***@api.internal/http://mirror/v1",
+			hidden:   []string{"alice", "pw%4", "%4", `"%4"`, "//alice"},
+		},
+		{
+			name:     "https text after an extra base slash",
+			upstream: "//al%zz@host.internal/root/https://mirror/v1",
+			shown:    "//***@host.internal/root/https://mirror/v1",
+			hidden:   []string{"al%zz", "%zz", `"%zz"`},
+		},
+		{
+			name:     "scheme text and a later at sign in the base path",
+			upstream: "//u:pw%@host.internal/http://mirror/v1@x",
+			shown:    "//***@host.internal/http://mirror/v1@x",
+			hidden:   []string{"pw%", `"%"`, "//u"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := assertSchemelessRejected(t, schemelessConfig(tc.upstream), tc.shown, tc.hidden)
+			if !strings.Contains(f.Reason, "invalid percent escape in its userinfo") {
+				t.Fatalf("reason = %q, want the dedicated userinfo reason", f.Reason)
+			}
+		})
+	}
+}
+
+// TestSchemelessUpstreamSchemeTextInBasePathKeepsPathDiagnostic pins that
+// with legal credentials, an error in the base path is still reported as a
+// base-path error even when the base path itself spells "https://": the
+// address is shown with the userinfo hidden whole, "invalid URL escape
+// "%zz"" is kept verbatim and must not be mislabeled a credential escape.
+// An '@' in that base path stays path content and never widens the hidden
+// range.
+func TestSchemelessUpstreamSchemeTextInBasePathKeepsPathDiagnostic(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		shown    string
+		keep     []string
+		hidden   []string
+	}{
+		{
+			name:     "legal credentials, bad base path escape after https text",
+			upstream: "//alice:p%40ss@api.internal/https://mirror/%zz",
+			shown:    "//***@api.internal/https://mirror/%zz",
+			keep:     []string{"not a valid URL", `parse "//***@api.internal/https://mirror/%zz"`, `invalid URL escape "%zz"`},
+			hidden:   []string{"alice", "p%40ss", "p@ss"},
+		},
+		{
+			name:     "at sign in that base path is path content",
+			upstream: "//alice:pw9@host.internal/https://mirror/%zz@x",
+			shown:    "//***@host.internal/https://mirror/%zz@x",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`, "/https://mirror/%zz@x"},
+			hidden:   []string{"alice", "pw9"},
+		},
+		{
+			name:     "bad host escape still reports the host first",
+			upstream: "//alice:pw%4@ho%zzst/https://mirror/v1",
+			shown:    "//***@ho%zzst/https://mirror/v1",
+			keep:     []string{"not a valid URL", `invalid URL escape "%zz"`},
+			hidden:   []string{"alice", "pw%4", `"%4"`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := assertSchemelessRejected(t, schemelessConfig(tc.upstream), tc.shown, tc.hidden)
+			for _, want := range tc.keep {
+				if !strings.Contains(f.Reason, want) {
+					t.Fatalf("reason = %q, want host/path diagnostic %q preserved", f.Reason, want)
+				}
+			}
+			if strings.Contains(f.Reason, "invalid percent escape in its userinfo") {
+				t.Fatalf("reason = %q must not mislabel a host/path error as a userinfo error", f.Reason)
+			}
+		})
+	}
+}
+
+// TestSchemelessUpstreamSchemeTextLegalAddressStillRejected pins that once
+// every part of a "//" address is legal — legal credentials, a legal host
+// and a base path containing "http://" text — the address is still rejected
+// solely for missing an absolute http/https scheme: no scheme is added, the
+// address is not quoted (so the credentials stay hidden) and the inner
+// "http://" text never legitimizes the outer schemeless spelling.
+func TestSchemelessUpstreamSchemeTextLegalAddressStillRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		hidden   []string
+	}{
+		{"encoded password and http text", "//alice:p%40ss@api.internal/http://mirror/v1", []string{"alice", "p%40ss", "p@ss"}},
+		{"username only and https text", "//alice@host.internal/https://mirror", []string{"alice"}},
+		{"no userinfo", "//api.internal/http://mirror/v1", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := assertSchemelessRejected(t, schemelessConfig(tc.upstream), "", tc.hidden)
+			if !strings.Contains(f.Reason, "upstream must be an absolute http or https URL") {
+				t.Fatalf("reason = %q, want the absolute http/https rule", f.Reason)
+			}
+			// The generic missing-scheme reason must neither quote the address
+			// nor present a spelled-out "://" scheme, so an inner "http://"
+			// cannot be mistaken for an added scheme.
+			for _, leaked := range []string{"://", "//***@"} {
+				if strings.Contains(f.Reason, leaked) {
+					t.Fatalf("reason = %q must not quote the address or add a scheme", f.Reason)
+				}
+			}
+		})
+	}
+}
+
+// TestSchemelessUpstreamSchemeTextErrorOrderUnchanged pins the existing
+// error-selection order with inner scheme text in the base path: host
+// shape, port range and base-path space rules still precede the
+// url.Parse userinfo-escape attribution.
+func TestSchemelessUpstreamSchemeTextErrorOrderUnchanged(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+		want     string
+		hidden   []string
+	}{
+		{"bad bracket beats bad userinfo escape", "//alice:%zz@[not-an-ip]/http://x", "not a legal IPv6 address", []string{"alice", "%zz"}},
+		{"out of range port beats bad userinfo escape", "//alice:%zz@h:99999/https://x", "out of range", []string{"alice", "%zz"}},
+		{"missing host beats bad userinfo escape", "//alice:%zz@:8080/http://x", "missing a host", []string{"alice", "%zz"}},
+		{"base path space beats bad userinfo escape", "//alice:%zz@h/http://base path", "unencoded space", []string{"alice", "%zz"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := assertSchemelessRejected(t, schemelessConfig(tc.upstream), "", tc.hidden)
+			if !strings.Contains(f.Reason, tc.want) {
+				t.Fatalf("reason = %q, want the earlier %q diagnostic", f.Reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestSplitUpstreamSchemeTextBoundaries pins the shared boundary reading
+// directly: a leading "//" always wins over any later "://", and for a
+// value not beginning with "//" the scheme separator cannot follow a '/'.
+func TestSplitUpstreamSchemeTextBoundaries(t *testing.T) {
+	cases := []struct {
+		name           string
+		raw            string
+		schemeEnd      int
+		authorityStart int
+		authority      string
+		basePath       string
+	}{
+		{"leading // with inner http://", "//alice:pw@h.internal/http://mirror/v1", -1, 2, "alice:pw@h.internal", "/http://mirror/v1"},
+		{"leading // with inner https://", "//h.internal/https://mirror", -1, 2, "h.internal", "/https://mirror"},
+		{"bare leading // no path", "//h.internal", -1, 2, "h.internal", ""},
+		{"scheme before a path colon-slash", "http://h/a://b", 4, 7, "h", "/a://b"},
+		{"single letter scheme", "a://b/c", 1, 4, "b", "/c"},
+		{"path colon slash is no marker at all", "/a://b", -1, 0, "", ""},
+		{"no marker", "api.internal/v1", -1, 0, "", ""},
+		{"https with inner scheme text in path", "https://user:p@h/v1/http://m", 5, 8, "user:p@h", "/v1/http://m"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := splitUpstream(tc.raw)
+			if p.schemeEnd != tc.schemeEnd || p.authorityStart != tc.authorityStart ||
+				p.authority != tc.authority || p.basePath != tc.basePath {
+				t.Fatalf("splitUpstream(%q) = {schemeEnd:%d authorityStart:%d authority:%q basePath:%q}, want {%d %d %q %q}",
+					tc.raw, p.schemeEnd, p.authorityStart, p.authority, p.basePath,
+					tc.schemeEnd, tc.authorityStart, tc.authority, tc.basePath)
+			}
+		})
+	}
+}
+
 // TestRedactUpstreamUserinfoSchemelessDirectly pins the redaction helper on
 // the schemeless boundary, including the no-userinfo and no-authority
 // shapes that must stay untouched.
@@ -412,6 +599,7 @@ func TestRedactUpstreamUserinfoSchemelessDirectly(t *testing.T) {
 		want string
 	}{
 		{"//alice:pw%4@api.internal/v1", "//***@api.internal/v1"},
+		{"//alice:pw%4@api.internal/http://mirror/v1", "//***@api.internal/http://mirror/v1"},
 		{"//alice@host/base", "//***@host/base"},
 		{"//@host/base", "//***@host/base"},
 		{"//host/base", "//host/base"},

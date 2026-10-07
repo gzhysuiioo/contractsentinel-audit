@@ -724,15 +724,33 @@ type upstreamParts struct {
 // authority/base-path boundaries; schemeEnd stays -1 so the scheme check
 // still rejects it and joinUpstream (which only runs on validated configs)
 // can never reach it.
+//
+// The leading "//" is decided before any "://" is searched for: once an
+// address starts with "//" it is protocol-relative, and a later "://" is
+// path text inside the base path (e.g. "//host/http://mirror/v1"), never a
+// scheme separator. Searching the whole string first would let that inner
+// marker hijack the boundaries, swallowing the leading "//", the
+// credentials and the real host into the would-be scheme and leaving the
+// credential redactors with no authority to hide. For a value that does not
+// begin with "//", the "://" marker must still be a genuine scheme
+// separator — the scheme is everything before it, and a scheme cannot
+// contain a slash — so a marker reached only after a '/' (a ":/" inside a
+// path) is not taken as one either.
 func splitUpstream(raw string) upstreamParts {
 	p := upstreamParts{raw: raw, schemeEnd: -1}
-	if i := strings.Index(raw, "://"); i >= 0 {
-		p.schemeEnd = i
-		p.authorityStart = i + 3
-	} else if strings.HasPrefix(raw, "//") {
+	switch {
+	case strings.HasPrefix(raw, "//"):
+		// Protocol-relative spelling: the authority starts at the leading
+		// "//" and stays there even when the base path later contains
+		// "http://" or "https://" text. schemeEnd stays -1 ("no scheme").
 		p.authorityStart = 2
-	} else {
-		return p
+	default:
+		if i := strings.Index(raw, "://"); i >= 0 && strings.IndexByte(raw[:i], '/') < 0 {
+			p.schemeEnd = i
+			p.authorityStart = i + 3
+		} else {
+			return p
+		}
 	}
 	tail := raw[p.authorityStart:]
 	if j := strings.IndexByte(tail, '/'); j >= 0 {
