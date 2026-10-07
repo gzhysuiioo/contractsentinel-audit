@@ -724,15 +724,32 @@ type upstreamParts struct {
 // authority/base-path boundaries; schemeEnd stays -1 so the scheme check
 // still rejects it and joinUpstream (which only runs on validated configs)
 // can never reach it.
+//
+// The leading-"//" spelling is decided first, before any search for "://":
+// the scheme separator must precede the authority marker, so a "://" that
+// merely appears later in the address is path text, never a scheme. Reading
+// the first "://" anywhere would mis-split
+// "//alice:pw%4@api.internal/http://mirror/v1" as "http" plus an authority
+// of "//mirror" — the base-path slash would become the authority boundary,
+// the userinfo would vanish into the path and its credentials would pass
+// unredacted into the diagnostic. Checking the leading marker first keeps a
+// schemeless address schemeless no matter what its base path contains.
 func splitUpstream(raw string) upstreamParts {
 	p := upstreamParts{raw: raw, schemeEnd: -1}
-	if i := strings.Index(raw, "://"); i >= 0 {
+	switch {
+	case strings.HasPrefix(raw, "//"):
+		// Protocol-relative spelling: no scheme, the authority marker starts
+		// the address. Decided before the "://" search so scheme text inside
+		// the base path (e.g. ".../http://mirror/v1") cannot be mistaken for
+		// the separator; schemeEnd stays -1 and the scheme check rejects it.
+		p.authorityStart = 2
+	default:
+		i := strings.Index(raw, "://")
+		if i < 0 {
+			return p
+		}
 		p.schemeEnd = i
 		p.authorityStart = i + 3
-	} else if strings.HasPrefix(raw, "//") {
-		p.authorityStart = 2
-	} else {
-		return p
 	}
 	tail := raw[p.authorityStart:]
 	if j := strings.IndexByte(tail, '/'); j >= 0 {
