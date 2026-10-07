@@ -5,6 +5,7 @@ package contractsentinel
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -705,6 +706,56 @@ func splitUpstream(raw string) upstreamParts {
 	return p
 }
 
+// redactUpstream returns raw with any userinfo hidden for display in a
+// failure reason: every byte of the authority before its last '@' — the
+// username and an optional password, however they are spelled — is replaced
+// by the single token "***", while the '@' that separates the userinfo from
+// the host stays, so the missing or malformed host after it stays visible
+// exactly as configured. The boundary is the same one splitUpstream uses to
+// locate the host: the authority runs from after "://" to the first path
+// slash, and only an '@' inside it can be the userinfo separator, so an '@'
+// in the base path is left untouched and several '@' signs hide as one
+// span up to the last one. The hiding is decided purely on the raw bytes:
+// nothing is percent-decoded or normalized, so an encoded password such as
+// "p%40ss" can never surface decoded, a password containing a colon or its
+// own percent encoding is hidden together with the username, and even an
+// empty username ("https://@host"), an empty password ("https://u:@host")
+// or an empty span between two '@' signs redacts the whole span rather than
+// leaving a name behind. An address without an '@' in the authority is
+// returned byte for byte, so diagnostics that previously showed no address
+// gain none and diagnostics that showed an address keep its exact wording.
+func redactUpstream(raw string) string {
+	p := splitUpstream(raw)
+	if p.schemeEnd < 0 {
+		return raw
+	}
+	k := strings.LastIndexByte(p.authority, '@')
+	if k < 0 {
+		return raw
+	}
+	at := p.schemeEnd + 3 + k // absolute position of the userinfo separator
+	return raw[:p.schemeEnd+3] + "***" + raw[at:]
+}
+
+// upstreamParseError renders a url.Parse failure against raw without ever
+// echoing the configured credentials: url.Parse wraps its errors as
+// parse "<full URL>": <detail>, so reproducing its *url.Error wording with
+// the URL run through redactUpstream keeps the existing diagnostic —
+// including the quoted address — byte for byte when the address carried no
+// userinfo, and shows parse "https://***@host/..." when it did. The detail
+// after the colon is the parser's report on a single offending token (a bad
+// escape, a bad host character, the bad port) or a fixed grammar string
+// ("missing ']' in host", "net/url: invalid userinfo"); parseAuthority
+// works on the span after the last '@' and never quotes userinfo bytes, so
+// the detail cannot carry credentials.
+func upstreamParseError(raw string, err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Sprintf("%s %q: %s", uerr.Op, redactUpstream(raw), uerr.Err)
+	}
+	return err.Error()
+}
+
 func validateUpstream(raw, loc, id string) *Failure {
 	if strings.ContainsAny(raw, "?#") {
 		return failuref("invalid_config", "%s (id %q): upstream must not contain a query string or fragment", loc, id)
@@ -737,7 +788,12 @@ func validateUpstream(raw, loc, id string) *Failure {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %v", loc, id, err)
+		// upstreamParseError keeps url.Parse's wording but quotes the address
+		// through redactUpstream, so a parse failure (e.g. an invalid escape
+		// in the userinfo or base path) cannot carry the configured
+		// credentials into the reason while a credential-free address keeps
+		// its exact existing message.
+		return failuref("invalid_config", "%s (id %q): upstream is not a valid URL: %s", loc, id, upstreamParseError(raw, err))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return failuref("invalid_config", "%s (id %q): upstream must be an absolute http or https URL", loc, id)
@@ -769,7 +825,9 @@ func validateUpstream(raw, loc, id string) *Failure {
 // Like the bracket rules this is a content error in a syntactically valid
 // JSON document — the reason names the route's 1-based position, its id and
 // the upstream field and says the upstream is missing a host, never that
-// the JSON is broken or that an IPv6 literal needs brackets.
+// the JSON is broken or that an IPv6 literal needs brackets. The address
+// quoted in the reason passes through redactUpstream, so the example above
+// is shown as "https://***@:8443/v1" rather than with its userinfo.
 func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
@@ -780,7 +838,7 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 	}
 	return failuref("invalid_config",
 		"%s: upstream %q is missing a host: the address must carry a non-empty host before any port (e.g. \"http://example.com:8080/base\"); a port cannot serve as the host, and userinfo or a base path cannot fill the host in either; no default host is added",
-		routeLabel(loc, id), p.raw)
+		routeLabel(loc, id), redactUpstream(p.raw))
 }
 
 // validateUpstreamPortRange enforces the TCP port range on an explicitly
@@ -1038,10 +1096,14 @@ func invalidBracketedHost(label, literal string) *Failure {
 // untouched, and the colons in userinfo or the base path are never
 // inspected: only hostPort — the authority after the last '@' and before
 // the first '/' according to the shared splitUpstream boundaries — is
-// considered. Like the bracketed-host rule this is a content error in a
-// syntactically valid JSON document, never a JSON parse failure, and it is
-// decided on the raw bytes before url.Parse so the wording cannot regress to
-// that parser's generic "invalid port" error.
+// considered. The full address quoted in the reason is the redacted form
+// from redactUpstream, so a route like "https://u:p@api:internal:8080/b"
+// is shown as "https://***@api:internal:8080/b" while the separately
+// quoted hostPort needs no redacting (it starts after the last '@').
+// Like the bracketed-host rule this is a content error in a syntactically
+// valid JSON document, never a JSON parse failure, and it is decided on the
+// raw bytes before url.Parse so the wording cannot regress to that parser's
+// generic "invalid port" error.
 func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	if p.schemeEnd < 0 {
 		return nil // no scheme: the generic absolute-URL check reports this
@@ -1079,7 +1141,7 @@ func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
 	}
 	return failuref("invalid_config",
 		"%s: upstream %q has an unbracketed host part %q with more than one colon: a host without square brackets may contain at most the one colon separating it from its port (e.g. \"example.com:8080\"); an IPv6 literal must be enclosed in brackets (e.g. \"[2001:db8::1]:8080\") and the host and port are never guessed apart",
-		label, p.raw, hostPort)
+		label, redactUpstream(p.raw), hostPort)
 }
 
 // invalidBracketedHostShape builds the content error for a bracketed host
@@ -1312,8 +1374,11 @@ func prefixMatch(prefix, path string) bool {
 // route selection.
 func joinUpstream(route *Route, path, target string) (string, *Failure) {
 	if _, err := url.Parse(route.Upstream); err != nil {
-		// Config validation already rejected this.
-		return "", failuref("invalid_config", "route %q has an invalid upstream: %v", route.ID, err)
+		// Config validation already rejected this. The parse error keeps
+		// url.Parse's wording with a redacted address, so a bypassed
+		// validation still cannot write this route's userinfo into a
+		// failure reason.
+		return "", failuref("invalid_config", "route %q has an invalid upstream: %s", route.ID, upstreamParseError(route.Upstream, err))
 	}
 
 	var remainder string
