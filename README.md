@@ -186,7 +186,7 @@ go run ./cmd/contractsentinel audit --input audit-input.json --store ./reports
 请分清输出中的两个标识：
 
 - **`artifact.hash`（artifactHash）** 绑定 ABI、字节码和 source 字符串的**内容**，合约名称不参与。同一份产物内容无论出现在哪份报告里，这个哈希都相同；findings 中的 `artifactHash` 与它一致。
-- **`reportId`** 是**整份报告**的内容寻址标识（产物哈希、名称、全部规则定义、每条规则的状态与版本、全部 findings 共同决定）。读回报告时用它，而不是用 artifactHash。
+- **`reportId`** 是**整份报告**的内容寻址标识：除产物哈希外还绑定产物**名称**、全部规则定义、每条规则的状态与版本、每条说明以及全部 findings。读回报告时用它，而不是用 artifactHash。规则与 findings 的**排列顺序不参与**标识计算（计算前按规则标识排序），所以仅调整排列的再次提交得到**同一个** `reportId`——见下文“仅调整排列后再次提交”。
 
 可以看到：`reentrancy-guard` 是带反例说明的唯一 `发现缺陷`，其证据就是提交时的原始 note；`solvency-symbolic` 仍是 `工具缺失`（版本 `0.9.3`，说明保留在规则结果中），不进 `findings`；`owner-only-withdraw` 为 `通过` 且无 note。
 
@@ -200,12 +200,211 @@ go run ./cmd/contractsentinel report \
   --id a6fa091bc2bb94a56453b3d58a190ff2c17c7023b7d2fd0600ffccccb3b13b34
 ```
 
-读回的是同一份完整报告 JSON（与提交成功时逐字段相同，不会被重新解释）。其中可以直接核对每条规则的**状态、版本**以及缺陷证据，例如：
+读回的是归档保存的同一份完整报告 JSON，不会被重新解释：它与**首次写入该标识归档的那次提交**的成功输出逐字段相同。这一保证的适用边界是“同一份归档内容”——如果之后只把规则或 checks 记录换个排列再次提交，新提交仍算出**同一个** `reportId`，其成功输出的排列跟随新提交的规则顺序，而读回仍保持首次归档的排列。这是正常行为，不是归档被覆盖，也不是结论改变；下一节给出可以照着运行的完整示例。其中可以直接核对每条规则的**状态、版本**以及缺陷证据，例如：
 
 - `reentrancy-guard`：`"version": "1.4.2"`、`"status": "发现缺陷"`，note 为反例原文；
 - `owner-only-withdraw`：`"version": "2.1.0"`、`"status": "通过"`；
 - `solvency-symbolic`：`"version": "0.9.3"`、`"status": "工具缺失"`，note 说明引擎缺失；
 - `findings` 中只有一条，归属 `reentrancy-guard` / 版本 `1.4.2` / 产物哈希 `0cdb8997…3a8ca7`，`evidence` 是上面的完整反例说明——而不是仅仅一个缺陷计数。
+
+### 完整离线示例：仅调整排列后再次提交（报告标识不变）
+
+同一份审计结论可能因收集渠道不同而以不同的规则排列、checks 排列反复提交。这是正常用法：**报告标识不受排列影响**，仅调整排列的各次提交都得到同一个 `reportId`；但 `audit` 成功输出里的规则与缺陷排列跟随**本次提交**的规则顺序，而 `report` 读回保持**首次归档**的排列。看到这两处排列不同，不等于归档被后来的提交覆盖，也不等于任何一条检查结论改变。下面用两份完整输入演示，全部离线运行。
+
+两份提交审计**同一产物**（`abi`、`bytecode`、`source` 与上文相同，产物哈希仍是 `0cdb8997…3a8ca7`），使用**同样的三条带版本规则**：`reentrancy-guard` `1.4.2` 与 `owner-only-withdraw` `2.1.0` 发现缺陷，`solvency-symbolic` `0.9.3` 通过并带一条说明。两份输入除排列外内容逐字一致：
+
+- `order-a.json`：规则顺序 reentrancy-guard、owner-only-withdraw、solvency-symbolic；checks 顺序 solvency-symbolic、owner-only-withdraw、reentrancy-guard（与规则顺序不同）。
+- `order-b.json`：规则顺序 solvency-symbolic、owner-only-withdraw、reentrancy-guard；checks 顺序 reentrancy-guard、solvency-symbolic、owner-only-withdraw（同样与自己的规则顺序不同）。
+
+`order-a.json` 的完整内容：
+
+```json
+{
+  "artifact": {
+    "name": "Vault",
+    "abi": "[{\"name\":\"withdraw\",\"type\":\"function\",\"stateMutability\":\"payable\"}]",
+    "bytecode": "0x6080604052",
+    "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Vault {\n    mapping(address => uint256) private balances;\n\n    function withdraw(uint256 amount) public {\n        (bool sent, ) = msg.sender.call{value: amount}(\"\");\n        require(sent, \"transfer failed\");\n        balances[msg.sender] -= amount;\n    }\n}\n"
+  },
+  "rules": [
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.4.2"
+    },
+    {
+      "id": "owner-only-withdraw",
+      "kind": "static",
+      "severity": "medium",
+      "invariant": "withdraw-owner-only",
+      "requiresABI": true,
+      "version": "2.1.0"
+    },
+    {
+      "id": "solvency-symbolic",
+      "kind": "symbolic",
+      "severity": "critical",
+      "invariant": "balances-cover-withdrawals",
+      "requiresABI": false,
+      "version": "0.9.3"
+    }
+  ],
+  "invariants": {},
+  "checks": [
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "solvency-symbolic",
+      "version": "0.9.3",
+      "status": "通过",
+      "note": "符号执行遍历了 withdraw 的全部可达状态，balances-cover-withdrawals 在每条路径上都成立。"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "owner-only-withdraw",
+      "version": "2.1.0",
+      "status": "发现缺陷",
+      "note": "反例：withdraw 没有任何调用者校验，非 owner 地址直接调用 withdraw 即可转走自己的余额，owner-only 约束不成立。"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "reentrancy-guard",
+      "version": "1.4.2",
+      "status": "发现缺陷",
+      "note": "反例：攻击者先存入 1 ether 后调用 withdraw；call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，此时 balances[msg.sender] 仍是旧值，同一笔余额被第二次转出。"
+    }
+  ]
+}
+```
+
+`order-b.json` 的完整内容（与 `order-a.json` 逐字段相同，仅 `rules` 与 `checks` 的排列不同）：
+
+```json
+{
+  "artifact": {
+    "name": "Vault",
+    "abi": "[{\"name\":\"withdraw\",\"type\":\"function\",\"stateMutability\":\"payable\"}]",
+    "bytecode": "0x6080604052",
+    "source": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract Vault {\n    mapping(address => uint256) private balances;\n\n    function withdraw(uint256 amount) public {\n        (bool sent, ) = msg.sender.call{value: amount}(\"\");\n        require(sent, \"transfer failed\");\n        balances[msg.sender] -= amount;\n    }\n}\n"
+  },
+  "rules": [
+    {
+      "id": "solvency-symbolic",
+      "kind": "symbolic",
+      "severity": "critical",
+      "invariant": "balances-cover-withdrawals",
+      "requiresABI": false,
+      "version": "0.9.3"
+    },
+    {
+      "id": "owner-only-withdraw",
+      "kind": "static",
+      "severity": "medium",
+      "invariant": "withdraw-owner-only",
+      "requiresABI": true,
+      "version": "2.1.0"
+    },
+    {
+      "id": "reentrancy-guard",
+      "kind": "static",
+      "severity": "high",
+      "invariant": "no-reentrant-withdraw",
+      "requiresABI": false,
+      "version": "1.4.2"
+    }
+  ],
+  "invariants": {},
+  "checks": [
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "reentrancy-guard",
+      "version": "1.4.2",
+      "status": "发现缺陷",
+      "note": "反例：攻击者先存入 1 ether 后调用 withdraw；call 在 balances 扣减前把控制权交给攻击合约的 receive，receive 重入 withdraw，此时 balances[msg.sender] 仍是旧值，同一笔余额被第二次转出。"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "solvency-symbolic",
+      "version": "0.9.3",
+      "status": "通过",
+      "note": "符号执行遍历了 withdraw 的全部可达状态，balances-cover-withdrawals 在每条路径上都成立。"
+    },
+    {
+      "artifactHash": "0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7",
+      "ruleId": "owner-only-withdraw",
+      "version": "2.1.0",
+      "status": "发现缺陷",
+      "note": "反例：withdraw 没有任何调用者校验，非 owner 地址直接调用 withdraw 即可转走自己的余额，owner-only 约束不成立。"
+    }
+  ]
+}
+```
+
+绑定值都是确定的、可直接使用：六条 checks 记录里的 `artifactHash` 都是
+`0cdb899734304f7aac91e746f5332c248c94bf0877ae37d0848409bd0b3a8ca7`，由上面 `abi`、`bytecode`、`source` 三个字符串内容实际算出（名称 `Vault` 不参与），不是占位符；每条记录的 `version` 与同名规则的版本一一对应。
+
+依次提交到**同一个报告目录**：
+
+```bash
+mkdir -p reports
+go run ./cmd/contractsentinel audit --input order-a.json --store ./reports
+go run ./cmd/contractsentinel audit --input order-b.json --store ./reports
+```
+
+两次都以退出状态 0 成功，stdout 各输出一份完整报告 JSON。两次成功输出的**报告标识相同**：
+
+```text
+reportId: 587afafd421dcd722b4a8909546e723062c8df0768780479f9bbafa48c28eb52
+```
+
+但两份成功输出中的规则排列与缺陷排列各自跟随本次提交的规则顺序：
+
+| 成功输出来源 | `rules` 排列 | `findings` 排列 |
+| --- | --- | --- |
+| 第一次（order-a.json） | reentrancy-guard → owner-only-withdraw → solvency-symbolic | reentrancy-guard → owner-only-withdraw |
+| 第二次（order-b.json） | solvency-symbolic → owner-only-withdraw → reentrancy-guard | owner-only-withdraw → reentrancy-guard |
+
+要点：
+
+- `audit` 输出的 `rules` 按**本次提交的规则数组顺序**排列；`findings` 只包含**发现缺陷**的规则，按本次规则顺序排列，**不按 checks 记录的顺序**——两份输入的 checks 排列都与各自输出的 findings 排列不同。
+- 缺陷始终归属各自的规则及版本，说明与证据一一对应：`reentrancy-guard` 的 finding 版本为 `1.4.2`、证据是重入反例原文；`owner-only-withdraw` 的 finding 版本为 `2.1.0`、证据是 owner 校验反例原文。记录在 checks 或 findings 中的位置变化不会把两条说明与证据互换。
+- 第二次提交时目录中已存在 `587afafd….json`：同标识内容再次提交**不会替换首次归档**，报告目录中始终只有这一份文件，字节与首次写入相同。
+
+用共同标识读回：
+
+```bash
+go run ./cmd/contractsentinel report \
+  --store ./reports \
+  --id 587afafd421dcd722b4a8909546e723062c8df0768780479f9bbafa48c28eb52
+```
+
+读回保持**首次归档**（order-a.json）的排列：`rules` 为 reentrancy-guard → owner-only-withdraw → solvency-symbolic，`findings` 为 reentrancy-guard → owner-only-withdraw。这与第二次成功输出的排列不同，但每条规则的状态、版本、说明和每条缺陷的证据逐字段一致——排列差异来自“读回保留归档顺序”，不是归档被第二次提交覆盖，也不是检查结论改变。
+
+也可以用 `diff` 核对：把同一标识同时作为基准与新报告（等价于比较两份仅排列不同的提交）：
+
+```bash
+go run ./cmd/contractsentinel diff \
+  --store ./reports \
+  --before 587afafd421dcd722b4a8909546e723062c8df0768780479f9bbafa48c28eb52 \
+  --after  587afafd421dcd722b4a8909546e723062c8df0768780479f9bbafa48c28eb52
+```
+
+`results` 三条全部是 `无变化`，`summary.noChange` 为 3，`beforeDefects` 与 `afterDefects` 都是 2。注意 `results` 始终**按规则标识排序**（owner-only-withdraw、reentrancy-guard、solvency-symbolic），这是比较结果自己的排列，与任一侧报告里规则或缺陷的保存顺序无关——只换排列仍显示无变化，但不能把比较结果的排序套用到完整报告上。
+
+#### 排列变化与内容变化的界限
+
+排列不影响报告标识，**任何文本内容变化**都会影响——哪怕只是一个尾随空格。把 `order-a.json` 中通过规则 `solvency-symbolic` 的说明末尾加一个空格（改为 `"…在每条路径上都成立。 "`），其余逐字不变，保存为 `order-c.json` 再提交：
+
+```bash
+go run ./cmd/contractsentinel audit --input order-c.json --store ./reports
+# reportId: 6ec4f89789d2c16e0108c0e6a476165b6febe74337b96eb02406f65a997f1198
+```
+
+得到的是**另一个报告标识**，报告目录中新增 `6ec4f897….json`，旧归档 `587afafd….json` 原样保留。两个标识分别读回时各自保留说明原文：旧报告的说明以 `成立。` 结尾（无尾随空格），新报告的说明以 `成立。 ` 结尾（有尾随空格），互不覆盖。对这两份报告做 `diff`，`solvency-symbolic` 一条为 `检查说明变化`，其余两条为 `无变化`。
+
+再次提醒本节的边界：`audit`、`report`、`diff` 只保存、读回和比较**已经得出的**检查结论；提交或比较本身不会启动符号执行、模糊测试或任何合约检查器。
 
 ### 读回失败条件（归档损坏，非零退出，不动归档）
 
