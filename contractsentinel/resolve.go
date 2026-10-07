@@ -693,32 +693,53 @@ func validatePrefixDirectCharacters(prefix, loc, id string) *Failure {
 // about where one part ends and the next begins:
 //
 //	scheme "://" [userinfo "@"] hostPort basePath
+//	"/"  "/"  [userinfo "@"] hostPort basePath
 //
-// authority runs from after "://" to the first path slash, and hostPort is
-// the authority after its last '@', so colons in userinfo or the base path
-// can never be read as part of an IPv6 host, while brackets, a port and a
-// zone stay inside hostPort.
+// The second line is the schemeless network-path spelling ("//host/path"):
+// it carries the same authority and base path but no scheme, and the reader
+// always rejects it rather than completing the scheme. authority runs from
+// after the "://" (or the leading "//") to the first path slash, and
+// hostPort is the authority after its last '@', so colons in userinfo or the
+// base path can never be read as part of an IPv6 host, while brackets, a
+// port and a zone stay inside hostPort.
 type upstreamParts struct {
 	raw       string // the upstream exactly as configured; every other field slices this
-	schemeEnd int    // index of the ':' in "://", or -1 when the scheme is absent
-	authority string // bytes between "://" and the first path slash (userinfo included)
+	schemeEnd int    // index of the ':' in "://", or -1 when the spelling has no scheme
+	authStart int    // byte index just past "://" (or the leading "//"); authority begins here
+	authority string // bytes up to the first path slash (userinfo included)
 	hostPort  string // authority after the last '@' (host plus optional port)
 	basePath  string // from the first path slash to the end, or ""
 }
 
 // splitUpstream applies the single boundary rule shared by the bracketed-host
-// check, the unbracketed-IPv6 check and the final join. It never rejects
-// anything on its own: a raw value without "://" comes back with schemeEnd
-// set to -1 and empty parts, leaving the generic absolute-URL check to
-// report it, exactly as the per-caller preamble used to.
+// check, the unbracketed-IPv6 check, the credential redaction and the final
+// join. It recognizes both an absolute spelling ("scheme://authority/path")
+// and a schemeless network-path spelling ("//authority/path"): the latter
+// keeps schemeEnd -1 with authStart set to 2, so the authority, hostPort and
+// base path read the same way and credential hiding works there too, while
+// the scheme check stays responsible for rejecting it instead of completing
+// http or https. It never rejects anything on its own: a raw value with
+// neither "://" nor a leading "//" comes back with schemeEnd -1 and empty
+// parts, leaving the generic absolute-URL check to report it, exactly as the
+// per-caller preamble used to.
 func splitUpstream(raw string) upstreamParts {
-	p := upstreamParts{raw: raw, schemeEnd: -1}
-	i := strings.Index(raw, "://")
-	if i < 0 {
+	p := upstreamParts{schemeEnd: -1}
+	p.raw = raw
+	var tail string
+	if i := strings.Index(raw, "://"); i >= 0 {
+		p.schemeEnd = i
+		p.authStart = i + 3
+		tail = raw[p.authStart:]
+	} else if strings.HasPrefix(raw, "//") {
+		// Schemeless network-path spelling: same authority and base path, no
+		// scheme. authStart alone marks the boundary; schemeEnd stays -1 so
+		// the validators keep treating it as "no scheme" and the final
+		// scheme check rejects it without ever guessing http or https.
+		p.authStart = 2
+		tail = raw[2:]
+	} else {
 		return p
 	}
-	p.schemeEnd = i
-	tail := raw[i+3:]
 	if j := strings.IndexByte(tail, '/'); j >= 0 {
 		p.authority = tail[:j]
 		p.basePath = tail[j:]
@@ -734,31 +755,43 @@ func splitUpstream(raw string) upstreamParts {
 	return p
 }
 
+// hasAddress reports whether splitUpstream recognized an address spelling
+// with an authority: an absolute "scheme://authority" or a schemeless
+// "//authority". When it is false the raw value is a relative reference and
+// authority, hostPort and basePath are empty, so every content check leaves
+// it for the generic absolute-URL rejection. schemeEnd alone cannot answer
+// this: a schemeless "//" spelling has no scheme but still carries an
+// authority whose credentials must be hidden and whose host and base path
+// keep their own diagnostics.
+func (p upstreamParts) hasAddress() bool {
+	return p.authStart > 0
+}
+
 // redactUpstreamUserinfo rewrites a raw upstream address for diagnostic
 // output: when the authority carries userinfo, the whole userinfo segment —
 // the username and the optional password, exactly as written, colons and
 // percent escapes included — is replaced by "***" while the '@' separating
 // it from the host is kept, so "https://user:p%40ss@:8443/v1" is reported
-// as "https://***@:8443/v1". The segment is never decoded and never
-// partially kept: a username-only userinfo, an empty password and a
+// as "https://***@:8443/v1" and the schemeless
+// "//user:p%40ss@host/v1" as "//***@host/v1". The segment is never decoded
+// and never partially kept: a username-only userinfo, an empty password and a
 // password carrying colons or percent escapes are all hidden whole. The
 // userinfo range follows the address's own splitUpstream boundaries —
-// everything before the last '@' of the authority (the part between "://"
-// and the first path slash) — so an '@' in the base path is never treated
-// as userinfo. An address without userinfo, or without a scheme and
-// authority at all, is returned unchanged, so existing diagnostics keep
-// their current text.
+// everything before the last '@' of the authority (the part after "://" or
+// the leading "//", up to the first path slash) — so an '@' in the base
+// path is never treated as userinfo. An address without userinfo, or without
+// an authority at all (a relative reference), is returned unchanged, so
+// existing diagnostics keep their current text.
 func redactUpstreamUserinfo(raw string) string {
 	p := splitUpstream(raw)
-	if p.schemeEnd < 0 {
+	if !p.hasAddress() {
 		return raw
 	}
 	k := strings.LastIndexByte(p.authority, '@')
 	if k < 0 {
 		return raw
 	}
-	start := p.schemeEnd + 3
-	return raw[:start] + "***" + raw[start+k:]
+	return raw[:p.authStart] + "***" + raw[p.authStart+k:]
 }
 
 // redactURLError renders a url.Parse failure for diagnostic output with the
@@ -787,32 +820,37 @@ func redactURLError(err error) string {
 
 // urlEscapeErrorFromUserinfo reports whether parseErr is the *url.Error a
 // url.Parse of rawURL failed with because a percent escape inside its
-// userinfo (the username or optional password between "://" and the
-// authority's last '@') is malformed. It replays net/url's parseAuthority
-// ordering exactly — host, then userinfo, then the base path — instead of
-// searching the reported fragment as a substring, which a truncated
-// fragment such as "%" or "%4" would match inside otherwise-legal escapes.
+// userinfo (the username or optional password before the authority's last
+// '@') is malformed. It replays net/url's parseAuthority ordering exactly —
+// host, then userinfo, then the base path — instead of searching the
+// reported fragment as a substring, which a truncated fragment such as "%"
+// or "%4" would match inside otherwise-legal escapes.
 //
 // The scheme is not judged here: credential redaction applies to every
-// scheme, so a non-http address with a bad userinfo escape never quotes
-// the credential fragment either; callers that only own the http/https
-// dedicated reason (invalidUpstreamUserinfoEscape) gate on the scheme
-// themselves. The probe follows the address's own splitUpstream boundaries
-// and requires userinfo:
+// spelling, so a non-http address or a schemeless "//..." address with a bad
+// userinfo escape never quotes the credential fragment either; callers that
+// only own the http/https dedicated reason
+// (invalidUpstreamUserinfoEscape) gate on the scheme themselves. The probe
+// follows the address's own splitUpstream boundaries and requires an
+// authority with userinfo:
 //
 //  1. parseErr must wrap url.EscapeError, the only error unescaping the
 //     username/password (encodeUserPassword mode) produces;
-//  2. the host, parsed on its own with the same scheme, must succeed —
-//     parseAuthority unescapes the host first, so any host-side failure
-//     (a host escape, a bad port or an IP-literal error) is the message
-//     url.Parse actually reports and keeps its existing wording;
+//  2. the host, parsed on its own against the same scheme spelling, must
+//     succeed — parseAuthority unescapes the host first, so any host-side
+//     failure (a host escape, a bad port or an IP-literal error) is the
+//     message url.Parse actually reports and keeps its existing wording;
 //  3. the userinfo is then parsed against a known-good host; the error its
-//     unescaping produces must be the very same EscapeError reported, so
-//     the decision cannot fire on a coincidentally equal fragment located
+//     unescaping produces must be the very same EscapeError reported, so the
+//     decision cannot fire on a coincidentally equal fragment located
 //     elsewhere (the grammar check validUserinfo runs first is covered: it
 //     yields "net/url: invalid userinfo", never an EscapeError).
 //
-// The base path is never probed: after a clean host and a failing userinfo
+// A schemeless "//" spelling has no real scheme, so both replays are run on
+// an "http://" base: net/url's parseAuthority stage is scheme-independent
+// (the scheme only decides the later port-strictness pass), which makes the
+// replay faithful for an address the reader will reject anyway. The base
+// path is never probed: after a clean host and a failing userinfo
 // parseAuthority has already returned, before setPath ever runs, so a path
 // escape cannot be the source even when it spells the same three bytes.
 func urlEscapeErrorFromUserinfo(rawURL string, parseErr error) bool {
@@ -825,20 +863,27 @@ func urlEscapeErrorFromUserinfo(rawURL string, parseErr error) bool {
 		return false
 	}
 	p := splitUpstream(rawURL)
-	if p.schemeEnd < 0 {
+	if !p.hasAddress() {
 		return false
 	}
 	k := strings.LastIndexByte(p.authority, '@')
 	if k < 0 {
 		return false // no userinfo: host and base-path escapes keep their wording
 	}
+	// The scheme prefix the replay probes are parsed with. A real scheme
+	// keeps its own spelling; a schemeless "//" address is replayed on an
+	// http:// base, whose authority parsing is identical at this stage.
+	prefix := rawURL[:p.authStart]
+	if p.schemeEnd < 0 {
+		prefix = "http://"
+	}
 	// Stage 1 of parseAuthority: the host alone, with the same scheme.
-	if _, err := url.Parse(rawURL[:p.schemeEnd+3] + p.hostPort); err != nil {
+	if _, err := url.Parse(prefix + p.hostPort); err != nil {
 		return false
 	}
 	// Stage 2: replay the userinfo stage against a trivially legal host;
 	// its path is "/", so the only possible failure is the credential's.
-	probe := rawURL[:p.schemeEnd+3] + p.authority[:k] + "@userinfo-escape-probe.invalid/"
+	probe := prefix + p.authority[:k] + "@userinfo-escape-probe.invalid/"
 	_, probeErr := url.Parse(probe)
 	if probeErr == nil {
 		return false
@@ -857,20 +902,26 @@ func urlEscapeErrorFromUserinfo(rawURL string, parseErr error) bool {
 // 1-based position, its id and the upstream field, shows the address with
 // the whole username and optional password replaced by "***" (the '@' and
 // the host, port and base path kept), and never repeats the malformed
-// fragment or any other credential byte. A non-http scheme returns nil so
-// it keeps the generic parse diagnostic; that path renders through
-// redactURLError, which still hides the credential fragment, it merely
-// keeps the standard "not a valid URL" wording rather than this one. Any
-// other url.Parse failure returns nil for the same reason.
+// fragment or any other credential byte. A spelling without an http/https
+// scheme — a different scheme or the rejected schemeless "//" form —
+// returns nil so it keeps the generic parse diagnostic; that path renders
+// through redactURLError, which still hides the credential fragment and
+// shows the address as "//***@host/...", it merely keeps the standard
+// "not a valid URL" wording rather than this one. Any other url.Parse
+// failure returns nil for the same reason.
 func invalidUpstreamUserinfoEscape(raw string, parseErr error, loc, id string) *Failure {
 	if !urlEscapeErrorFromUserinfo(raw, parseErr) {
 		return nil
 	}
 	// The dedicated, field-located reason is the http/https contract; other
-	// schemes fall through to the generic parse error (with the credential
-	// fragment still redacted by redactURLError) and are then rejected by the
-	// scheme check that already follows url.Parse.
+	// schemes and the schemeless "//" spelling fall through to the generic
+	// parse error (with the credential fragment still redacted by
+	// redactURLError) and are then rejected by the scheme check that already
+	// follows url.Parse.
 	p := splitUpstream(raw)
+	if p.schemeEnd < 0 {
+		return nil
+	}
 	if scheme := strings.ToLower(raw[:p.schemeEnd]); scheme != "http" && scheme != "https" {
 		return nil
 	}
@@ -954,8 +1005,8 @@ func validateUpstream(raw, loc, id string) *Failure {
 // shown with any userinfo hidden (redactUpstreamUserinfo), so the reason
 // cannot leak the configured credentials into a saved diagnostic.
 func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
-	if p.schemeEnd < 0 {
-		return nil // no scheme: the generic absolute-URL check reports this
+	if !p.hasAddress() {
+		return nil // relative reference: the generic absolute-URL check reports this
 	}
 	hostPort := p.hostPort
 	if hostPort != "" && hostPort[0] != ':' {
@@ -1006,8 +1057,8 @@ func validateUpstreamHostPresent(p upstreamParts, loc, id string) *Failure {
 // the join slices the raw upstream, so "00065535" reaches upstreamURL with
 // its leading zeros intact.
 func validateUpstreamPortRange(p upstreamParts, loc, id string) *Failure {
-	if p.schemeEnd < 0 {
-		return nil // no scheme: the generic absolute-URL check reports this
+	if !p.hasAddress() {
+		return nil // relative reference: the generic absolute-URL check reports this
 	}
 	port, ok := upstreamExplicitPort(p.hostPort)
 	if !ok || port == "" {
@@ -1087,8 +1138,8 @@ func portWithinTCPRange(port string) bool {
 // content error in a syntactically valid JSON document, never a JSON parse
 // failure.
 func validateUpstreamBasePathSpace(p upstreamParts, loc, id string) *Failure {
-	if p.schemeEnd < 0 {
-		return nil // no scheme: the generic absolute-URL check reports this
+	if !p.hasAddress() {
+		return nil // relative reference: the generic absolute-URL check reports this
 	}
 	if !strings.ContainsRune(p.basePath, ' ') {
 		return nil
@@ -1119,8 +1170,8 @@ func validateUpstreamBasePathSpace(p upstreamParts, loc, id string) *Failure {
 // and the rule is enforced here on the raw bytes rather than left to
 // url.Parse's parser strictness.
 func validateBracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
-	if p.schemeEnd < 0 {
-		return nil // no scheme: the generic absolute-URL check reports this
+	if !p.hasAddress() {
+		return nil // relative reference: the generic absolute-URL check reports this
 	}
 	hostPort := p.hostPort
 
@@ -1228,8 +1279,8 @@ func invalidBracketedHost(label, literal string) *Failure {
 // whole address, any userinfo is hidden first (redactUpstreamUserinfo), so
 // the diagnostic cannot leak the configured credentials.
 func validateUnbracketedUpstreamHost(p upstreamParts, loc, id string) *Failure {
-	if p.schemeEnd < 0 {
-		return nil // no scheme: the generic absolute-URL check reports this
+	if !p.hasAddress() {
+		return nil // relative reference: the generic absolute-URL check reports this
 	}
 	hostPort := p.hostPort
 	if hostPort == "" || strings.ContainsAny(hostPort, "[]") {

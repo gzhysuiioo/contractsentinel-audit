@@ -272,6 +272,44 @@ userinfo` 时问题在凭据，地址中 `@` 之前的内容整体为 `***`，�
 任何凭据片段；说 `not a valid URL` 并引用具体转义片段（如 `%zz`）时，
 问题在主机或基础路径，片段来自 `@` 之后，与凭据无关。
 
+**情况三：无协议的 `//` 开头地址。** 以 `//` 开头、没有协议的地址
+（协议相对地址）一律拒绝，不会自动补成 `http` 或 `https`；但拒绝理由
+引用地址时，凭据隐藏与有协议地址完全一致，地址只显示为
+`//***@主机/基础路径`。配置（第二条路由的密码 `pw%4` 是截断的非法转义）：
+
+```json
+{
+  "routes": [
+    {"id": "api",   "methods": ["GET"], "pathPrefix": "/api",    "upstream": "http://api.internal/v1"},
+    {"id": "admin", "methods": ["GET"], "pathPrefix": "/admin",  "upstream": "//alice:pw%4@api.internal/v1"}
+  ]
+}
+```
+
+请求（只命中第一条合法路由）：
+
+```json
+{"method": "GET", "target": "/api/items"}
+```
+
+标准输出为空，退出状态非零，标准错误为：
+
+```json
+{"code":"invalid_config","reason":"route 2 (id \"admin\"): upstream is not a valid URL: parse \"//***@api.internal/v1\": invalid URL escape in upstream userinfo (username or password hidden)"}
+```
+
+reason 仍定位从 1 开始的路由位置（route 2）、该路由合法非空的 id 与
+`upstream` 字段，问题归属用户信息且不引用其中的错误片段，地址只能显示
+为 `//***@api.internal/v1`，原始或解码后的用户名、密码在 reason 的任何
+位置都不出现；这份配置是合法 JSON，不会被说成语法损坏。凭据与主机或
+基础路径同时有问题时，错误选择顺序与有协议地址相同：
+`//alice:p%40ss@api.internal/%zz` 隐藏凭据但保留基础路径的
+`invalid URL escape "%zz"`；主机出错（如
+`//alice:secret@ho%zzst/`）同样保留主机诊断，不笼统改成密码错误；基础
+路径中的 `@` 只是路径字符，不扩大隐藏范围。即使地址的其余部分都合法
+（如 `//alice:secret@api.internal/v1`），该路由仍被拒绝，reason 为
+`upstream must be an absolute http or https URL`，且同样不泄露凭据。
+
 **修正后的成功结果。** 把基础路径改为合法地址：
 
 ```json
