@@ -196,6 +196,148 @@ go test ./...
   （方法必填、目标路径必须以 `/` 开头），不归为类型错误。
 - `route_conflict` / `route_not_found`：见上。
 
+### 上游地址带用户名或密码：失败诊断如何隐藏凭据
+
+`upstream` 可以携带用户信息，形如 `scheme://用户名:密码@主机/基础路径`
+（密码可省略；`resolve` 全程离线，主机不需要真实存在，也不会发起连接）。
+当某条路由的 upstream 不合法、整份配置返回 `invalid_config` 时，标准错误
+JSON 的 `reason` 会引用这个地址，引用时遵守一条固定的隐藏规则：
+
+- authority 中 `@` 之前的整段用户信息——用户名和可选密码，连同其中的
+  冒号、百分号编码——**整体替换为 `***`**，既不解码也不部分保留；
+- 分隔用的 `@` 以及后面的主机、端口、基础路径原样保留；
+- reason 的其他文字也不会再次引用用户名、密码或其中的出错片段。
+
+因此诊断可以安全保存或转交。区分“凭据本身错误”与“地址其他部分错误”，
+看 reason 给出的实际原因，而不是地址中有没有 `%`：
+
+- **凭据里的非法百分号转义**使用专用原因（“invalid percent escape in
+  its userinfo”），只说明 `@` 之前的用户名或密码存在没有跟上两位十六
+  进制数字的 `%`，绝不会把出错片段再写一遍；
+- **主机或基础路径的错误**保留各自原有的具体原因：主机错误说主机
+  （缺少主机、IPv6 括号问题等），路径中的非法转义以通用 URL 解析错误
+  报告并保留 `invalid URL escape "%zz"` 这样的片段——这个 `%zz` 位于
+  主机或路径中，不是密码的一部分，不能据此判断为凭据错误；
+- 用户信息的边界是 authority（`://` 之后到第一个路径 `/` 之间）中
+  **最后一个 `@`**：基础路径里单独出现的 `@` 属于路径内容，不作为
+  用户名或密码的分隔位置。
+
+#### 情况一：密码中的百分号转义不完整
+
+以下配置共两条路由；请求只会命中第一条合法路由，第二条路由的 upstream
+为 `https://reader:pw%4@api.internal/v1`，密码片段 `pw%4` 中的 `%4`
+不是完整的百分号转义（`%` 后必须紧跟两位十六进制数字）。
+
+配置文件：
+
+```json
+{
+  "routes": [
+    {"id": "api",    "methods": ["GET"], "pathPrefix": "/api",    "upstream": "http://api.internal/v1"},
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:pw%4@api.internal/v1"}
+  ]
+}
+```
+
+请求：
+
+```json
+{"method":"GET","target":"/api/items/9?a=1&a="}
+```
+
+运行结果（退出状态为 1，标准输出为空，标准错误为一行 JSON）：
+
+```json
+{"code":"invalid_config","reason":"route 2 (id \"reader\"): upstream \"https://***@api.internal/v1\" contains an invalid percent escape in its userinfo: the username or password before the '@' carries a '%' that is not followed by two hexadecimal digits, so the address cannot be parsed; write a literal percent as %25 and percent-encode every other byte as two hex digits. The configured username and password are not repeated — shown together as \"***\" — while the '@', host, port and base path stay unchanged"}
+```
+
+要点：
+
+- reason 定位到从 1 开始的路由位置（`route 2`）、路由 id（`"reader"`）
+  与 `upstream` 字段，并说明问题是凭据中存在非法百分号转义；
+- 地址展示为 `https://***@api.internal/v1`：用户名 `reader` 与密码
+  整体被 `***` 替换，`@`、主机与基础路径 `/v1` 保留；整段 reason 中
+  不会再次出现 `pw%4`、`%4` 或用户名的任何字节；
+- 即使出错路由不会被当前请求选中，只要配置中存在一条这样的路由，
+  `ParseConfig` 就在读取时拒绝**整份配置**、不返回可用对象——配置
+  在读取 stdin 之前即校验完毕，与请求命中哪条路由无关。
+
+修正方法是把字面百分号写成 `%25`（密码 `pw%4` 按字面写应作
+`pw%254`），或补全/更正转义。
+
+#### 情况二：凭据合法，基础路径含非法转义
+
+把密码换成合法的百分号编码（`p%40ss` 解码后是 `p@ss`），非法转义
+改放到基础路径中：upstream 为
+`https://reader:p%40ss@api.internal/%zz`。
+
+配置文件：
+
+```json
+{
+  "routes": [
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:p%40ss@api.internal/%zz"}
+  ]
+}
+```
+
+请求：
+
+```json
+{"method":"GET","target":"/reader/books/7?a=1&a="}
+```
+
+运行结果（退出状态为 1，标准输出为空）：
+
+```json
+{"code":"invalid_config","reason":"route 1 (id \"reader\"): upstream is not a valid URL: parse \"https://***@api.internal/%zz\": invalid URL escape \"%zz\""}
+```
+
+这里仍然隐藏凭据（reason 中找不到 `reader` 或 `p%40ss`），但保留了
+路径转义错误的真实原因：`%zz` 位于基础路径，诊断中的
+`invalid URL escape "%zz"` 指向的是路径，**不能把它解释为密码错误**。
+主机部分的错误同理，按主机自身的原因报告，例如把非法转义放到主机中
+（upstream `https://reader:p%40ss@ho%zzst.internal/`）时，reason 为
+`route 1 (id "reader"): upstream is not a valid URL: parse "https://***@ho%zzst.internal/": invalid URL escape "%zz"`——
+片段 `%zz` 属于主机；又如 `https://reader:p%40ss@:8443/v1` 缺少主机
+时，reason 引用的地址为 `https://***@:8443/v1`，原因明确是
+“is missing a host”，而不是 JSON 解析失败或 IPv6 括号问题。
+
+基础路径中的 `@` 是普通路径字符：upstream
+`https://reader:p%40ss@api.internal/v1@x%zz` 报错时展示为
+`parse "https://***@api.internal/v1@x%zz": invalid URL escape "%zz"`，
+`/v1@x%zz` 整段保留，其中的 `@` 不会被当作凭据分隔符，凭据仍只隐藏
+authority 中最后一个 `@` 之前的部分。
+
+#### 修正地址后的成功结果
+
+把基础路径改为合法的 `/v1`（凭据 `reader:p%40ss` 保持不变）：
+
+```json
+{
+  "routes": [
+    {"id": "reader", "methods": ["GET"], "pathPrefix": "/reader", "upstream": "https://reader:p%40ss@api.internal/v1"}
+  ]
+}
+```
+
+对同一个请求 `{"method":"GET","target":"/reader/books/7?a=1&a="}`，
+退出状态为 0、标准错误为空，标准输出为：
+
+```json
+{"routeId":"reader","upstreamURL":"https://reader:p%40ss@api.internal/v1/books/7?a=1&a="}
+```
+
+隐藏只作用于**失败诊断**：配置合法时，解析结果中的 `upstreamURL`
+仍逐字节保留原始用户名、密码及其百分号编码（`p%40ss` 不会被解码成
+`p@ss`），并照现有规则拼接——去掉 `/reader` 前缀后的剩余路径接到
+基础路径 `/v1` 之后，连接处恰好保留一个 `/`，原始查询串（重复参数、
+空值与顺序）逐字节保留；路由若配置了 `queryTransforms`，仍按前述
+规则改写查询串。情况一修正后的 `https://reader:pw%254@api.internal/v1`
+同样解析成功，`upstreamURL` 中保留的就是 `reader:pw%254`。通过校验
+的配置用 `encoding/json` 保存时，upstream 中的用户名、密码与百分号
+编码也原样写回，重新读取后解析结果不变（见下一节）。
+
 ### 保存配置为 JSON 并重新读取
 
 前面介绍的 `ParseConfig` 是读取配置的完整校验入口；同一份通过校验的
