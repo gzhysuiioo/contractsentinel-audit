@@ -312,3 +312,31 @@ func TestCLIAuditDuplicateExistingArchiveFailsAndKeepsFile(t *testing.T) {
 		t.Fatal("failed audit must leave the corrupt archive untouched")
 	}
 }
+
+// --- report：合法大数扩展值不能使重复成员错误丢掉缺陷记录的规则归属 ---
+
+func TestCLIReportDuplicateFindingBigNumberStillNamesRule(t *testing.T) {
+	bin := auditBinary(t)
+	work := t.TempDir()
+	store := filepath.Join(work, "reports")
+	id := auditOneReport(t, bin, work, store)
+	injectArchiveDuplicate(t, store, id,
+		`"ruleId":"rule-defect"`,
+		`"ruleId":"rule-defect","ruleId":"rule-defect"`)
+	// 顶层扩展里的合法大数（超出 float64）不得改变归档损坏的归属信息。
+	injectArchiveDuplicate(t, store, id,
+		`{"reportId"`,
+		`{"extra":{"tolerance":1e1000},"reportId"`)
+
+	stdout, stderr, code := runCLIReport(t, bin, store, id)
+	assertDupFailure(t, stdout, stderr, code, id, `"ruleId"`, `finding for rule "rule-defect"`, "findings[0]")
+
+	// 原文件必须原样保留。
+	data, err := os.ReadFile(filepath.Join(store, id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"ruleId":"rule-defect","ruleId":"rule-defect"`) {
+		t.Fatal("failed report read must leave the corrupt archive untouched")
+	}
+}

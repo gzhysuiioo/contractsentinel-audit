@@ -2,6 +2,7 @@
 package contractsentinel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -125,12 +126,26 @@ func locateDupObject(data []byte, path []jsonPathStep) string {
 
 // arrayEntryID extracts the identifying field of one rules/checks/findings
 // array element. Rules carry their own id; check and finding records name the
-// rule via ruleId. The unmarshal is last-key-wins for repeated members, which
-// is fine here: identification only needs some id carried by the offending
-// entry, and the index already makes it unambiguous.
+// rule via ruleId. Only the entry's own formal member counts: the name is
+// matched byte for byte after JSON string decoding (an escaped spelling of
+// the agreed name still denotes the field, while case variants and
+// whitespace-padded names stay extension data), the value must be a JSON
+// string, and no other entry's identifier can stand in. The unmarshal is
+// last-key-wins for repeated members, which is fine here: identification only
+// needs some id carried by the offending entry, and the index already makes
+// it unambiguous.
+//
+// Numbers decode as json.Number rather than float64: a legal oversized
+// exponent such as 1e1000 anywhere in the document — at the top level, in
+// another record, or inside extension content of the offending entry itself —
+// overflows float64 and would fail the whole-document decode, silently
+// dropping the rule attribution even though the number is ordinary extension
+// data that every other check already tolerates.
 func arrayEntryID(data []byte, field string, index int) string {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := dec.Decode(&root); err != nil {
 		return ""
 	}
 	arr, ok := root[field].([]any)

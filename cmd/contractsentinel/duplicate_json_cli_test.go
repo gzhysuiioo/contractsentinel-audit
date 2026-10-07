@@ -279,3 +279,56 @@ func TestCLIAuditLegalReportIDUnchanged(t *testing.T) {
 		t.Fatalf("legal false must still register exactly one defect: %+v", report.Findings)
 	}
 }
+
+// --- 合法大数扩展值（如 1e1000）不能使重复成员错误丢掉规则归属 ---
+
+func TestCLIAuditDuplicateRuleBigNumberExtensionStillNamesRule(t *testing.T) {
+	bin := auditBinary(t)
+	work := t.TempDir()
+	input := writeInput(t, work, "bad.json", `{
+		`+cliDupArtifact+`,
+		"rules": [
+			{"id":"rule-a","kind":"static","severity":"low","invariant":"a","version":"1"},
+			{"id":"rule-b","kind":"static","severity":"high","severity":"low","invariant":"b","version":"1"}
+		],
+		"extension": {"tolerance": 1e1000, "deep": [[2E+999]]}
+	}`)
+	store := filepath.Join(work, "nested", "missing-store")
+
+	// 超出 float64 的合法大数只是扩展数据：重复成员仍被拒绝，且错误
+	// 继续点名出错规则与数组位置，报告目录不被创建。
+	auditMustRejectDuplicate(t, bin, input, store, `"severity"`, `rule "rule-b"`, "rules[1]")
+	if _, err := os.Stat(store); !os.IsNotExist(err) {
+		t.Fatalf("rejected submission must not create the report store: %v", err)
+	}
+}
+
+// --- 没有重复成员时，大数扩展值继续作为扩展信息忽略，报告标识不变 ---
+
+func TestCLIAuditLegalBigNumberExtensionIgnored(t *testing.T) {
+	bin := auditBinary(t)
+	work := t.TempDir()
+	store := filepath.Join(work, "reports")
+
+	plain := writeInput(t, work, "plain.json",
+		cliDupInput(`"invariants":{"inv":false}`))
+	stdout, stderr, code := runCLIAudit(t, bin, plain, store)
+	if code != 0 {
+		t.Fatalf("plain legal input must succeed: %s", stderr)
+	}
+	wantID := decodeReport(t, stdout).ReportID
+
+	withBig := writeInput(t, work, "big.json",
+		cliDupInput(`"invariants":{"inv":false},"extension":{"tolerance":1e1000,"deep":[[2E+999]]}`))
+	stdout, stderr, code = runCLIAudit(t, bin, withBig, store)
+	if code != 0 {
+		t.Fatalf("a legal oversized exponent is extension data, not an error: %s", stderr)
+	}
+	got := decodeReport(t, stdout)
+	if got.ReportID != wantID {
+		t.Fatalf("extension content must not change the report id:\n got %s\nwant %s", got.ReportID, wantID)
+	}
+	if len(got.Findings) != 1 {
+		t.Fatalf("legal false must still register exactly one defect: %+v", got.Findings)
+	}
+}
