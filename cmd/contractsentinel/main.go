@@ -90,21 +90,39 @@ func runReport(args []string) {
 	printReport("report", report)
 }
 
-// runDiff compares two stored reports and prints the diff JSON.
+// runDiff compares two stored reports and prints the diff JSON. An optional
+// --rule flag narrows the comparison to a single rule id, matched verbatim.
 func runDiff(args []string) {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	store := fs.String("store", "", "report store directory")
 	before := fs.String("before", "", "baseline report id")
 	after := fs.String("after", "", "new report id")
+	rule := fs.String("rule", "", "only compare the rule with this exact id")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
 	if *store == "" || *before == "" || *after == "" {
-		fmt.Fprintln(os.Stderr, "usage: contractsentinel diff --store <dir> --before <id> --after <id>")
+		fmt.Fprintln(os.Stderr, "usage: contractsentinel diff --store <dir> --before <id> --after <id> [--rule <rule id>]")
 		os.Exit(2)
 	}
-	diff, err := contractsentinel.DiffStore(*store, *before, *after)
+	ruleGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "rule" {
+			ruleGiven = true
+		}
+	})
+	var diff contractsentinel.DiffResult
+	var err error
+	if ruleGiven {
+		if *rule == "" {
+			fmt.Fprintln(os.Stderr, "diff: --rule requires a non-empty rule id")
+			os.Exit(2)
+		}
+		diff, err = contractsentinel.DiffStoreRule(*store, *before, *after, *rule)
+	} else {
+		diff, err = contractsentinel.DiffStore(*store, *before, *after)
+	}
 	if err != nil {
 		fail("diff", err)
 	}

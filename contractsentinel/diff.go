@@ -107,6 +107,74 @@ func DiffStore(dir, beforeID, afterID string) (DiffResult, error) {
 	return DiffReports(before, after), nil
 }
 
+// DiffStoreRule loads both reports from the store and compares only the rule
+// with the given id. Both reports are fully verified before any comparison
+// happens, exactly as in DiffStore; the rule id must match exactly, including
+// case and surrounding spaces. The store is only read, never modified.
+func DiffStoreRule(dir, beforeID, afterID, ruleID string) (DiffResult, error) {
+	if ruleID == "" {
+		return DiffResult{}, errInvalid("rule id must not be empty")
+	}
+	before, err := LoadReportForDiff(dir, beforeID)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	after, err := LoadReportForDiff(dir, afterID)
+	if err != nil {
+		return DiffResult{}, err
+	}
+	return DiffReportsRule(before, after, ruleID)
+}
+
+// DiffReportsRule compares two verified reports restricted to one rule id.
+// The classification of the selected rule is identical to the full diff; the
+// summary counts only that rule, and the defect totals become 0 or 1 each,
+// reflecting whether this rule has a real defect record in that report.
+func DiffReportsRule(before, after Report, ruleID string) (DiffResult, error) {
+	if ruleID == "" {
+		return DiffResult{}, errInvalid("rule id must not be empty")
+	}
+	full := DiffReports(before, after)
+	for _, entry := range full.Results {
+		if entry.RuleID != ruleID {
+			continue
+		}
+		filtered := DiffResult{
+			Before:              full.Before,
+			After:               full.After,
+			ArtifactNameChanged: full.ArtifactNameChanged,
+			ArtifactHashChanged: full.ArtifactHashChanged,
+			Results:             []RuleDiff{entry},
+		}
+		switch entry.Change {
+		case ChangeNewDefect:
+			filtered.Summary.NewDefects = 1
+		case ChangeResolvedDefect:
+			filtered.Summary.ResolvedDefects = 1
+		case ChangeStatusChanged:
+			filtered.Summary.StatusChanges = 1
+		case ChangeNoteChanged:
+			filtered.Summary.NoteChanges = 1
+		case ChangeNoChange:
+			filtered.Summary.NoChange = 1
+		case ChangeRuleAdded:
+			filtered.Summary.AddedRules = 1
+		case ChangeRuleRemoved:
+			filtered.Summary.RemovedRules = 1
+		case ChangeRuleChanged:
+			filtered.Summary.ChangedRules = 1
+		}
+		if entry.Before != nil && entry.Before.Finding != nil {
+			filtered.Summary.BeforeDefects = 1
+		}
+		if entry.After != nil && entry.After.Finding != nil {
+			filtered.Summary.AfterDefects = 1
+		}
+		return filtered, nil
+	}
+	return DiffResult{}, errInvalid("rule " + ruleID + " not found in either report")
+}
+
 // sameRuleDefinition reports whether two rules with the same id also agree on
 // version, kind, severity, invariant and ABI requirement. Only then may their
 // check statuses be compared.
