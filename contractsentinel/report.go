@@ -642,11 +642,17 @@ func ReportID(r Report) string {
 // lowercase hex characters, the id matches the content, the artifact name is
 // present, rule ids are present and unique with non-empty versions, statuses
 // use the five recorded values, tool-missing and timeout notes are
-// non-blank, and 发现缺陷 rules correspond one-to-one with findings whose
-// artifact hash, version, severity, invariant and evidence match the rule.
-// The same conditions apply to submissions and to stored archives: a
-// recomputed id never makes an invalid report legal. fail is errInvalid for
-// submissions and errCorrupt for stored archives.
+// non-blank, a 发现缺陷 rule's note is either absent/empty (a boolean-only
+// report whose finding carries the invariant <name> does not hold evidence)
+// or a note containing non-whitespace text, and 发现缺陷 rules correspond
+// one-to-one with findings whose artifact hash, version, severity, invariant
+// and evidence match the rule. A non-empty note made solely of spaces, tabs
+// or newlines is never legal for a defect: it cannot be read as "no note
+// supplied" and the finding must not be repaired into the auto-generated
+// evidence, even when its evidence copies that whitespace verbatim and the
+// recomputed id matches. The same conditions apply to submissions and to
+// stored archives: a recomputed id never makes an invalid report legal.
+// fail is errInvalid for submissions and errCorrupt for stored archives.
 func validateReport(r Report, fail func(string) error) error {
 	if !validReportID(r.ReportID) {
 		return fail("report id " + r.ReportID + " is not a 64-character lowercase hex string")
@@ -680,6 +686,21 @@ func validateReport(r Report, fail func(string) error) error {
 		}
 		if (rule.Status == StatusToolMissing || rule.Status == StatusTimeout) && strings.TrimSpace(rule.Note) == "" {
 			return fail("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
+		}
+		// A written defect note made solely of whitespace is not the same as
+		// an omitted note. The omitted/empty note is the boolean-only form,
+		// whose finding evidence is "invariant <name> does not hold"; an
+		// omitted member and an explicit "" both decode to "" and keep that
+		// form. A non-empty whitespace string could only have reached this
+		// field by being written as an external checker description, and the
+		// submission side has always demanded non-blank text for such
+		// descriptions — reading such an archive back must not launder the
+		// blank description, neither by treating it as an omitted note nor by
+		// replacing the verbatim whitespace evidence with the auto-generated
+		// one, even when the finding evidence copies the note and the
+		// recomputed report id matches.
+		if rule.Status == StatusDefect && rule.Note != "" && strings.TrimSpace(rule.Note) == "" {
+			return fail("report " + r.ReportID + " rule " + rule.ID + " has a blank defect note")
 		}
 		if rule.Status == StatusDefect {
 			defectByID[rule.ID] = rule
