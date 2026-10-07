@@ -125,28 +125,44 @@ func locateDupObject(data []byte, path []jsonPathStep) string {
 
 // arrayEntryID extracts the identifying field of one rules/checks/findings
 // array element. Rules carry their own id; check and finding records name the
-// rule via ruleId. The unmarshal is last-key-wins for repeated members, which
-// is fine here: identification only needs some id carried by the offending
-// entry, and the index already makes it unambiguous.
+// rule via ruleId. The decode goes through json.RawMessage at every level so
+// that unrelated extension content — an oversized number such as 1e1000 anywhere in
+// the document, including inside the offending entry's own nested extension
+// members — is never converted to a Go float and cannot abort the lookup; only
+// the entry's own id/ruleId member is decoded, as a JSON string. Member names
+// are matched exactly after JSON string decoding, so an escaped spelling of
+// the formal name identifies the entry while case variants and
+// whitespace-padded names do not. The unmarshal is last-key-wins for repeated
+// members, which is fine here: identification only needs some id carried by
+// the offending entry, and the index already makes it unambiguous.
 func arrayEntryID(data []byte, field string, index int) string {
-	var root map[string]any
+	var root map[string]json.RawMessage
 	if err := json.Unmarshal(data, &root); err != nil {
 		return ""
 	}
-	arr, ok := root[field].([]any)
-	if !ok || index < 0 || index >= len(arr) {
+	raw, ok := root[field]
+	if !ok {
 		return ""
 	}
-	obj, ok := arr[index].(map[string]any)
-	if !ok {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil || index < 0 || index >= len(elems) {
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(elems[index], &obj); err != nil {
 		return ""
 	}
 	idKey := "ruleId"
 	if field == "rules" {
 		idKey = "id"
 	}
-	if v, ok := obj[idKey].(string); ok {
-		return v
+	rawID, ok := obj[idKey]
+	if !ok {
+		return ""
 	}
-	return ""
+	var id string
+	if err := json.Unmarshal(rawID, &id); err != nil {
+		return ""
+	}
+	return id
 }
