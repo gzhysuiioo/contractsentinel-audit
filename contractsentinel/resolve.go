@@ -86,39 +86,98 @@ type QueryTransform struct {
 	To    string `json:"to"`
 }
 
-// MarshalJSON renders each rule so the output satisfies the same constraints
-// parseQueryTransforms enforces on input:
+// queryTransformShapes is the one description of each op's rule grammar,
+// consulted by both sides of a save: parseQueryTransforms validates a rule
+// against its entry and QueryTransform.MarshalJSON writes exactly that
+// shape. The entry names the single field each op owns besides op and name:
+//
+//   - "value" (set): required and a JSON string, the empty string included;
+//   - "to" (rename and copy): required and a non-empty JSON string;
+//   - "" (remove): neither field is owned.
+//
+// Every op that does not own "value" must not carry one, so the read-side
+// ban and the save-side omission live behind this one table. Fields an op
+// does not own — a "to" arriving on set or remove, and any unknown key —
+// stay accepted and ignored on read and are dropped on save just as before;
+// the table describes the owned fields only and never tightens the grammar.
+// Rename and copy share one "to" entry, so their target-name requirement
+// and their ban on "value" cannot be maintained or drift in two places.
+var queryTransformShapes = map[string]string{
+	"set":    "value",
+	"remove": "",
+	"rename": "to",
+	"copy":   "to",
+}
+
+// MarshalJSON renders each rule in the exact shape queryTransformShapes
+// pins for input, so the save shape can never drift from the read-side
+// field requirements:
 //   - set keeps "value" as a JSON string, including the empty string;
 //   - remove emits only op and name (never value or to);
-//   - rename and copy keep a non-empty "to" and never emit value.
+//   - rename and copy keep "to" and never emit value.
 //
 // name, value and to are written as the literal strings read in — spaces,
 // non-ASCII letters, '+' and '%' included — with only JSON string escaping,
 // never query-string percent-encoding or decoding, so a re-read matches the
-// same parameter names and applies the same literal values.
+// same parameter names and applies the same literal values. An op absent
+// from the table (one no validated config can carry) renders the
+// remove-shaped pair and so can never gain a field the reader rejects.
 func (q *QueryTransform) MarshalJSON() ([]byte, error) {
-	switch q.Op {
-	case "set":
+	switch queryTransformShapes[q.Op] {
+	case "value":
 		return json.Marshal(struct {
 			Op    string `json:"op"`
 			Name  string `json:"name"`
 			Value string `json:"value"`
 		}{q.Op, q.Name, q.Value})
-	case "rename", "copy":
+	case "to":
 		return json.Marshal(struct {
 			Op   string `json:"op"`
 			Name string `json:"name"`
 			To   string `json:"to"`
 		}{q.Op, q.Name, q.To})
 	default:
-		// remove (and any op a validated config could never carry) writes
-		// neither value nor to, so the output cannot gain fields the reader
-		// rejects.
 		return json.Marshal(struct {
 			Op   string `json:"op"`
 			Name string `json:"name"`
 		}{q.Op, q.Name})
 	}
+}
+
+// checkRuleFields validates the op-owned field named by queryTransformShapes
+// for one rule whose op and name are already decoded. set's "value" must be
+// present as a JSON string (the empty string included); rename/copy's "to"
+// must be present as a non-empty string; and an op that does not own
+// "value" must not carry one. The value ban is decided before the owned
+// field's presence/type, so a rename or copy carrying both keeps failing on
+// the stray value first. Fields the op does not own stay untouched: a "to"
+// on set or remove is neither rejected nor copied onto the rule, and saving
+// omits it. Every reason keeps parseQueryTransforms' existing wording.
+func checkRuleFields(qt *QueryTransform, ownedField string, fields map[string]json.RawMessage, ruleLoc string) *Failure {
+	valueRaw, hasValue := fields["value"]
+	if ownedField != "value" && hasValue {
+		return failuref("invalid_config", "%s: %s must not include a value", ruleLoc, qt.Op)
+	}
+	switch ownedField {
+	case "value":
+		if !hasValue {
+			return failuref("invalid_config", "%s: %s requires a string value", ruleLoc, qt.Op)
+		}
+		if !jsonString(valueRaw, &qt.Value) {
+			return failuref("invalid_config", "%s: value must be a string", ruleLoc)
+		}
+	case "to":
+		toRaw, hasTo := fields["to"]
+		switch {
+		case !hasTo:
+			return failuref("invalid_config", "%s: %s requires a non-empty string to", ruleLoc, qt.Op)
+		case !jsonString(toRaw, &qt.To):
+			return failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
+		case qt.To == "":
+			return failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
+		}
+	}
+	return nil
 }
 
 // routeJSON mirrors Route but keeps every field raw: the basic fields are
@@ -272,7 +331,12 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: op is required", ruleLoc)
 		case !jsonString(opRaw, &qt.Op):
 			return nil, failuref("invalid_config", "%s: op must be a string", ruleLoc)
-		case qt.Op != "set" && qt.Op != "remove" && qt.Op != "rename" && qt.Op != "copy":
+		}
+		// The op decides the rule's shape once, through the same
+		// queryTransformShapes table the saver uses; an unknown op fails
+		// before name so it never reaches a field requirement.
+		ownedField, knownOp := queryTransformShapes[qt.Op]
+		if !knownOp {
 			return nil, failuref("invalid_config", "%s: unknown op %q (only set, remove, rename and copy are supported)", ruleLoc, qt.Op)
 		}
 
@@ -286,44 +350,8 @@ func parseQueryTransforms(raw json.RawMessage, loc, id string) ([]*QueryTransfor
 			return nil, failuref("invalid_config", "%s: name must be a non-empty string", ruleLoc)
 		}
 
-		valueRaw, hasValue := fields["value"]
-		toRaw, hasTo := fields["to"]
-		switch qt.Op {
-		case "set":
-			if !hasValue {
-				return nil, failuref("invalid_config", "%s: set requires a string value", ruleLoc)
-			}
-			if !jsonString(valueRaw, &qt.Value) {
-				return nil, failuref("invalid_config", "%s: value must be a string", ruleLoc)
-			}
-		case "remove":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: remove must not include a value", ruleLoc)
-			}
-		case "rename":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: rename must not include a value", ruleLoc)
-			}
-			switch {
-			case !hasTo:
-				return nil, failuref("invalid_config", "%s: rename requires a non-empty string to", ruleLoc)
-			case !jsonString(toRaw, &qt.To):
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			case qt.To == "":
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			}
-		case "copy":
-			if hasValue {
-				return nil, failuref("invalid_config", "%s: copy must not include a value", ruleLoc)
-			}
-			switch {
-			case !hasTo:
-				return nil, failuref("invalid_config", "%s: copy requires a non-empty string to", ruleLoc)
-			case !jsonString(toRaw, &qt.To):
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			case qt.To == "":
-				return nil, failuref("invalid_config", "%s: to must be a non-empty string", ruleLoc)
-			}
+		if f := checkRuleFields(qt, ownedField, fields, ruleLoc); f != nil {
+			return nil, f
 		}
 		transforms = append(transforms, qt)
 	}
