@@ -642,7 +642,9 @@ func ReportID(r Report) string {
 // lowercase hex characters, the id matches the content, the artifact name is
 // present, rule ids are present and unique with non-empty versions, statuses
 // use the five recorded values, tool-missing and timeout notes are
-// non-blank, and 发现缺陷 rules correspond one-to-one with findings whose
+// non-blank, a 发现缺陷 rule never carries a note that is present yet entirely
+// whitespace (an omitted or empty note stays legal for the invariant-boolean
+// evidence form), and 发现缺陷 rules correspond one-to-one with findings whose
 // artifact hash, version, severity, invariant and evidence match the rule.
 // The same conditions apply to submissions and to stored archives: a
 // recomputed id never makes an invalid report legal. fail is errInvalid for
@@ -682,6 +684,17 @@ func validateReport(r Report, fail func(string) error) error {
 			return fail("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has no note")
 		}
 		if rule.Status == StatusDefect {
+			// A defect rule may carry no note at all (reports built only from
+			// invariant booleans, whose finding holds the generated evidence),
+			// but a note that is present yet entirely whitespace is not a
+			// checker description: the blankness judgement is the same
+			// TrimSpace one the audit submission applies. The evidence matching
+			// the note verbatim and the recomputed id matching the content can
+			// never make such a note legal, and the whole report is rejected
+			// rather than skipping the bad rule.
+			if rule.Note != "" && strings.TrimSpace(rule.Note) == "" {
+				return fail("report " + r.ReportID + " rule " + rule.ID + " status " + rule.Status + " has a blank note")
+			}
 			defectByID[rule.ID] = rule
 		}
 	}
